@@ -1,0 +1,10 @@
+
+#ignore mac only files
+.DS_Store
+**/.DS_Store
+
+#ignore environment and build file
+.idea/
+.vscode/
+*.log
+build/
