@@ -1,6 +1,6 @@
-# Guitar → Sine Model LUT → Synth (JUCE VST)
+# Guitar → Harmonic Fingerprint LUT → Note Detection → Synth (JUCE VST)
 
-A research-stage pipeline for converting recorded guitar notes and chords into a **mathematical sine-wave representation**, stored in a lookup table (LUT), for later real-time synthesis inside a JUCE VST.
+A research-stage pipeline for converting recorded guitar notes into **normalized harmonic fingerprints**, stored in a lookup table (LUT), for real-time note detection inside a future JUCE VST.
 
 ---
 
@@ -9,106 +9,133 @@ A research-stage pipeline for converting recorded guitar notes and chords into a
 The long-term goal is to build a guitar-to-synth VST that:
 
 1. Takes live instrument input  
-2. Matches the incoming waveform to a stored sine-wave model  
-3. Uses the closest match to drive a synthesized output  
+2. Identifies which note is being played  
+3. Uses that detected note to trigger a separate synthesized or sampled sound  
 
-This repository contains the **Python modeling stage**, which:
+This repository contains the **Python modeling and detection stage**, which:
 
-- Loads recorded guitar notes or chords  
-- Approximates them as a **sum of sine waves**  
-- Plots original vs reconstructed waveform  
-- Saves the mathematical parameters to a LUT (JSON)  
+- Extracts harmonic fingerprints from recorded guitar notes  
+- Stores them in a lookup table (LUT)  
+- Matches unknown input audio against the LUT  
+- Selects the most similar note using cosine similarity  
 
----
-
-# The Math
-
-We approximate a short segment of a guitar signal as:
-
-$$
-x[n] \approx \sum_{k=1}^{K} A_k \sin\left(2\pi f_k \frac{n}{f_s} + \phi_k\right)
-$$
-
-Where:
-
-- $x[n]$ = discrete-time audio sample  
-- $f_s$ = sample rate  
-- $f_k$ = detected frequency component  
-- $A_k$ = amplitude  
-- $\phi_k$ = phase  
-- $K$ = number of sine components  
+This system does **not** recreate the waveform directly.  
+Instead, it performs **template matching in harmonic space**.
 
 ---
 
-## Why This Works
+# Core Idea
 
-A guitar tone can be approximated as:
+Instead of fitting sine waves to reconstruct the signal, we:
 
-- A fundamental frequency  
-- Harmonic overtones  
-- A transient attack  
+1. Assume a candidate note with known fundamental frequency \( f_0 \)
+2. Measure harmonic energy at integer multiples:
+   
+   \[
+   f_k = k f_0
+   \]
 
-Single note model:
+3. Normalize those harmonic amplitudes
+4. Store that normalized vector as the note’s fingerprint
 
-$$
-x[n] \approx A \sin\left(2\pi f \frac{n}{f_s} + \phi\right)
-$$
-
-Chord model:
-
-$$
-x[n] \approx \sum_{k=1}^{K} A_k \sin\left(2\pi f_k \frac{n}{f_s} + \phi_k\right)
-$$
+Later, live input is classified by comparing its harmonic fingerprint to the LUT.
 
 ---
 
-# Frequency Detection
+# Harmonic Fingerprint Model
 
-We compute the FFT of a Hann-windowed segment:
+For a note with fundamental \( f_0 \), we compute:
 
-$$
+\[
+H_k = \text{Energy near } k f_0
+\]
+
+for \( k = 1, 2, ..., K \)
+
+We then normalize:
+
+\[
+\tilde{H}_k = \frac{H_k}{\sum_{i=1}^{K} H_i}
+\]
+
+The resulting vector:
+
+\[
+\mathbf{h} = [\tilde{H}_1, \tilde{H}_2, ..., \tilde{H}_K]
+\]
+
+is the **harmonic fingerprint** of that note.
+
+This removes loudness dependency and focuses only on harmonic structure.
+
+---
+
+# Why This Works
+
+A guitar tone consists of:
+
+- A fundamental frequency
+- Harmonic overtones
+- A transient attack
+
+The harmonic amplitude ratios are relatively stable for:
+
+- A given string
+- A given fret
+- A given pickup configuration
+
+Even if:
+
+- Volume changes
+- Pick strength changes
+- Slight EQ shifts occur
+
+The **relative harmonic structure** remains similar.
+
+This makes harmonic fingerprints effective for classification.
+
+---
+
+# FFT Analysis
+
+We compute the short-time FFT of a Hann-windowed segment:
+
+\[
 X[k] = \sum_{n=0}^{N-1} x[n] w[n] e^{-j 2\pi kn/N}
-$$
+\]
 
-Dominant peaks in $|X[k]|$ correspond to frequency components.
+We then measure:
+
+\[
+H_k = \max |X(f)| \text{ near } k f_0
+\]
+
+within a small tolerance window (e.g., ±15 Hz).
+
+This is repeated for each harmonic.
 
 ---
 
-# Least Squares Fitting
+# Live Note Detection (Template Matching)
 
-Instead of fitting:
+For an unknown input signal:
 
-$$
-A \sin(\omega n + \phi)
-$$
+1. For each candidate note in the LUT:
+   - Assume its known \( f_0 \)
+   - Extract harmonic fingerprint from live audio
+2. Compare live fingerprint \( \mathbf{h}_{live} \) with stored template \( \mathbf{h}_{lut} \)
 
-We fit:
+We use cosine similarity:
 
-$$
-a \cos(\omega n) + b \sin(\omega n)
-$$
+\[
+\text{similarity} =
+\frac{\mathbf{h}_{live} \cdot \mathbf{h}_{lut}}
+{\|\mathbf{h}_{live}\| \|\mathbf{h}_{lut}\|}
+\]
 
-This makes it a linear least-squares problem:
+The note with highest similarity is selected.
 
-$$
-\mathbf{x} = \mathbf{M}\theta
-$$
-
-Solve using:
-
-$$
-\theta = (M^T M)^{-1} M^T x
-$$
-
-Convert to amplitude and phase:
-
-$$
-A = \sqrt{a^2 + b^2}
-$$
-
-$$
-\phi = \tan^{-1}\left(\frac{a}{b}\right)
-$$
+This avoids explicit fundamental detection and reduces octave errors.
 
 ---
 
@@ -118,50 +145,15 @@ Example entry:
 
 ```json
 {
-  "label": "E2_pick",
-  "sample_rate_hz": 44100,
-  "model": {
-    "type": "sum_of_sines",
-    "components": [
-      {
-        "freq_hz": 82.41,
-        "amp": 0.732,
-        "phase_rad": 1.13
-      }
-    ]
-  }
+  "note": "E6",
+  "midi": 88,
+  "f0_hz": 1318.51,
+  "k": 60,
+  "fingerprint": [
+    0.28,
+    0.21,
+    0.16,
+    0.09,
+    ...
+  ]
 }
-```
-
-Inside JUCE:
-
-```cpp
-float sample = 0.0f;
-for (auto& c : components)
-{
-    sample += c.amp * std::sin(2.0f * float_Pi * c.freq * n / sampleRate + c.phase);
-}
-```
-
----
-
-# Requirements
-
-```bash
-pip install numpy scipy matplotlib
-```
-
----
-
-# Status
-
-- IN TESTING 
-
----
-
-# Mathematical Inspiration
-
-- Sinusoidal modeling synthesis  
-- Short-time Fourier analysis  
-- Linear least squares estimation  
-- Harmonic analysis of plucked strings  
