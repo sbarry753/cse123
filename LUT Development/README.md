@@ -62,7 +62,7 @@ $$
 
 ---
 
-# 🔍 Frequency Detection
+# Frequency Detection
 
 We compute the FFT of a Hann-windowed segment:
 
@@ -74,7 +74,7 @@ Dominant peaks in $|X[k]|$ correspond to frequency components.
 
 ---
 
-# 📐 Least Squares Fitting
+# Least Squares Fitting
 
 Instead of fitting:
 
