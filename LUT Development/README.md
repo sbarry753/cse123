@@ -1,10 +1,10 @@
-# 🎸 Guitar → Sine Model LUT → Synth (JUCE VST)
+# Guitar → Sine Model LUT → Synth (JUCE VST)
 
 A research-stage pipeline for converting recorded guitar notes and chords into a **mathematical sine-wave representation**, stored in a lookup table (LUT), for later real-time synthesis inside a JUCE VST.
 
 ---
 
-## 🚀 Project Goal
+## Project Goal
 
 The long-term goal is to build a guitar-to-synth VST that:
 
