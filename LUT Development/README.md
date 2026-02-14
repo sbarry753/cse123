@@ -28,12 +28,10 @@ Instead, it performs **template matching in harmonic space**.
 
 Instead of fitting sine waves to reconstruct the signal, we:
 
-1. Assume a candidate note with known fundamental frequency \( f_0 \)
+1. Assume a candidate note with known fundamental frequency: f0
 2. Measure harmonic energy at integer multiples:
 
-   \[
-   f_k = k f_0
-   \]
+   fk = k * f0
 
 3. Normalize those harmonic amplitudes
 4. Store that normalized vector as the note’s fingerprint
@@ -44,25 +42,19 @@ Later, live input is classified by comparing its harmonic fingerprint to the LUT
 
 ## Harmonic Fingerprint Model
 
-For a note with fundamental \( f_0 \), we compute:
+For a note with fundamental f0, we compute:
 
-\[
-H_k = \text{Energy near } k f_0
-\]
+Hk = energy near (k * f0)
 
-for \( k = 1, 2, \dots, K \)
+for k = 1, 2, ..., K
 
 We then normalize:
 
-\[
-\tilde{H}_k = \frac{H_k}{\sum_{i=1}^{K} H_i}
-\]
+Hk_norm = Hk / (sum_{i=1..K} Hi)
 
 The resulting vector:
 
-\[
-\mathbf{h} = [\tilde{H}_1, \tilde{H}_2, \dots, \tilde{H}_K]
-\]
+h = [H1_norm, H2_norm, ..., HK_norm]
 
 is the **harmonic fingerprint** of that note.
 
@@ -100,15 +92,11 @@ This makes harmonic fingerprints effective for classification.
 
 We compute the short-time FFT of a Hann-windowed segment:
 
-\[
-X[k] = \sum_{n=0}^{N-1} x[n]\, w[n]\, e^{-j 2\pi kn/N}
-\]
+X[k] = Σ_{n=0..N-1} x[n] * w[n] * exp(-j * 2π * k * n / N)
 
-We then measure:
+We then measure harmonic energy as:
 
-\[
-H_k = \max |X(f)| \text{ near } k f_0
-\]
+Hk = max(|X(f)|) near (k * f0)
 
 within a small tolerance window (e.g., ±15 Hz).
 
@@ -121,17 +109,13 @@ This is repeated for each harmonic.
 For an unknown input signal:
 
 1. For each candidate note in the LUT:
-   - Assume its known \( f_0 \)
+   - Assume its known f0
    - Extract harmonic fingerprint from live audio
-2. Compare live fingerprint \( \mathbf{h}_{live} \) with stored template \( \mathbf{h}_{lut} \)
+2. Compare the live fingerprint h_live with stored template h_lut
 
 We use cosine similarity:
 
-\[
-\text{similarity} =
-\frac{\mathbf{h}_{live} \cdot \mathbf{h}_{lut}}
-{\|\mathbf{h}_{live}\|\ \|\mathbf{h}_{lut}\|}
-\]
+similarity = (h_live · h_lut) / (||h_live|| * ||h_lut||)
 
 The note with the highest similarity is selected.
 
@@ -151,7 +135,7 @@ Example entry:
   "k": 60,
   "fingerprint": [0.28, 0.21, 0.16, 0.09]
 }
-
+```
 ---
 
 ## System Architecture
