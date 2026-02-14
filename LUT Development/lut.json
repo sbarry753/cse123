@@ -31,7 +31,7 @@
         0.047814428477514395,
         0.09469346721511622
       ],
-      "source_wav": "samples/E6.wav",
+      "source_wav": "samples\\E6.wav",
       "analysis_start_sec": 0.12,
       "analysis_dur_sec": 0.18
     },
@@ -104,7 +104,7 @@
         0.01716029514862187,
         0.016951217893862246
       ],
-      "source_wav": "samples/F4.wav",
+      "source_wav": "samples\\F4.wav",
       "analysis_start_sec": 0.12,
       "analysis_dur_sec": 0.18
     },
@@ -176,7 +176,7 @@
         0.011939128187877122,
         0.00942263850533056
       ],
-      "source_wav": "samples/F#4.wav",
+      "source_wav": "samples\\F#4.wav",
       "analysis_start_sec": 0.12,
       "analysis_dur_sec": 0.18
     },
@@ -239,7 +239,7 @@
         0.016634039272986057,
         0.018491213125252575
       ],
-      "source_wav": "samples/A4.wav",
+      "source_wav": "samples\\A4.wav",
       "analysis_start_sec": 0.12,
       "analysis_dur_sec": 0.18
     },
@@ -274,7 +274,7 @@
         0.030849234071249718,
         0.038836236761794964
       ],
-      "source_wav": "samples/B5.wav",
+      "source_wav": "samples\\B5.wav",
       "analysis_start_sec": 0.12,
       "analysis_dur_sec": 0.18
     },
@@ -347,7 +347,7 @@
         0.016679348581911137,
         0.020581438768949675
       ],
-      "source_wav": "samples/E4.wav",
+      "source_wav": "samples\\E4.wav",
       "analysis_start_sec": 0.12,
       "analysis_dur_sec": 0.18
     },
@@ -413,7 +413,7 @@
         0.004630917885679417,
         0.0021598844151118177
       ],
-      "source_wav": "samples/G#4.wav",
+      "source_wav": "samples\\G#4.wav",
       "analysis_start_sec": 0.12,
       "analysis_dur_sec": 0.18
     },
@@ -482,7 +482,7 @@
         0.005530074237796034,
         0.004528273973888946
       ],
-      "source_wav": "samples/G4.wav",
+      "source_wav": "samples\\G4.wav",
       "analysis_start_sec": 0.12,
       "analysis_dur_sec": 0.18
     }

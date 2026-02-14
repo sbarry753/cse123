@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 """
-wave_to_lut.py
+wav_to_lut.py
 A simple harmonic fingerprint LUT builder + matcher.
+
 - For every candidate note in the LUT with known f0(note),
   measure energy in the live spectrum near k*f0(note) for k=1..K.
 - Normalize those harmonic energies -> fingerprint vector.
 - Compare that vector to the stored template fingerprint for that note.
 - Choose best similarity.
 
-
 Commands:
-  1) Build LUT from labeled recordings:
+  1) Build LUT from labeled recordings (NOTE=path):
     python wav_to_lut.py build --out lut.json --k 60 --tol 15 --start 0.12 --dur 0.18 \
-        E6=samples/E6.wav   \
-        F4=samples/F4.wav \
-        F#4=samples/F#4.wav \
-        A4=samples/A4.wav \
-        B5=samples/B5.wav \
-        E4=samples/E4.wav \
-        G#4=samples/G#4.wav \
-        G4=samples/G4.wav
+        E6=samples/E6.wav F4=samples/F4.wav
 
-  2) Match an unknown recording:
-     python wav_to_lut.py match --lut lut.json --wav unknown.wav --start 0.12 --dur 0.18
+  2) Build LUT from a directory (auto-note from filename):
+    python wav_to_lut.py build_dir --out lut.json --dir samples --k 60 --tol 15 --start 0.12 --dur 0.18
+
+  3) Match an unknown recording:
+    python wav_to_lut.py match --lut lut.json --wav unknown.wav --start 0.12 --dur 0.18 --plot
 
 Optional:
   --plot : show spectrum + note scores
   --top  : show top N matches
-  --bandpass : apply simple highpass to reduce rumble (optional)
+  --highpass : apply simple highpass to reduce rumble (optional)
 
 Requirements:
   pip install numpy scipy matplotlib
@@ -38,6 +34,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+from pathlib import Path
 
 import numpy as np
 from scipy.io import wavfile
@@ -63,6 +60,26 @@ _NOTE_TO_SEMITONE = {
     "B": 11,
 }
 
+# Match note tokens in filenames, e.g. "E6", "F#4", "Bb3"
+# Accept either '#' or 'b' (case-insensitive), with optional separators after it.
+_NOTE_TOKEN_RE = re.compile(r"(?i)\b([A-G])([#b]?)(-?\d+)\b")
+
+
+def normalize_note_token(letter: str, accidental: str, octave_str: str) -> str:
+    """
+    Convert letter/accidental/octave into canonical form like:
+      Bb3, F#4, E6
+    """
+    letter = letter.upper()
+    accidental = accidental.strip()
+    if accidental == "b":
+        accidental = "b"
+    elif accidental == "#":
+        accidental = "#"
+    else:
+        accidental = ""
+    return f"{letter}{accidental}{octave_str}"
+
 
 def note_to_midi(note: str) -> int:
     s = note.strip().upper().replace("♯", "#").replace("♭", "B")
@@ -81,6 +98,25 @@ def note_to_midi(note: str) -> int:
 
 def midi_to_freq_hz(midi: int, a4_hz: float = 440.0) -> float:
     return float(a4_hz * (2.0 ** ((midi - 69) / 12.0)))
+
+
+def note_from_filename(path: Path) -> str:
+    """
+    Extract a note token from filename stem.
+    Examples:
+      E6.wav -> E6
+      F#4_take2.wav -> F#4
+      Bb3-clean.wav -> Bb3
+    """
+    stem = path.stem  # without extension
+    m = _NOTE_TOKEN_RE.search(stem)
+    if not m:
+        raise ValueError(f"Could not parse note from filename '{path.name}'. "
+                         f"Expected something like E6.wav, F#4.wav, Bb3.wav.")
+    letter, accidental, octave_str = m.group(1), m.group(2), m.group(3)
+    # Canonicalize to nice form: Bb3 / F#4 / E6
+    # Note: note_to_midi expects flats as 'b' or 'B' in original string; we store as 'Bb3' etc.
+    return normalize_note_token(letter, accidental.lower(), octave_str)
 
 
 # -----------------------------
@@ -107,7 +143,6 @@ def pick_segment(x: np.ndarray, fs: int, start_sec: float, dur_sec: float) -> np
 
 
 def highpass_filter(x: np.ndarray, fs: int, cutoff_hz: float = 80.0, order: int = 4) -> np.ndarray:
-    # Simple rumble killer, optional
     if cutoff_hz <= 0:
         return x
     sos = butter(order, cutoff_hz / (fs * 0.5), btype="highpass", output="sos")
@@ -145,7 +180,6 @@ def fingerprint_for_note(seg: np.ndarray,
                          window: str = "hann") -> np.ndarray:
     """
     Extract a normalized harmonic fingerprint from seg ASSUMING the candidate note's f0.
-    This is what you'll do in the pedal for each candidate note.
     """
     freqs, mag = spectrum_mag(seg, fs, window=window)
     nyq = float(freqs[-1])
@@ -165,7 +199,6 @@ def fingerprint_for_note(seg: np.ndarray,
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    # Allow different lengths (use min length)
     n = min(len(a), len(b))
     if n == 0:
         return 0.0
@@ -211,7 +244,7 @@ def save_lut(path: str, data: Dict):
 
 
 # -----------------------------
-# Build LUT
+# Build LUT (from labeled list)
 # -----------------------------
 def build_lut(out_path: str,
               labeled: List[Tuple[str, str]],
@@ -222,7 +255,8 @@ def build_lut(out_path: str,
               a4: float,
               window: str,
               use_highpass: bool,
-              highpass_hz: float):
+              highpass_hz: float,
+              replace_existing: bool):
     lut = {"meta": {
                 "type": "harmonic_fingerprint_lut",
                 "normalization": "sum_to_1",
@@ -231,6 +265,19 @@ def build_lut(out_path: str,
             },
            "entries": []
     }
+
+    # If replacing into an existing LUT, load it
+    if not replace_existing and Path(out_path).exists():
+        try:
+            lut = load_lut(out_path)
+        except Exception:
+            pass
+
+    # Index existing entries by note for easy replacement
+    existing_idx = {}
+    for i, e in enumerate(lut.get("entries", [])):
+        if isinstance(e, dict) and "note" in e:
+            existing_idx[str(e["note"]).upper()] = i
 
     for note, wav_path in labeled:
         fs, x = wavfile.read(wav_path)
@@ -257,16 +304,29 @@ def build_lut(out_path: str,
             tol_hz=float(tol_hz),
             window=window,
             fingerprint=[float(v) for v in fp.tolist()],
-            source_wav=wav_path,
+            source_wav=str(wav_path),
             analysis_start_sec=float(start),
             analysis_dur_sec=float(dur),
-        )
+        ).__dict__
 
-        lut["entries"].append(entry.__dict__)
-        print(f"[build] {note}: f0={f0:.2f} Hz, fp_len={len(fp)} from {wav_path}")
+        key = note.strip().upper()
+        if key in existing_idx:
+            lut["entries"][existing_idx[key]] = entry
+            print(f"[build] replaced {note}: f0={f0:.2f} Hz, fp_len={len(fp)} from {wav_path}")
+        else:
+            lut["entries"].append(entry)
+            print(f"[build] added    {note}: f0={f0:.2f} Hz, fp_len={len(fp)} from {wav_path}")
 
     save_lut(out_path, lut)
     print(f"Saved LUT -> {out_path} with {len(lut['entries'])} entries")
+
+
+def gather_wavs_from_dir(dir_path: str, recursive: bool) -> List[Path]:
+    root = Path(dir_path)
+    if not root.exists():
+        raise FileNotFoundError(f"Directory not found: {dir_path}")
+    glob = root.rglob("*.wav") if recursive else root.glob("*.wav")
+    return sorted([p for p in glob if p.is_file()])
 
 
 # -----------------------------
@@ -285,12 +345,10 @@ def match_note(lut_path: str,
                top_n: int,
                plot: bool):
     lut = load_lut(lut_path)
-
     entries = lut.get("entries", [])
     if not entries:
         raise ValueError("LUT has no entries.")
 
-    # Load unknown wav
     fs, x = wavfile.read(wav_path)
     x = to_mono(x)
     if x.dtype.kind in "iu":
@@ -302,22 +360,19 @@ def match_note(lut_path: str,
         seg = highpass_filter(seg, fs, cutoff_hz=highpass_hz)
     seg = normalize_peak(seg)
 
-    # Match settings: if user doesn't pass, use LUT meta/defaults per-entry
     results = []
 
-    # For plotting spectrum once
     freqs_mag = None
     if plot:
         freqs_mag = spectrum_mag(seg, fs, window=window_live or entries[0].get("window", "hann"))
 
-    # a4 for computing note f0: normally you want LUT's a4, but allow override
     a4_lut = float(lut.get("meta", {}).get("a4_hz", 440.0))
     a4 = float(a4_override) if a4_override is not None else a4_lut
 
     for e in entries:
         note = e["note"]
         midi = int(e["midi"])
-        f0 = midi_to_freq_hz(midi, a4_hz=a4)  # recompute in case a4 override
+        f0 = midi_to_freq_hz(midi, a4_hz=a4)
         k = int(k_live) if k_live is not None else int(e.get("k", 60))
         tol = float(tol_hz_live) if tol_hz_live is not None else float(e.get("tol_hz", 12.0))
         win = window_live or e.get("window", "hann")
@@ -335,11 +390,11 @@ def match_note(lut_path: str,
 
     print(f"\nTop {top_n} matches:")
     for note, sim, f0, L in results[:top_n]:
-        print(f"  {note:5s}  sim={sim:.4f}   f0={f0:8.2f} Hz   fp_len={L}")
+        print(f"  {note:6s}  sim={sim:.4f}   f0={f0:8.2f} Hz   fp_len={L}")
 
     if plot:
         freqs, mag = freqs_mag
-        # Plot spectrum + score bar chart
+
         plt.figure(figsize=(12, 4))
         plt.plot(freqs, mag)
         plt.title("Live Segment Magnitude Spectrum")
@@ -363,10 +418,10 @@ def match_note(lut_path: str,
     return best_note, best_sim
 
 
+# -----------------------------
+# CLI parsing
+# -----------------------------
 def parse_labeled_args(pairs: List[str]) -> List[Tuple[str, str]]:
-    """
-    Parse inputs like:  E6=E6.wav  F#4=samples/Fsharp4.wav
-    """
     out = []
     for s in pairs:
         if "=" not in s:
@@ -384,7 +439,7 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    ap_build = sub.add_parser("build", help="Build LUT from labeled note recordings")
+    ap_build = sub.add_parser("build", help="Build LUT from labeled note recordings (NOTE=wav_path)")
     ap_build.add_argument("--out", required=True, help="Output LUT json")
     ap_build.add_argument("--k", type=int, default=60, help="Max harmonics K")
     ap_build.add_argument("--tol", type=float, default=15.0, help="Tolerance Hz around each harmonic")
@@ -394,7 +449,24 @@ def main():
     ap_build.add_argument("--window", type=str, default="hann", help="FFT window")
     ap_build.add_argument("--highpass", action="store_true", help="Apply a highpass to reduce rumble")
     ap_build.add_argument("--highpass_hz", type=float, default=80.0, help="Highpass cutoff Hz")
+    ap_build.add_argument("--replace_existing", action="store_true",
+                          help="Overwrite output file instead of merging/replacing by note")
     ap_build.add_argument("labeled", nargs="+", help="Pairs NOTE=wav_path, e.g. E6=E6.wav")
+
+    ap_build_dir = sub.add_parser("build_dir", help="Build LUT from a directory of wavs (note parsed from filename)")
+    ap_build_dir.add_argument("--out", required=True, help="Output LUT json")
+    ap_build_dir.add_argument("--dir", required=True, help="Directory of wavs (filenames contain notes, e.g. E6.wav)")
+    ap_build_dir.add_argument("--recursive", action="store_true", help="Search subfolders too")
+    ap_build_dir.add_argument("--k", type=int, default=60, help="Max harmonics K")
+    ap_build_dir.add_argument("--tol", type=float, default=15.0, help="Tolerance Hz around each harmonic")
+    ap_build_dir.add_argument("--start", type=float, default=0.10, help="Segment start sec")
+    ap_build_dir.add_argument("--dur", type=float, default=0.20, help="Segment duration sec")
+    ap_build_dir.add_argument("--a4", type=float, default=440.0, help="A4 reference")
+    ap_build_dir.add_argument("--window", type=str, default="hann", help="FFT window")
+    ap_build_dir.add_argument("--highpass", action="store_true", help="Apply a highpass to reduce rumble")
+    ap_build_dir.add_argument("--highpass_hz", type=float, default=80.0, help="Highpass cutoff Hz")
+    ap_build_dir.add_argument("--replace_existing", action="store_true",
+                              help="Overwrite output file instead of merging/replacing by note")
 
     ap_match = sub.add_parser("match", help="Match an unknown note recording against LUT")
     ap_match.add_argument("--lut", required=True, help="LUT json")
@@ -424,7 +496,43 @@ def main():
             a4=args.a4,
             window=args.window,
             use_highpass=args.highpass,
-            highpass_hz=args.highpass_hz
+            highpass_hz=args.highpass_hz,
+            replace_existing=args.replace_existing,
+        )
+        return
+
+    if args.cmd == "build_dir":
+        wavs = gather_wavs_from_dir(args.dir, recursive=args.recursive)
+        if not wavs:
+            raise FileNotFoundError(f"No .wav files found in {args.dir} (recursive={args.recursive})")
+
+        labeled = []
+        skipped = 0
+        for p in wavs:
+            try:
+                note = note_from_filename(p)
+                labeled.append((note, str(p)))
+            except ValueError as ex:
+                skipped += 1
+                print(f"[skip] {p.name}: {ex}")
+
+        if not labeled:
+            raise RuntimeError("No wav files had parseable note names in their filename.")
+
+        print(f"Found {len(labeled)} labeled wavs (skipped {skipped}).")
+
+        build_lut(
+            out_path=args.out,
+            labeled=labeled,
+            k=args.k,
+            tol_hz=args.tol,
+            start=args.start,
+            dur=args.dur,
+            a4=args.a4,
+            window=args.window,
+            use_highpass=args.highpass,
+            highpass_hz=args.highpass_hz,
+            replace_existing=args.replace_existing,
         )
         return
 
