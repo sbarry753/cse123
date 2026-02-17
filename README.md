@@ -29,7 +29,6 @@ Instead of doing full waveform resynthesis, this approach focuses on **template-
 
 ![LUT polyphonic flow](Documentation/images/LUTPolyphonic.drawio%20(1).png)
 
-> If these images don’t render in GitHub, check the filenames in your repo root and update the paths above.
 
 ---
 
