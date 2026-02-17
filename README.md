@@ -5,7 +5,7 @@ A research and hardware project building a **polyphonic guitar synth pedal** usi
 Instead of traditional waveform resynthesis or naive pitch tracking, this system performs:
 
 - **Monophonic note detection** via harmonic template matching  
-- **Polyphonic chord detection** using spectral mixture modeling (NNLS)  
+- **Polyphonic chord detection** using the template matching to help optimize NNLS or FFT
 - **Strike detection** to separate attacks from sustain for better tracking  
 
 The long-term goal is a standalone hardware pedal combining:
@@ -19,7 +19,7 @@ The long-term goal is a standalone hardware pedal combining:
 
 ## Project Status
 
-- **Python LUT prototype active** — note + chord detection working offline
+- **Python LUT prototype active** - note + chord detection working offline
 - **Strike detection system in development**
 - **Daisy Seed hardware prototype in progress**
 - **JUCE project scaffolded for desktop/VST testing**
