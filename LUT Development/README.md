@@ -1,4 +1,4 @@
-````markdown
+
 # Guitar → Harmonic Fingerprint LUT → Note / Chord Detection (Python prototype for a future JUCE VST)
 
 This repo is a research-stage **template-based pitch / note identification** system for guitar audio.
@@ -50,7 +50,6 @@ Then it normalizes it to remove loudness:
 
 So the LUT is **multi-take per note**, and each take is a richer “feature snapshot”.
 
----
 
 ## LUT format (`lut.json`)
 
