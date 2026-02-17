@@ -1,210 +1,179 @@
 # LUT Guitar Synth Pedal (Polyphonic)
 
-A research/prototype project for a **polyphonic guitar “synth” pedal** built around a **harmonic fingerprint lookup table (LUT)**.
+A research and hardware project building a **polyphonic guitar synth pedal** using a **harmonic fingerprint lookup table (LUT)** for note and chord detection.
 
-Instead of doing full waveform resynthesis, this approach focuses on **template-based harmonic matching** in the frequency domain:
+Instead of traditional waveform resynthesis or naive pitch tracking, this system performs:
 
-- **Monophonic:** classify a single played note by comparing it against a LUT of recorded single-note templates.
-- **Polyphonic:** detect multiple notes (chords/strums) by fitting the live spectrum as a **nonnegative mixture** of single-note templates (NNLS).
+- **Monophonic note detection** via harmonic template matching  
+- **Polyphonic chord detection** using spectral mixture modeling (NNLS)  
+- **Strike detection** to separate attacks from sustain for better tracking  
 
-> Current focus: nailing the math + workflow in Python first, then porting the core ideas into realtime prototypes (JUCE + Daisy Seed).
+The long-term goal is a standalone hardware pedal combining:
 
----
-
-## Project status
-
-**Python LUT + matcher prototype is active** (note detection + chord inference).  
-**Daisy Seed + Audio Shield prototype is in progress** (hardware pedal pipeline).  
-**JUCE project is a skeleton** (intended as a VST/desktop prototype harness).
+- Real-time digital note/chord detection
+- Synth/sample playback engine
+- Analog preamp + overdrive section
+- Flexible routing between clean, driven, and synthesized signals
 
 ---
 
-## System diagrams
+## Project Status
 
-### Pedal-level concept
+- **Python LUT prototype active** — note + chord detection working offline
+- **Strike detection system in development**
+- **Daisy Seed hardware prototype in progress**
+- **JUCE project scaffolded for desktop/VST testing**
+- **Analog front-end planned and partially prototyped**
+
+---
+
+## System Overview
+
+### Pedal Concept
 
 ![Pedal concept](Documentation/images/Guitar%20Pedal.drawio.png)
 
-### Signal flow (LUT + polyphonic inference)
+### Detection + Synthesis Flow
 
 ![LUT polyphonic flow](Documentation/images/LUTPolyphonic.drawio%20(1).png)
 
+---
+
+## Core Detection Approach
+
+### Harmonic Fingerprint LUT
+
+Single-note recordings are analyzed and stored as harmonic “fingerprints.”  
+Each note in the LUT contains multiple takes for robustness.
+
+During detection, the system:
+
+1. Assumes each possible note
+2. Extracts harmonic features under that assumption
+3. Scores against stored templates
+4. Selects the best match
+
+This avoids fragile single-f0 estimation and improves stability across strings and playing styles.
 
 ---
 
-## Repo layout (high level)
+### Polyphonic (Chord) Detection
 
-- `LUT - In Development/`
-  - Python prototype that builds the LUT from labeled `.wav` samples and performs:
-    - monophonic note classification
-    - polyphonic chord note detection (NNLS mixture)
-- `JUCE/`
-  - Skeleton project (future: realtime VST / desktop prototyping harness)
-- `DAISY/`
-  - Skeleton/in-progress hardware prototype (Daisy Seed + Audio Shield)
+Chord detection does **not** use chord templates.
 
----
+Instead:
 
-## What the Python prototype does
+- Single-note templates are converted into spectral templates
+- The live spectrum is modeled as a **nonnegative mixture**
+- NNLS determines which notes are present
+- Results are pruned and thresholded
 
-### 1) Build: create a multi-take LUT per note
-
-For each labeled single-note recording (`.wav`), the build script:
-
-1. Loads WAV (stereo → mono)
-2. Normalizes peak amplitude
-3. Extracts a short analysis segment (`--start`, `--dur`)
-4. (Optional) highpass filters (`--highpass`)
-5. Computes FFT magnitude spectrum (Hann by default)
-6. For the note’s known fundamental `f0` (from MIDI + A4 ref), measures **harmonic peaks**
-
-For harmonic index `h = 1..K`:
-
-- Search near `h * f0` within `± tol_hz`
-- Take the max magnitude in that band
-
-This yields a harmonic amplitude vector:
-
-`v = [A1, A2, ..., AH]`
-
-Normalize to remove loudness:
-
-`fingerprint = v / sum(v)`
-
-Each **take** stored in the LUT also includes extra “stability” features (used for better scoring):
-
-- harmonic peak freqs / amps
-- harmonic slope (linear fit of `log(amp)` vs harmonic index)
-- inharmonicity (avg deviation from ideal harmonic locations)
-- spectral centroid
-- spectral rolloff (85%)
-- spectral flatness
-
-So the LUT is **multi-take per note**, not “one template per note”.
+This allows detection of multiple simultaneous strings without pre-defining chord shapes.
 
 ---
 
-### 2) Monophonic matching (single note)
+### Strike Detection
 
-This system does **not** do “estimate f0 → map to note”.
+Accurate detection requires separating:
 
-Instead it does:
+- **Attack transients (strike)**
+- **Sustained harmonic content**
 
-> “Assume every candidate note is correct, extract harmonic features under that assumption, and score against stored templates.”
+Strike detection helps:
+- Trigger new synth events cleanly
+- Avoid re-triggering during sustain
+- Improve chord onset recognition
 
-For each candidate note in the LUT:
-
-1. Compute candidate `f0` from its MIDI (and A4)
-2. Compute live features **assuming that f0**
-3. Compare against **every stored take** for that note
-4. Collapse take scores into one note score (default: best-take wins)
-
-**Scoring**
-- base: cosine similarity between harmonic fingerprints
-- penalties: feature deltas (inharmonicity, centroid, rolloff, slope, flatness)
-- weights are CLI-tunable
+This subsystem is currently under active development for real-time hardware use.
 
 ---
 
-### 3) Polyphonic matching (chords / multi-string)
+## Analog Front-End (Planned)
 
-Polyphonic mode **does not store chord templates**. It still uses the **single-note LUT**.
+The final pedal will include a dedicated **analog input and overdrive section**.
 
-Workflow:
+### Clean Preamp (Line-Level Conditioning)
 
-**A) Candidate prune (fast prepass)**  
-Compute a quick fingerprint cosine score per note; keep the top `--prune N`.
+The microcontroller expects a stable line-level signal.  
+A clean preamp stage is required to:
 
-**B) Build FFT-bin templates for each take**  
-Convert each take into a template over FFT bins by “painting” Gaussian bumps at harmonic frequencies.
-Optionally add detuned variants (± `--detune_cents`) to handle tuning drift.
+- Properly buffer guitar pickups
+- Provide adjustable gain
+- Condition signal before ADC
 
-**C) Fit mixture with NNLS**  
-Solve:
+A functional prototype based on a CMOY-style op-amp design already exists and will be adapted for guitar-level input:
 
-`min ||A x - y||  subject to x >= 0`
+https://tangentsoft.com/audio/cmoy/
 
-Where:
-- `y` is the live FFT magnitude (optionally `log1p`)
-- `A` columns are take templates (including detunes)
-- `x` are nonnegative activations
-
-**D) Collapse take activations → note strengths**  
-Take max activation per note, normalize, threshold, return up to `--max_notes`.
+This will likely be redesigned onto a custom PCB.
 
 ---
 
-## LUT format (`lut.json`)
+### Analog Overdrive
 
-Each LUT note entry contains:
+Two overdrive-style circuits are being explored:
 
-- `note`, `midi`, `f0_hz`
-- analysis params used at build time (`k`, `tol_hz`, `window`, `analysis_start_sec`, `analysis_dur_sec`)
-- `takes[]`: list of per-recording templates/features
-- `source_wavs[]`: list of wavs used for that note
+- A classic op-amp soft-clipping design (Wampler reference topology)  
+  https://www.wamplerpedals.com/blog/latest-news/2020/05/how-to-design-a-basic-overdrive-pedal-circuit/
 
-Example (simplified):
+- A preamp-style overdrive inspired by the Tascam 424  
+  https://aionfx.com/app/files/docs/424_preamp_documentation.pdf
 
-```json
-{
-  "note": "E3",
-  "midi": 52,
-  "f0_hz": 164.81,
-  "k": 60,
-  "tol_hz": 15.0,
-  "window": "hann",
-  "analysis_start_sec": 0.12,
-  "analysis_dur_sec": 0.18,
-  "takes": [
-    {
-      "fingerprint": [ ... ],
-      "peak_freqs": [ ... ],
-      "peak_amps": [ ... ],
-      "harm_slope": -0.42,
-      "inharm": 0.0031,
-      "centroid_hz": 812.4,
-      "rolloff_hz": 2490.0,
-      "flatness": 0.018
-    }
-  ],
-  "source_wavs": ["samples/E3.wav", "samples/E3_lowstring.wav"]
-}
-## Analog Overdrive Section (Planned)
+The final hardware pedal will include an analog drive stage for:
 
-The final pedal will include a **fully analog overdrive circuit** alongside the LUT-based note detection and synth engine.
-
-We are using the basic overdrive topology outlined by Brian Wampler as a learning and reference design:
-
-https://www.wamplerpedals.com/blog/latest-news/2020/05/how-to-design-a-basic-overdrive-pedal-circuit/
-
-All required components for this circuit are already on hand. The overdrive will be implemented in hardware as part of the final pedal build.
-
-### What this adds to the pedal
-
-- True analog soft-clipping overdrive
-- Gain (Drive), Tone, and Volume control
-- Traditional op-amp + diode clipping topology
-- Integrated into the same enclosure as the digital synth system
-
-### Why analog?
-
-The LUT synth system handles pitch detection and synthesis digitally, but distortion is often more natural, responsive, and low-latency in analog form. Including an analog overdrive stage allows:
-
-- Classic guitar drive tones
+- Traditional guitar overdrive tones
 - Synth-through-drive textures
-- Flexible routing options in the final hardware design
+- Flexible signal routing options
 
-The current repository does **not** yet contain the analog schematic implementation — this will be part of the hardware build phase (Daisy Seed prototype → final pedal PCB).
+---
 
-More detailed circuit documentation will live in a dedicated `analog/` folder once finalized.
+## Analog Preprocessing & Detection Accuracy
+
+There is ongoing investigation into whether analog preprocessing can improve polyphonic detection accuracy. Possible areas:
+
+- Adjustable input gain
+- Mild high-pass filtering
+- Dynamic range conditioning
+- Controlled saturation before ADC
+
+A clean, well-scaled input signal is critical for stable harmonic fingerprint matching.
+
+---
+
+## Repository Layout
+
+- `LUT - In Development/`  
+  Python prototype for LUT building and note/chord detection
+
+- `JUCE - In Development/`  
+  Desktop/VST prototyping environment (skeleton)
+
+- `DAISY - In Development/`  
+  Hardware prototype (Daisy Seed + Audio Shield)
+
+- `Documentation/`  
+  Diagrams, status reports, and supporting materials
+
+---
 
 ## Status Reports
-### Latest Status Report
+
+### Latest
 [Status Report 3](Documentation/status_reports/status_report_3)
 
-### All Status Reports
-[Status Report 3](Documentation/status_reports/status_report_3)
+### Archive
+- [Status Report 2](Documentation/status_reports/status_report_2)
+- [Status Report 1](Documentation/status_reports/status_report_1)
 
-[Status Report 2](Documentation/status_reports/status_report_2)
+---
 
-[Status Report 1](Documentation/status_reports/status_report_1)
+## Long-Term Goal
+
+A standalone polyphonic guitar synth pedal combining:
+
+- Harmonic fingerprint note/chord detection
+- Real-time synthesis
+- Analog drive and tone shaping
+- Hardware-friendly DSP
+- Expandable routing architecture
+
