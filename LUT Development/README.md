@@ -1,175 +1,254 @@
-# Guitar → Harmonic Fingerprint LUT → Note Detection → Synth (JUCE VST)
 
-A research-stage pipeline for converting recorded guitar notes into **normalized harmonic fingerprints**, stored in a lookup table (LUT), for real-time note detection inside a future JUCE VST.
+# Guitar → Harmonic Fingerprint LUT → Note / Chord Detection (Python prototype for a future JUCE VST)
 
----
+This repo is a research-stage **template-based pitch / note identification** system for guitar audio.
 
-## Project Goal
+It builds a **lookup table (LUT)** of *single-note templates* from labeled `.wav` recordings, then:
 
-The long-term goal is to build a guitar-to-synth VST that:
+- **Monophonic:** classifies a single played note by scoring it against every note in the LUT (and every *take* of that note).
+- **Polyphonic:** detects multiple notes (like a chord / strum) by fitting the spectrum as a **nonnegative mixture** of note templates (NNLS).
 
-1. Takes live instrument input
-2. Identifies which note is being played
-3. Uses that detected note to trigger a separate synthesized or sampled sound
-
-This repository contains the **Python modeling + detection stage**, which:
-
-- Extracts harmonic fingerprints from recorded guitar notes
-- Stores them in a lookup table (LUT)
-- Matches unknown input audio against the LUT
-- Selects the most similar note using cosine similarity
-
-This system does **not** recreate the waveform directly.  
-Instead, it performs **template matching in harmonic space**.
+This is not waveform resynthesis. It’s **harmonic-structure matching** in the frequency domain.
 
 ---
 
-## Core Idea
+## What the code actually does
 
-Instead of fitting sine waves to reconstruct the signal, we:
+### 1) Build step: multi-take templates per note
 
-1. Assume a candidate note with known fundamental frequency: f0
-2. Measure harmonic energy at integer multiples:
+For each labeled note recording, the script:
 
-   fk = k * f0
+1. Loads the WAV (stereo → mono)
+2. Normalizes peak amplitude
+3. Extracts a short analysis window (`--start`, `--dur`)
+4. Optionally highpass filters (`--highpass`)
+5. Computes an FFT magnitude spectrum (Hann by default)
+6. For that note’s known fundamental `f0` (from MIDI + A4 reference), measures **harmonic peaks**
 
-3. Normalize those harmonic amplitudes
-4. Store that normalized vector as the note’s fingerprint
+For harmonic index `h = 1..K`:
 
-Later, live input is classified by comparing its harmonic fingerprint to the LUT.
+- Look near `h * f0` within `± tol_hz`
+- Take the **max magnitude** in that band
 
----
+That yields a harmonic amplitude vector:
 
-## Harmonic Fingerprint Model
+`v = [A1, A2, ..., A_H]`
 
-For a note with fundamental f0, we compute:
+Then it normalizes it to remove loudness:
 
-Hk = energy near (k * f0)
+`fingerprint = v / sum(v)`
 
-for k = 1, 2, ..., K
+**But** the LUT doesn’t store just the fingerprint — each take stores extra spectral features too:
 
-We then normalize:
+- harmonic peak frequencies (per harmonic)
+- harmonic peak magnitudes (per harmonic)
+- harmonic slope (linear fit of `log(amp)` vs harmonic index)
+- inharmonicity (average relative deviation from ideal `k*f0`)
+- spectral centroid
+- spectral rolloff (85%)
+- spectral flatness
 
-Hk_norm = Hk / (sum_{i=1..K} Hi)
+So the LUT is **multi-take per note**, and each take is a richer “feature snapshot”.
 
-The resulting vector:
 
-h = [H1_norm, H2_norm, ..., HK_norm]
+## LUT format (`lut.json`)
 
-is the **harmonic fingerprint** of that note.
+Each note entry contains:
 
-This removes loudness dependency and focuses only on harmonic structure.
+- `note`, `midi`, `f0_hz`
+- analysis params used at build time (`k`, `tol_hz`, `window`, `analysis_start_sec`, `analysis_dur_sec`)
+- `takes[]`: list of per-recording templates
+- `source_wavs[]`: which wav files produced the takes
 
----
-
-## Why This Works
-
-A guitar tone consists of:
-
-- A fundamental frequency
-- Harmonic overtones
-- A transient attack
-
-The harmonic amplitude ratios are relatively stable for:
-
-- A given string
-- A given fret
-- A given pickup configuration
-
-Even if:
-
-- Volume changes
-- Pick strength changes
-- Slight EQ shifts occur
-
-…the **relative harmonic structure** remains similar.
-
-This makes harmonic fingerprints effective for classification.
-
----
-
-## FFT Analysis
-
-We compute the short-time FFT of a Hann-windowed segment:
-
-X[k] = Σ_{n=0..N-1} x[n] * w[n] * exp(-j * 2π * k * n / N)
-
-We then measure harmonic energy as:
-
-Hk = max(|X(f)|) near (k * f0)
-
-within a small tolerance window (e.g., ±15 Hz).
-
-This is repeated for each harmonic.
-
----
-
-## Live Note Detection (Template Matching)
-
-For an unknown input signal:
-
-1. For each candidate note in the LUT:
-   - Assume its known f0
-   - Extract harmonic fingerprint from live audio
-2. Compare the live fingerprint h_live with stored template h_lut
-
-We use cosine similarity:
-
-similarity = (h_live · h_lut) / (||h_live|| * ||h_lut||)
-
-The note with the highest similarity is selected.
-
-This avoids explicit fundamental detection and reduces octave errors.
-
----
-
-## LUT Format
-
-Example entry:
+Example (simplified):
 
 ```json
 {
-  "note": "E6",
-  "midi": 88,
-  "f0_hz": 1318.51,
+  "note": "E3",
+  "midi": 52,
+  "f0_hz": 164.81,
   "k": 60,
-  "fingerprint": [0.28, 0.21, 0.16, 0.09]
+  "tol_hz": 15.0,
+  "window": "hann",
+  "analysis_start_sec": 0.12,
+  "analysis_dur_sec": 0.18,
+  "takes": [
+    {
+      "fingerprint": [...],
+      "peak_freqs": [...],
+      "peak_amps": [...],
+      "harm_slope": -0.42,
+      "inharm": 0.0031,
+      "centroid_hz": 812.4,
+      "rolloff_hz": 2490.0,
+      "flatness": 0.018
+    }
+  ],
+  "source_wavs": ["samples/E3.wav", "samples/E3_lowstring.wav"]
 }
-```
+````
+
 ---
 
-## System Architecture
+## 2) Monophonic matching (single note)
 
-Below is the high-level signal flow of the system:
+Monophonic classification is **not**:
 
-![System Architecture](LUTPolyphonic.drawio.png)
+> “extract one fingerprint from the unknown and compare to stored fingerprints”
 
-### Flow Overview
+Instead the code does this:
 
-1. **Instrument Audio**
-   - Raw guitar signal enters the system.
+For **each candidate note** in the LUT:
 
-2. **Note Classifier (LUT)**
-   - Extracts harmonic fingerprint
-   - Compares against stored LUT entries
-   - Outputs nearest note identity
+1. Compute that candidate note’s `f0` from its MIDI (and A4 ref)
+2. Compute **live features assuming that f0** (fingerprint + other features)
+3. Compare the live features against **every stored take** for that note
 
-3. **Pitch Tracking (FFT-based)**
-   - Tracks actual continuous pitch (for bends/vibrato)
-   - Uses reference note from classifier
-   - Outputs real-time pitch ratio
+### Scoring: cosine similarity + feature penalties
 
-4. **Strike Detection**
-   - Detects whether note is newly struck or sustained
-   - Controls envelope triggering
+* base similarity: `cosine(fingerprint_live, fingerprint_take)`
+* penalties for:
 
-5. **Synthesizer**
-   - Receives:
-     - Detected note identity
-     - Continuous pitch data
-     - Strike state
-   - Plays or sustains sample
-   - Applies pitch shifting if needed
+  * inharmonicity difference
+  * centroid ratio difference (log)
+  * rolloff ratio difference (log)
+  * harmonic slope difference
+  * flatness difference
 
-6. **Output**
-   - Final synthesized audio sent to speakers/pedal output
+Weights are CLI tunable (`--w_inharm`, `--w_centroid`, etc.)
+
+### Multi-take collapse (important)
+
+A note has multiple takes → multiple scores.
+
+Those take scores get collapsed into a **single note score** using:
+
+* `--score_mode max` (default): best take wins
+* `--score_mode mean`
+* `--score_mode topk --topk N`: average of top N takes
+
+Then the note with the highest final score is your winner.
+
+So the classifier is basically:
+
+> “try every note as if it were correct, see which assumption produces the best harmonic alignment + feature match.”
+
+---
+
+## 3) Polyphonic matching (chords / multi-string)
+
+Polyphonic mode does **not** store chord templates.
+
+It still uses the same **single-note LUT** — but match time changes.
+
+### Step A — prune candidate notes (fast pre-pass)
+
+It runs a cheap fingerprint cosine score per note and keeps only the top `--prune N` notes to limit NNLS size.
+
+### Step B — build FFT-bin templates for each take
+
+For each candidate note and each take:
+
+* Convert the take fingerprint into a **template vector over FFT bins**
+* “Paint” a small Gaussian bump at each harmonic frequency
+* Weight bumps by the take’s fingerprint values
+* Normalize template to unit norm
+
+Optionally it adds detuned template variants (`--detune_cents`, default ±20c) to handle tuning drift.
+
+You end up with a matrix:
+
+`A = [template_1 template_2 ... template_M]`
+
+### Step C — fit the live spectrum as a nonnegative mixture (NNLS)
+
+It computes the live FFT magnitude `y` (optionally `log1p` with `--logmag`), normalizes it, then solves:
+
+`min ||A x - y||  subject to x >= 0`
+
+(using `scipy.optimize.nnls`)
+
+### Step D — collapse templates → notes
+
+Multiple templates correspond to the same note (multiple takes + detunes).
+
+The code collapses them by taking the **max weight per note**, normalizes note strengths by the max, then outputs up to `--max_notes` above `--thresh`.
+
+So polyphonic output is:
+
+> “which notes have strong activations in the NNLS mixture.”
+
+---
+
+## Commands
+
+### Build LUT from explicit labels
+
+```bash
+python wav_to_lut.py build --out lut.json --k 60 --tol 15 --start 0.12 --dur 0.18 \
+  E3=samples/E3.wav E3=samples/E3_lowstring.wav
+```
+
+### Build LUT from a directory (note parsed from filename)
+
+Supports filenames like:
+
+* `E6.wav`
+* `F#4_take2.wav`
+* `Bb3-clean.wav`
+* `E3_lowstring.wav`
+
+```bash
+python wav_to_lut.py build_dir --out lut.json --dir samples --k 60 --tol 15 --start 0.12 --dur 0.18
+```
+
+### Match monophonic
+
+```bash
+python wav_to_lut.py match --lut lut.json --wav unknown.wav --start 0.12 --dur 0.18 --plot
+```
+
+Useful knobs:
+
+* `--score_mode max|mean|topk`
+* `--w_inharm ...` etc (feature penalty weights)
+
+### Match polyphonic (chord)
+
+```bash
+python wav_to_lut.py match_poly --lut lut.json --wav chord.wav --start 0.12 --dur 0.18 \
+  --max_notes 6 --thresh 0.25 --prune 60 --detune_cents 20 --logmag --plot
+```
+
+---
+
+## Notes / assumptions baked into the approach
+
+* The system **does not do explicit f0 estimation** first.
+
+  * It instead evaluates candidates by “assuming” their f0 and measuring harmonic alignment.
+* Short windows matter: `--start` and `--dur` heavily affect stability (attack vs sustain).
+* Polyphonic mode is spectrum-mixture-based (NNLS), so it works best when:
+
+  * notes are reasonably harmonic
+  * not too much distortion / noise
+  * pruning keeps the NNLS problem manageable
+
+---
+
+## Roadmap (VST direction)
+
+This Python code is meant to prototype:
+
+* a note/chord detector that can run on short windows
+* multi-take robustness (different strings / pickups / picking styles)
+* template-mixture chord inference
+
+A JUCE plugin version would likely need:
+
+* streaming / overlap-add analysis windows
+* faster solvers or approximations than full NNLS
+* onset (“strike”) detection and tracking across frames
+
+```
+```
