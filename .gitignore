@@ -8,3 +8,4 @@
 .vscode/
 *.log
 build/
+/demo3/Builds
