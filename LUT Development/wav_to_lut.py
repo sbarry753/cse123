@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
 wav_to_lut.py
-Harmonic fingerprint LUT builder + matcher (multi-take per note + richer features).
+Harmonic fingerprint LUT builder + matcher (multi-take per note + polyphonic chord detection).
 
-Core idea:
+Core idea (single note):
 - For a candidate note with known f0(note), measure harmonic energy near k*f0 for k=1..K.
 - Normalize those harmonic energies -> fingerprint vector.
 - Store MULTIPLE takes per note (each take is a separate lookup).
 - During matching: score live vs ALL takes for each note, and use the best take score.
 
-Upgrades for accuracy (per take, stored in LUT):
-- fingerprint: normalized harmonic amplitude vector (sum-to-1)
-- peak_freqs: peak frequency near each harmonic
-- peak_amps:  peak magnitude near each harmonic
-- harm_slope: slope of log(amp_k) vs k (spectral envelope proxy)
-- inharm:     average relative deviation of peak_freqs from k*f0
-- centroid_hz, rolloff_hz, flatness: simple spectral features
+Polyphonic extension (chords / 6-string):
+- Keep LUT as SINGLE-NOTE templates.
+- At match time, build per-take harmonic "templates" in FFT-bin space.
+- Fit the live spectrum as a nonnegative mixture of templates (NNLS).
+- Collapse take activations -> note activations -> return notes present.
 
 Commands:
   1) Build LUT from labeled recordings (NOTE=path):
@@ -25,15 +23,17 @@ Commands:
   2) Build LUT from a directory (auto-note from filename, supports E3_lowstring.wav):
     python wav_to_lut.py build_dir --out lut.json --dir samples --k 60 --tol 15 --start 0.12 --dur 0.18
 
-  3) Match an unknown recording:
+  3) Match a MONOPHONIC unknown recording:
     python wav_to_lut.py match --lut lut.json --wav unknown.wav --start 0.12 --dur 0.18 --plot
+
+  4) Match a POLYPHONIC recording (chord):
+    python wav_to_lut.py match_poly --lut lut.json --wav chord.wav --start 0.12 --dur 0.18 \
+        --max_notes 6 --thresh 0.25 --prune 60 --detune_cents 20 --logmag --plot
 
 Optional:
   --plot : show spectrum + note scores
-  --top  : show top N matches
+  --top  : show top N matches (monophonic)
   --highpass : apply simple highpass to reduce rumble (optional)
-  --score_mode : how to collapse multiple take scores into a note score: max | mean | topk
-  --topk : if score_mode=topk, average the top-k take scores
 
 Requirements:
   pip install numpy scipy matplotlib
@@ -50,6 +50,7 @@ from collections import defaultdict
 import numpy as np
 from scipy.io import wavfile
 from scipy.signal import get_window, butter, sosfilt
+from scipy.optimize import nnls
 import matplotlib.pyplot as plt
 
 
@@ -144,10 +145,23 @@ def note_from_filename(path: Path) -> str:
 # -----------------------------
 # Audio helpers
 # -----------------------------
-def to_mono(x: np.ndarray) -> np.ndarray:
-    if x.ndim == 1:
-        return x.astype(np.float64)
-    return x.mean(axis=1).astype(np.float64)
+def read_wav_mono_float(wav_path: str) -> Tuple[int, np.ndarray]:
+    """
+    Read wav and return (fs, mono_float64) normalized to [-1,1] if integer PCM.
+    """
+    fs, x = wavfile.read(wav_path)
+
+    if isinstance(x, np.ndarray) and x.ndim > 1:
+        x = x.mean(axis=1)
+
+    # Convert to float64 in [-1,1] if integer
+    if x.dtype.kind in "iu":
+        maxv = float(np.iinfo(x.dtype).max)
+        x = x.astype(np.float64) / maxv
+    else:
+        x = x.astype(np.float64)
+
+    return int(fs), x
 
 
 def normalize_peak(x: np.ndarray) -> np.ndarray:
@@ -231,7 +245,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # -----------------------------
-# Extra features for accuracy
+# Extra features for accuracy (monophonic scorer)
 # -----------------------------
 def harmonic_peaks(freqs: np.ndarray,
                    mag: np.ndarray,
@@ -483,10 +497,7 @@ def build_lut(
         new_sources: List[str] = []
 
         for wav_path in wav_paths:
-            fs, x = wavfile.read(wav_path)
-            x = to_mono(x)
-            if x.dtype.kind in "iu":
-                x = x.astype(np.float64) / float(np.iinfo(x.dtype).max)
+            fs, x = read_wav_mono_float(wav_path)
             x = normalize_peak(x)
 
             seg = pick_segment(x, fs, start, dur)
@@ -511,7 +522,7 @@ def build_lut(
                 fps = old.get("fingerprints", [])
                 srcs = old_sources if old_sources else ["<unknown_take>"] * len(fps)
                 rebuilt = []
-                for fp, src in zip(fps, srcs):
+                for fp, _src in zip(fps, srcs):
                     rebuilt.append({
                         "fingerprint": fp,
                         "peak_freqs": [],
@@ -583,7 +594,7 @@ def gather_wavs_from_dir(dir_path: str, recursive: bool) -> List[Path]:
 
 
 # -----------------------------
-# Match
+# Match (monophonic)
 # -----------------------------
 def match_note(
     lut_path: str,
@@ -611,10 +622,7 @@ def match_note(
     if not entries:
         raise ValueError("LUT has no entries.")
 
-    fs, x = wavfile.read(wav_path)
-    x = to_mono(x)
-    if x.dtype.kind in "iu":
-        x = x.astype(np.float64) / float(np.iinfo(x.dtype).max)
+    fs, x = read_wav_mono_float(wav_path)
     x = normalize_peak(x)
 
     seg = pick_segment(x, fs, start, dur)
@@ -708,6 +716,233 @@ def match_note(
 
 
 # -----------------------------
+# Match (polyphonic): NNLS mixture of harmonic templates
+# -----------------------------
+def cents_to_ratio(cents: float) -> float:
+    return float(2.0 ** (cents / 1200.0))
+
+
+def make_harm_template(
+    freqs: np.ndarray,
+    f0: float,
+    fp: np.ndarray,
+    tol_hz: float,
+    detune_ratio: float = 1.0,
+) -> np.ndarray:
+    """
+    Build an FFT-bin-space template by "painting" bumps at harmonic locations.
+    fp is the take's harmonic fingerprint weights (sum-to-1).
+    """
+    t = np.zeros_like(freqs, dtype=np.float64)
+    nyq = float(freqs[-1])
+    if f0 <= 0:
+        return t
+
+    # bump width: related to tol_hz
+    sigma = max(1.0, float(tol_hz) / 2.5)
+
+    f0d = float(f0) * float(detune_ratio)
+
+    for h, w in enumerate(fp, start=1):
+        fh = h * f0d
+        if fh >= nyq:
+            break
+        # gaussian bump centered at fh
+        t += float(w) * np.exp(-0.5 * ((freqs - fh) / sigma) ** 2)
+
+    # normalize
+    t /= (np.linalg.norm(t) + 1e-12)
+    return t
+
+
+def quick_note_prune(
+    lut_entries: List[Dict[str, Any]],
+    seg: np.ndarray,
+    fs: int,
+    a4: float,
+    tol_hz: float,
+    window: str,
+    prune_top_notes: int,
+) -> List[str]:
+    """
+    Cheap pre-pass: score each note by cosine(live_fp, best_take_fp) and keep top N notes.
+    """
+    scored: List[Tuple[str, float]] = []
+    for e in lut_entries:
+        note = str(e.get("note", "?"))
+        midi = int(e.get("midi", 0))
+        f0 = midi_to_freq_hz(midi, a4_hz=a4)
+        k = int(e.get("k", 60))
+
+        live_fp = fingerprint_for_note(seg, fs, f0, k=k, tol_hz=tol_hz, window=window)
+        best = 0.0
+        takes = e.get("takes", [])
+        if not takes and "fingerprints" in e:
+            takes = [{"fingerprint": fp} for fp in e.get("fingerprints", [])]
+        if not takes and "fingerprint" in e:
+            takes = [{"fingerprint": e.get("fingerprint", [])}]
+
+        for t in takes:
+            ref_fp = np.array(t.get("fingerprint", []), dtype=np.float64)
+            best = max(best, cosine_similarity(live_fp, ref_fp))
+        scored.append((note, float(best)))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    keep_notes = [n for n, _s in scored[:max(1, int(prune_top_notes))]]
+    return keep_notes
+
+
+def match_poly(
+    lut_path: str,
+    wav_path: str,
+    start: float,
+    dur: float,
+    tol: float,
+    window: Optional[str],
+    a4_override: Optional[float],
+    use_highpass: bool,
+    highpass_hz: float,
+    max_notes: int,
+    thresh: float,
+    prune_top_notes: int,
+    detune_cents: float,
+    logmag: bool,
+    plot: bool,
+):
+    lut = load_lut(lut_path)
+    entries = lut.get("entries", [])
+    if not entries:
+        raise ValueError("LUT has no entries.")
+
+    fs, x = read_wav_mono_float(wav_path)
+    x = normalize_peak(x)
+
+    seg = pick_segment(x, fs, start, dur)
+    if use_highpass:
+        seg = highpass_filter(seg, fs, cutoff_hz=highpass_hz)
+    seg = normalize_peak(seg)
+
+    a4_lut = float(lut.get("meta", {}).get("a4_hz", 440.0))
+    a4 = float(a4_override) if a4_override is not None else a4_lut
+    win = window or str(entries[0].get("window", "hann"))
+
+    freqs, mag = spectrum_mag(seg, fs, window=win)
+
+    y = mag.astype(np.float64)
+    if logmag:
+        y = np.log1p(y)
+    y /= (np.linalg.norm(y) + 1e-12)
+
+    # 1) prune candidates (optional but recommended)
+    keep_notes = quick_note_prune(
+        lut_entries=entries,
+        seg=seg,
+        fs=fs,
+        a4=a4,
+        tol_hz=tol,
+        window=win,
+        prune_top_notes=prune_top_notes,
+    )
+    keep_set = set(keep_notes)
+
+    # 2) build template matrix A (one column per take * detune variant)
+    detunes = [0.0]
+    if detune_cents and detune_cents > 0:
+        detunes = [-float(detune_cents), 0.0, float(detune_cents)]
+
+    cols: List[np.ndarray] = []
+    col_note: List[str] = []
+
+    for e in entries:
+        note = str(e.get("note", "?"))
+        if note not in keep_set:
+            continue
+
+        midi = int(e.get("midi", 0))
+        f0 = midi_to_freq_hz(midi, a4_hz=a4)
+
+        takes = e.get("takes", [])
+        if not takes and "fingerprints" in e:
+            takes = [{"fingerprint": fp} for fp in e.get("fingerprints", [])]
+        if not takes and "fingerprint" in e:
+            takes = [{"fingerprint": e.get("fingerprint", [])}]
+
+        for t in takes:
+            fp = np.array(t.get("fingerprint", []), dtype=np.float64)
+            if fp.size == 0:
+                continue
+            for cents in detunes:
+                ratio = cents_to_ratio(cents)
+                templ = make_harm_template(freqs, f0, fp, tol_hz=tol, detune_ratio=ratio)
+                if np.linalg.norm(templ) < 1e-9:
+                    continue
+                cols.append(templ)
+                col_note.append(note)
+
+    if not cols:
+        print("No templates built (check LUT contents).")
+        return []
+
+    A = np.column_stack(cols)  # shape: [num_bins, num_templates]
+
+    # 3) NNLS solve
+    xw, _ = nnls(A, y)  # nonnegative weights
+
+    # 4) collapse template weights -> note strengths
+    note_strength: Dict[str, float] = {}
+    for w, n in zip(xw, col_note):
+        note_strength[n] = max(note_strength.get(n, 0.0), float(w))
+
+    if not note_strength:
+        print("No note strengths found.")
+        return []
+
+    # normalize strengths to [0,1] by max
+    m = max(note_strength.values()) + 1e-12
+    items = sorted(((n, s / m) for n, s in note_strength.items()), key=lambda p: p[1], reverse=True)
+
+    # pick notes
+    out: List[Tuple[str, float]] = []
+    for n, s in items:
+        if len(out) >= int(max_notes):
+            break
+        if float(s) < float(thresh):
+            break
+        out.append((n, float(s)))
+
+    print("\nDetected notes (polyphonic):")
+    if not out:
+        print("  (none above threshold)")
+    else:
+        for n, s in out:
+            print(f"  {n:6s}  strength={s:.3f}")
+
+    if plot:
+        plt.figure(figsize=(12, 4))
+        plt.plot(freqs, mag)
+        plt.title("Live Segment Magnitude Spectrum")
+        plt.xlabel("Hz")
+        plt.ylabel("|X(f)|")
+        plt.xlim(0, min(8000, freqs[-1]))
+        plt.tight_layout()
+        plt.show()
+
+        top_show = min(12, len(items))
+        notes = [n for n, _s in items[:top_show]]
+        vals = [s for _n, s in items[:top_show]]
+
+        plt.figure(figsize=(12, 4))
+        plt.bar(notes, vals)
+        plt.title(f"Top Note Strengths (poly)  prune={prune_top_notes}  detune={detune_cents}c")
+        plt.xlabel("Note")
+        plt.ylabel("Strength (normalized)")
+        plt.tight_layout()
+        plt.show()
+
+    return out
+
+
+# -----------------------------
 # CLI parsing
 # -----------------------------
 def parse_labeled_args(pairs: List[str]) -> List[Tuple[str, str]]:
@@ -763,7 +998,7 @@ def main():
         help="Overwrite output file instead of merging/appending by note",
     )
 
-    ap_match = sub.add_parser("match", help="Match an unknown note recording against LUT")
+    ap_match = sub.add_parser("match", help="Match an unknown MONOPHONIC note recording against LUT")
     ap_match.add_argument("--lut", required=True, help="LUT json")
     ap_match.add_argument("--wav", required=True, help="Unknown wav to classify")
     ap_match.add_argument("--start", type=float, default=0.10, help="Segment start sec")
@@ -777,18 +1012,36 @@ def main():
     ap_match.add_argument("--top", type=int, default=8, help="Print top N matches")
     ap_match.add_argument("--plot", action="store_true", help="Plot spectrum and top scores")
 
-    # NEW: scoring controls
+    # scoring controls
     ap_match.add_argument("--score_mode", type=str, default="max", choices=["max", "mean", "topk"],
                           help="How to collapse multiple take scores into a note score")
     ap_match.add_argument("--topk", type=int, default=3,
                           help="If score_mode=topk, average the top-k take scores")
 
-    # NEW: feature weights (tweak if needed)
+    # feature weights (tweak if needed)
     ap_match.add_argument("--w_inharm", type=float, default=2.0, help="Penalty weight for inharmonicity difference")
     ap_match.add_argument("--w_centroid", type=float, default=0.5, help="Penalty weight for centroid ratio")
     ap_match.add_argument("--w_rolloff", type=float, default=0.25, help="Penalty weight for rolloff ratio")
     ap_match.add_argument("--w_slope", type=float, default=0.5, help="Penalty weight for harmonic slope difference")
     ap_match.add_argument("--w_flatness", type=float, default=0.25, help="Penalty weight for flatness difference")
+
+    ap_poly = sub.add_parser("match_poly", help="Match a POLYPHONIC chord/strum and output notes present")
+    ap_poly.add_argument("--lut", required=True, help="LUT json")
+    ap_poly.add_argument("--wav", required=True, help="Unknown wav to classify")
+    ap_poly.add_argument("--start", type=float, default=0.10, help="Segment start sec")
+    ap_poly.add_argument("--dur", type=float, default=0.20, help="Segment duration sec")
+    ap_poly.add_argument("--tol", type=float, default=15.0, help="Tolerance Hz for harmonic bumps/templates")
+    ap_poly.add_argument("--window", type=str, default=None, help="FFT window (else LUT default)")
+    ap_poly.add_argument("--a4", type=float, default=None, help="Override A4 reference")
+    ap_poly.add_argument("--highpass", action="store_true", help="Apply a highpass to reduce rumble")
+    ap_poly.add_argument("--highpass_hz", type=float, default=80.0, help="Highpass cutoff Hz")
+    ap_poly.add_argument("--max_notes", type=int, default=6, help="Max notes to output (6 strings)")
+    ap_poly.add_argument("--thresh", type=float, default=0.25, help="Strength threshold (normalized 0..1)")
+    ap_poly.add_argument("--prune", type=int, default=60, help="Keep top-N note candidates before NNLS")
+    ap_poly.add_argument("--detune_cents", type=float, default=20.0,
+                         help="Add detuned template variants at ±cents (0 disables)")
+    ap_poly.add_argument("--logmag", action="store_true", help="Use log1p(mag) before NNLS (often better)")
+    ap_poly.add_argument("--plot", action="store_true", help="Plot spectrum + top note strengths")
 
     args = ap.parse_args()
 
@@ -865,6 +1118,26 @@ def main():
             w_slope=args.w_slope,
             w_rolloff=args.w_rolloff,
             w_flatness=args.w_flatness,
+        )
+        return
+
+    if args.cmd == "match_poly":
+        match_poly(
+            lut_path=args.lut,
+            wav_path=args.wav,
+            start=args.start,
+            dur=args.dur,
+            tol=args.tol,
+            window=args.window,
+            a4_override=args.a4,
+            use_highpass=args.highpass,
+            highpass_hz=args.highpass_hz,
+            max_notes=args.max_notes,
+            thresh=args.thresh,
+            prune_top_notes=args.prune,
+            detune_cents=args.detune_cents,
+            logmag=args.logmag,
+            plot=args.plot,
         )
         return
 
