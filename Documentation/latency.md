@@ -12,6 +12,7 @@ For digital effects processing, there is far more indirection between the physic
 4. The processor sends chunks of the processed audio bitstream to a DAC (digital-to-analog converter), which converts the processed bitstream back into an analog signal.
 
 ![](images/pcm_signal.png)
+
 (Image from Katz, Gentile. *Embedded media processing*. 1st ed. 2005)
 
 A lot of care is required to fulfill this process without introducing unacceptably high latency.
