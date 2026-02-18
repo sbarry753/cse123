@@ -8,7 +8,7 @@ Daisy Skeleton Code
 - [Toolchain/DaisyExamples Installation](https://daisy.audio/tutorials/cpp-dev-env/)
     - Follow the Getting Started tutorial
 - *libDaisy* and *DaisySP* are submodules of the project
-    - If this is oyur first time cloning, you must run it with the **--recurse-submodules** flag to install the libraries
+    - If this is your first time cloning, you must run it with the **--recurse-submodules** flag to install the libraries
     - If you have already cloned and need to pull, to install the libraries you must run 
     ```bash
     git submodule update --init --recursive
@@ -26,5 +26,4 @@ Daisy Skeleton Code
 - Build: **make build**
 - Flash: **make program-dfu**
 - Clean: **make clean**
-- Checkout [tasks.json](tasks.json) for more 
 
