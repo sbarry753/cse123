@@ -35,6 +35,10 @@ Optional:
   --top  : show top N matches (monophonic)
   --highpass : apply simple highpass to reduce rumble (optional)
 
+NEW FLAGS (polyphonic):
+  --algo nnls|omp      choose solver
+  --tol_mode hz|cents  interpret --tol as Hz or cents (cents converted per harmonic)
+
 Requirements:
   pip install numpy scipy matplotlib
 """
@@ -208,12 +212,37 @@ def band_energy_max(freqs: np.ndarray, mag: np.ndarray, center_hz: float, tol_hz
     return float(np.max(mag[mask]))
 
 
+# -----------------------------
+# Tolerance mode helpers (Hz vs cents)
+# -----------------------------
+def cents_to_ratio(cents: float) -> float:
+    return float(2.0 ** (cents / 1200.0))
+
+
+def cents_to_hz_width(center_hz: float, tol_cents: float) -> float:
+    """Return +/- Hz width equivalent to +/- tol_cents around center_hz."""
+    if center_hz <= 0:
+        return 0.0
+    r = 2.0 ** (tol_cents / 1200.0)
+    return float(center_hz * (r - 1.0))
+
+
+def get_tol_hz(center_hz: float, tol_value: float, tol_mode: str) -> float:
+    tol_mode = (tol_mode or "hz").lower()
+    if tol_mode == "hz":
+        return float(tol_value)
+    if tol_mode == "cents":
+        return cents_to_hz_width(center_hz, float(tol_value))
+    raise ValueError(f"Unknown tol_mode '{tol_mode}'. Use hz|cents.")
+
+
 def fingerprint_for_note(
     seg: np.ndarray,
     fs: int,
     note_f0_hz: float,
     k: int,
-    tol_hz: float,
+    tol_value: float,
+    tol_mode: str = "hz",
     window: str = "hann",
 ) -> np.ndarray:
     """Extract a normalized harmonic fingerprint from seg ASSUMING candidate note's f0."""
@@ -225,6 +254,7 @@ def fingerprint_for_note(
         fh = h * note_f0_hz
         if fh >= nyq:
             break
+        tol_hz = get_tol_hz(fh, tol_value, tol_mode)
         amps.append(band_energy_max(freqs, mag, fh, tol_hz))
 
     v = np.array(amps, dtype=np.float64)
@@ -251,9 +281,11 @@ def harmonic_peaks(freqs: np.ndarray,
                    mag: np.ndarray,
                    f0: float,
                    k: int,
-                   tol_hz: float) -> Tuple[np.ndarray, np.ndarray]:
+                   tol_value: float,
+                   tol_mode: str) -> Tuple[np.ndarray, np.ndarray]:
     """
-    For k harmonics, find the peak frequency + peak magnitude near k*f0 within +/- tol_hz.
+    For k harmonics, find the peak frequency + peak magnitude near k*f0 within tolerance.
+    tol_value interpreted by tol_mode (hz|cents).
     Returns:
       peak_freqs[k_used], peak_amps[k_used]
     """
@@ -264,6 +296,7 @@ def harmonic_peaks(freqs: np.ndarray,
         center = h * f0
         if center >= nyq:
             break
+        tol_hz = get_tol_hz(center, tol_value, tol_mode)
         lo = max(0.0, center - tol_hz)
         hi = center + tol_hz
         mask = (freqs >= lo) & (freqs <= hi)
@@ -325,12 +358,13 @@ def features_for_candidate(seg: np.ndarray,
                            fs: int,
                            f0: float,
                            k: int,
-                           tol_hz: float,
+                           tol_value: float,
+                           tol_mode: str,
                            window: str) -> Dict[str, Any]:
     freqs, mag = spectrum_mag(seg, fs, window=window)
 
-    pk_f, pk_a = harmonic_peaks(freqs, mag, f0, k=k, tol_hz=tol_hz)
-    fp = fingerprint_for_note(seg, fs, f0, k=k, tol_hz=tol_hz, window=window)
+    pk_f, pk_a = harmonic_peaks(freqs, mag, f0, k=k, tol_value=tol_value, tol_mode=tol_mode)
+    fp = fingerprint_for_note(seg, fs, f0, k=k, tol_value=tol_value, tol_mode=tol_mode, window=window)
 
     slope = harmonic_slope(pk_a)
     inharm = inharmonicity(pk_f, f0)
@@ -505,7 +539,8 @@ def build_lut(
                 seg = highpass_filter(seg, fs, cutoff_hz=highpass_hz)
             seg = normalize_peak(seg)
 
-            take = features_for_candidate(seg, fs, f0, k=k, tol_hz=tol_hz, window=window)
+            # Build uses Hz tolerance (stored as tol_hz)
+            take = features_for_candidate(seg, fs, f0, k=k, tol_value=tol_hz, tol_mode="hz", window=window)
             new_takes.append(take)
             new_sources.append(str(wav_path))
 
@@ -647,8 +682,8 @@ def match_note(
         tol = float(tol_hz_live) if tol_hz_live is not None else float(e.get("tol_hz", 12.0))
         win = window_live or e.get("window", "hann")
 
-        # Live features *for this candidate f0*
-        live_take = features_for_candidate(seg, fs, f0, k=k, tol_hz=tol, window=win)
+        # Live features *for this candidate f0* (monophonic uses Hz tolerance)
+        live_take = features_for_candidate(seg, fs, f0, k=k, tol_value=tol, tol_mode="hz", window=win)
 
         takes = e.get("takes", [])
         # Backward compatibility: older LUTs might have "fingerprints"
@@ -716,30 +751,25 @@ def match_note(
 
 
 # -----------------------------
-# Match (polyphonic): NNLS mixture of harmonic templates
+# Match (polyphonic): mixture of harmonic templates
 # -----------------------------
-def cents_to_ratio(cents: float) -> float:
-    return float(2.0 ** (cents / 1200.0))
-
-
 def make_harm_template(
     freqs: np.ndarray,
     f0: float,
     fp: np.ndarray,
-    tol_hz: float,
+    tol_value: float,
+    tol_mode: str,
     detune_ratio: float = 1.0,
 ) -> np.ndarray:
     """
     Build an FFT-bin-space template by "painting" bumps at harmonic locations.
     fp is the take's harmonic fingerprint weights (sum-to-1).
+    tol_value interpreted by tol_mode (hz|cents) PER HARMONIC center frequency.
     """
     t = np.zeros_like(freqs, dtype=np.float64)
     nyq = float(freqs[-1])
     if f0 <= 0:
         return t
-
-    # bump width: related to tol_hz
-    sigma = max(1.0, float(tol_hz) / 2.5)
 
     f0d = float(f0) * float(detune_ratio)
 
@@ -747,6 +777,10 @@ def make_harm_template(
         fh = h * f0d
         if fh >= nyq:
             break
+
+        tol_hz = get_tol_hz(fh, tol_value, tol_mode)
+        sigma = max(1.0, float(tol_hz) / 2.5)
+
         # gaussian bump centered at fh
         t += float(w) * np.exp(-0.5 * ((freqs - fh) / sigma) ** 2)
 
@@ -760,7 +794,8 @@ def quick_note_prune(
     seg: np.ndarray,
     fs: int,
     a4: float,
-    tol_hz: float,
+    tol_value: float,
+    tol_mode: str,
     window: str,
     prune_top_notes: int,
 ) -> List[str]:
@@ -774,7 +809,8 @@ def quick_note_prune(
         f0 = midi_to_freq_hz(midi, a4_hz=a4)
         k = int(e.get("k", 60))
 
-        live_fp = fingerprint_for_note(seg, fs, f0, k=k, tol_hz=tol_hz, window=window)
+        live_fp = fingerprint_for_note(seg, fs, f0, k=k, tol_value=tol_value, tol_mode=tol_mode, window=window)
+
         best = 0.0
         takes = e.get("takes", [])
         if not takes and "fingerprints" in e:
@@ -792,12 +828,66 @@ def quick_note_prune(
     return keep_notes
 
 
+def solve_nonneg_omp(A: np.ndarray,
+                     y: np.ndarray,
+                     max_notes: int,
+                     min_corr: float = 1e-3,
+                     min_improve: float = 1e-4) -> np.ndarray:
+    """
+    Greedy sparse selection using nonnegative correlations + small NNLS refits.
+    Returns full-length weight vector x (same columns as A).
+
+    This tends to reduce "neighbor bleed" compared to full NNLS because it selects
+    a small set of templates that actually improve the reconstruction.
+    """
+    _m, n = A.shape
+    selected: List[int] = []
+    r = y.copy()
+    prev_norm = float(np.linalg.norm(r))
+    x_full = np.zeros(n, dtype=np.float64)
+
+    for _ in range(int(max_notes)):
+        scores = A.T @ r
+        j = int(np.argmax(scores))
+        best = float(scores[j])
+
+        if best < float(min_corr):
+            break
+
+        if j not in selected:
+            selected.append(j)
+
+        As = A[:, selected]
+        x_s, _ = nnls(As, y)
+        r_new = y - As @ x_s
+        new_norm = float(np.linalg.norm(r_new))
+
+        if (prev_norm - new_norm) < float(min_improve):
+            # undo last selection if it didn’t help
+            if selected:
+                selected.pop()
+            break
+
+        r = r_new
+        prev_norm = new_norm
+
+    if selected:
+        As = A[:, selected]
+        x_s, _ = nnls(As, y)
+        for idx, val in zip(selected, x_s):
+            x_full[idx] = float(val)
+
+    return x_full
+
+
 def match_poly(
     lut_path: str,
     wav_path: str,
     start: float,
     dur: float,
     tol: float,
+    tol_mode: str,
+    algo: str,
     window: Optional[str],
     a4_override: Optional[float],
     use_highpass: bool,
@@ -839,7 +929,8 @@ def match_poly(
         seg=seg,
         fs=fs,
         a4=a4,
-        tol_hz=tol,
+        tol_value=tol,
+        tol_mode=tol_mode,
         window=win,
         prune_top_notes=prune_top_notes,
     )
@@ -873,7 +964,12 @@ def match_poly(
                 continue
             for cents in detunes:
                 ratio = cents_to_ratio(cents)
-                templ = make_harm_template(freqs, f0, fp, tol_hz=tol, detune_ratio=ratio)
+                templ = make_harm_template(
+                    freqs, f0, fp,
+                    tol_value=tol,
+                    tol_mode=tol_mode,
+                    detune_ratio=ratio
+                )
                 if np.linalg.norm(templ) < 1e-9:
                     continue
                 cols.append(templ)
@@ -885,8 +981,14 @@ def match_poly(
 
     A = np.column_stack(cols)  # shape: [num_bins, num_templates]
 
-    # 3) NNLS solve
-    xw, _ = nnls(A, y)  # nonnegative weights
+    # 3) solve
+    algo_l = (algo or "nnls").lower()
+    if algo_l == "nnls":
+        xw, _ = nnls(A, y)  # nonnegative weights
+    elif algo_l == "omp":
+        xw = solve_nonneg_omp(A, y, max_notes=max_notes)
+    else:
+        raise ValueError(f"Unknown algo '{algo}'. Use nnls|omp.")
 
     # 4) collapse template weights -> note strengths
     note_strength: Dict[str, float] = {}
@@ -933,7 +1035,7 @@ def match_poly(
 
         plt.figure(figsize=(12, 4))
         plt.bar(notes, vals)
-        plt.title(f"Top Note Strengths (poly)  prune={prune_top_notes}  detune={detune_cents}c")
+        plt.title(f"Top Note Strengths (poly)  algo={algo_l}  tol_mode={tol_mode}  prune={prune_top_notes}  detune={detune_cents}c")
         plt.xlabel("Note")
         plt.ylabel("Strength (normalized)")
         plt.tight_layout()
@@ -1030,17 +1132,21 @@ def main():
     ap_poly.add_argument("--wav", required=True, help="Unknown wav to classify")
     ap_poly.add_argument("--start", type=float, default=0.10, help="Segment start sec")
     ap_poly.add_argument("--dur", type=float, default=0.20, help="Segment duration sec")
-    ap_poly.add_argument("--tol", type=float, default=15.0, help="Tolerance Hz for harmonic bumps/templates")
+    ap_poly.add_argument("--tol", type=float, default=15.0, help="Tolerance value (interpreted by --tol_mode)")
+    ap_poly.add_argument("--tol_mode", type=str, default="hz", choices=["hz", "cents"],
+                         help="Interpret --tol as Hz or cents (cents converts per harmonic)")
+    ap_poly.add_argument("--algo", type=str, default="nnls", choices=["nnls", "omp"],
+                         help="Polyphonic solver: nnls (default) or omp (sparser, reduces neighbor bleed)")
     ap_poly.add_argument("--window", type=str, default=None, help="FFT window (else LUT default)")
     ap_poly.add_argument("--a4", type=float, default=None, help="Override A4 reference")
     ap_poly.add_argument("--highpass", action="store_true", help="Apply a highpass to reduce rumble")
     ap_poly.add_argument("--highpass_hz", type=float, default=80.0, help="Highpass cutoff Hz")
     ap_poly.add_argument("--max_notes", type=int, default=6, help="Max notes to output (6 strings)")
     ap_poly.add_argument("--thresh", type=float, default=0.25, help="Strength threshold (normalized 0..1)")
-    ap_poly.add_argument("--prune", type=int, default=60, help="Keep top-N note candidates before NNLS")
+    ap_poly.add_argument("--prune", type=int, default=60, help="Keep top-N note candidates before solve")
     ap_poly.add_argument("--detune_cents", type=float, default=20.0,
                          help="Add detuned template variants at ±cents (0 disables)")
-    ap_poly.add_argument("--logmag", action="store_true", help="Use log1p(mag) before NNLS (often better)")
+    ap_poly.add_argument("--logmag", action="store_true", help="Use log1p(mag) before solve (often better)")
     ap_poly.add_argument("--plot", action="store_true", help="Plot spectrum + top note strengths")
 
     args = ap.parse_args()
@@ -1128,6 +1234,8 @@ def main():
             start=args.start,
             dur=args.dur,
             tol=args.tol,
+            tol_mode=args.tol_mode,
+            algo=args.algo,
             window=args.window,
             a4_override=args.a4,
             use_highpass=args.highpass,
