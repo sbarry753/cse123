@@ -26,35 +26,6 @@ What this stores:
 - harmonic band mask (for optional off-harmonic penalties at match time)
 - per-take harmonic/off-harmonic energy summaries (useful for rejection / penalties)
 - entry-level aggregated statistics across takes (median + std) for more stable matching
-
-<<<<<<< HEAD
-Added features:
-1) Ideal templates per note per string (math-based, not from a single take):
-   - Fits each band dimension as a smooth function of log(f0) across ALL notes on that string
-   - Stored per entry:
-       ideal_band_template_median
-       ideal_band_template_std  (fit residual std per band)
-
-2) Per-string band importance weights (what bands separate notes best):
-   - Fisher-like ratio per band:
-       importance = between_note_var / (within_note_var + eps)
-   - Stored in LUT:
-       lut["string_band_importance"]["strings"][<string_idx>] with:
-         importance_raw, top_raw
-         importance_residual, top_residual (if ideals exist)
-
-Onset fix:
-- Uses dedicated onset_frame_ms/onset_hop_ms (short) instead of feature frame/hop
-- Robust noise floor (percentile on early window) + fallback to peak-RMS
-- Clamps seg_start so it can’t run off the end of the file
-=======
-Added:
-- “Ideal” per-note-per-string templates computed mathematically from ALL notes on that string:
-  Each log-band dimension is fit as a smooth function of log(f0) across the string using polynomial ridge regression.
-  Stored per entry as:
-    - ideal_band_template_median
-    - ideal_band_template_std  (fit residual std per band dim)
->>>>>>> parent of 67013a5 (onset please work)
 """
 
 import argparse
@@ -219,7 +190,7 @@ def pick_segment(x: np.ndarray, fs: int, start_sec: float, dur_sec: float) -> np
 
 
 # -----------------------------
-# Onset detection (robust energy-based)
+# Onset detection (energy-based)
 # -----------------------------
 def frame_signal(x: np.ndarray, frame: int, hop: int) -> np.ndarray:
     if frame <= 0 or hop <= 0:
@@ -244,28 +215,11 @@ def detect_onset_sec_energy(
     hold_frames: int = 3,
     search_start_sec: float = 0.0,
     search_end_sec: Optional[float] = None,
-<<<<<<< HEAD
-    *,
-    noise_sec: float = 0.12,
-    noise_percentile: float = 25.0,
-    fallback_to_peak: bool = True,
-    peak_backtrack_sec: float = 0.03,
-) -> float:
-    """
-    Energy-based onset:
-    - Per-frame RMS
-    - noise_floor = percentile(RMS in early noise_sec window)
-    - onset = first window of hold_frames where RMS >= noise_floor*thresh_ratio
-
-    Fallback:
-    - if never crosses threshold, pick peak-RMS frame and optionally backtrack a bit.
-=======
 ) -> float:
     """
     Finds the first frame where RMS exceeds (noise_floor * thresh_ratio) for hold_frames.
     noise_floor is estimated from the first ~0.25s of the search region.
     Returns onset time in seconds (within original signal).
->>>>>>> parent of 67013a5 (onset please work)
     """
     n = len(x)
     if search_end_sec is None:
@@ -278,19 +232,13 @@ def detect_onset_sec_energy(
 
     xs = x[start_i:end_i]
     frames = frame_signal(xs, frame=frame, hop=hop)
+    # RMS per frame
     rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
 
-<<<<<<< HEAD
-    nf_frames = int(round((noise_sec * fs) / hop))
-    nf_frames = max(8, min(nf_frames, len(rms)))
-    noise_slice = rms[:nf_frames] if nf_frames > 0 else rms
-    noise_floor = float(np.percentile(noise_slice, noise_percentile) + 1e-12)
-
-=======
+    # estimate noise floor from first 0.25s or first 10 frames, whichever larger
     nf_frames = max(10, int(round(0.25 * fs / hop)))
     nf_frames = min(nf_frames, len(rms))
     noise_floor = float(np.median(rms[:nf_frames]) + 1e-12)
->>>>>>> parent of 67013a5 (onset please work)
     thresh = noise_floor * float(thresh_ratio)
 
     hold_frames = max(1, int(hold_frames))
@@ -299,16 +247,7 @@ def detect_onset_sec_energy(
             onset_sample = start_i + i * hop
             return float(onset_sample / fs)
 
-<<<<<<< HEAD
-    if fallback_to_peak and len(rms) > 0:
-        i_peak = int(np.argmax(rms))
-        back = int(round((peak_backtrack_sec * fs) / hop))
-        i0 = max(0, i_peak - back)
-        onset_sample = start_i + i0 * hop
-        return float(onset_sample / fs)
-
-=======
->>>>>>> parent of 67013a5 (onset please work)
+    # fallback: if never crosses, just return search_start
     return float(search_start_sec)
 
 
@@ -425,6 +364,7 @@ def compute_band_template_oneframe(
     if logmag:
         y = np.log1p(y)
     band = pool_to_log_bands(freqs, y, edges, agg=agg)
+    # leave unnormalized here; normalization happens after aggregation
     return band
 
 
@@ -437,6 +377,7 @@ def aggregate_feature(frames_feat: np.ndarray, agg: str = "median") -> np.ndarra
     agg = (agg or "median").lower()
     if agg == "mean":
         return np.mean(frames_feat, axis=0)
+    # default robust
     return np.median(frames_feat, axis=0)
 
 
@@ -465,17 +406,20 @@ def analyze_segment_multiframe(
       band_template (unit norm)
       fingerprint (unit sum, same as original style)
     """
+    # frame segment; if too short, zero-pad to one frame
     if len(seg) < frame_size:
         seg = np.pad(seg, (0, frame_size - len(seg)))
 
-    frames = frame_signal(seg, frame=frame_size, hop=hop_size)
+    frames = frame_signal(seg, frame=frame_size, hop=hop_size)  # (T, frame)
+    # pre-windowing per frame
     w = get_window(window, frame_size, fftbins=True).astype(np.float64)
     frames_w = frames * w[None, :]
 
+    # --- band templates per frame
     bands = []
     fps = []
     for i in range(frames_w.shape[0]):
-        f, mag = spectrum_mag(frames_w[i], fs, window="boxcar")
+        f, mag = spectrum_mag(frames_w[i], fs, window="boxcar")  # already windowed; avoid double windowing
         y = mag.astype(np.float64)
         if band_logmag:
             y = np.log1p(y)
@@ -488,7 +432,7 @@ def analyze_segment_multiframe(
         fps.append(fp_i)
 
     bands = np.stack(bands, axis=0) if bands else np.zeros((1, len(edges) - 1), dtype=np.float64)
-
+    # fingerprints vary in length depending on nyquist & k; pad to max length among frames
     if fps:
         maxlen = max(len(v) for v in fps)
         fp_mat = np.zeros((len(fps), maxlen), dtype=np.float64)
@@ -508,203 +452,13 @@ def analyze_segment_multiframe(
 
 
 # -----------------------------
-# “Ideal” per-string math model (your request)
-# -----------------------------
-def _poly_design(x: np.ndarray, degree: int) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float64).reshape(-1)
-    return np.vstack([x**p for p in range(degree + 1)]).T
-
-
-def _ridge_fit_predict(X: np.ndarray, y: np.ndarray, lam: float, Xq: np.ndarray) -> np.ndarray:
-    d = X.shape[1]
-    A = X.T @ X + float(lam) * np.eye(d)
-    b = X.T @ y
-    w = np.linalg.solve(A, b)
-    return Xq @ w
-
-
-def build_string_ideals_from_entries(
-    entries: List[Dict[str, Any]],
-    *,
-    degree: int = 4,
-    lam: float = 1e-2,
-    min_notes: int = 6,
-) -> int:
-    """
-    For each string, fit each band dimension y_d as a smooth function of x=log(f0_hz) across ALL notes on that string.
-    Then for each entry on that string, predict its “ideal” band template at its f0.
-
-    Mutates entries in-place:
-      - ideal_band_template_median
-      - ideal_band_template_std
-
-    Returns number of entries that received an ideal.
-    """
-    by_string: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for e in entries:
-        if not isinstance(e, dict):
-            continue
-        if "band_template_median" not in e or "f0_hz" not in e:
-            continue
-        try:
-            si = int(e.get("string_idx", -1))
-        except Exception:
-            continue
-        if si < 0:
-            continue
-        by_string[si].append(e)
-
-    wrote = 0
-    for si, group in by_string.items():
-        if len(group) < int(min_notes):
-            continue
-
-        f0 = np.array([float(e["f0_hz"]) for e in group], dtype=np.float64)
-        x = np.log(np.maximum(f0, 1e-9))  # (N,)
-
-        Y = np.stack([np.array(e["band_template_median"], dtype=np.float64) for e in group], axis=0)
-        N, D = Y.shape
-
-<<<<<<< HEAD
-        X = _poly_design(x, degree=int(degree))
-        Xq = X
-=======
-        X = _poly_design(x, degree=int(degree))  # (N, P)
-        Xq = X  # predict at training x (ideal per note)
->>>>>>> parent of 67013a5 (onset please work)
-
-        Yhat = np.zeros_like(Y)
-        resid_std = np.zeros(D, dtype=np.float64)
-
-        for d in range(D):
-            y = Y[:, d]
-            yhat = _ridge_fit_predict(X, y, lam=float(lam), Xq=Xq)
-            Yhat[:, d] = yhat
-            resid_std[d] = float(np.std(y - yhat))
-
-        for i, e in enumerate(group):
-            v = Yhat[i].copy()
-            v[v < 0.0] = 0.0
-            v = l2_normalize(v)
-
-            e["ideal_band_template_median"] = [float(z) for z in v.tolist()]
-            e["ideal_band_template_std"] = [float(z) for z in resid_std.tolist()]
-            wrote += 1
-
-    return wrote
-
-
-# -----------------------------
-<<<<<<< HEAD
-# String band importance (what bands are most discriminative)
-# -----------------------------
-def _normalize_nonneg(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=np.float64)
-    v[v < 0.0] = 0.0
-    s = float(np.sum(v))
-    return v / (s + 1e-12)
-
-
-def compute_string_band_importance(
-    lut: Dict[str, Any],
-    *,
-    top_n: int = 24,
-    eps: float = 1e-12,
-) -> Dict[str, Any]:
-    """
-    Computes per-string band importance weights (Fisher-like):
-      importance[d] = between_note_var[d] / (within_note_var[d] + eps)
-
-    between_note_var: var over band_template_median across notes on the same string
-    within_note_var : mean(band_template_std^2) across notes on the same string
-
-    Also computes "residual" importance if ideal templates exist:
-      residual = band_template_median - ideal_band_template_median
-    """
-    meta_bt = lut.get("meta", {}).get("band_template", {})
-    fmin = float(meta_bt.get("fmin_hz", 40.0))
-    fmax = float(meta_bt.get("fmax_hz", 8000.0))
-    nb = int(meta_bt.get("n_bands", 480))
-    edges = make_log_band_edges(fmin, fmax, nb)
-
-    by_string: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for e in lut.get("entries", []):
-        if not isinstance(e, dict):
-            continue
-        if "string_idx" not in e:
-            continue
-        if "band_template_median" not in e or "band_template_std" not in e:
-            continue
-        try:
-            si = int(e["string_idx"])
-        except Exception:
-            continue
-        by_string[si].append(e)
-
-    out: Dict[str, Any] = {"strings": {}}
-
-    def top_list(w: np.ndarray) -> List[Dict[str, Any]]:
-        idxs = np.argsort(-w)[: int(top_n)]
-        items: List[Dict[str, Any]] = []
-        for idx in idxs:
-            items.append({
-                "band": int(idx),
-                "lo_hz": float(edges[idx]),
-                "hi_hz": float(edges[idx + 1]),
-                "weight": float(w[idx]),
-            })
-        return items
-
-    for si, group in sorted(by_string.items()):
-        if len(group) < 2:
-            continue
-
-        Y = np.stack([np.array(e["band_template_median"], dtype=np.float64) for e in group], axis=0)
-        S = np.stack([np.array(e["band_template_std"], dtype=np.float64) for e in group], axis=0)
-
-        if Y.shape[1] != nb or S.shape[1] != nb:
-            continue
-
-        within_var = np.mean(S * S, axis=0)
-        between_var = np.var(Y, axis=0)
-        imp_raw = _normalize_nonneg(between_var / (within_var + float(eps)))
-
-        has_ideal = all(("ideal_band_template_median" in e) for e in group)
-        if has_ideal:
-            Yid = np.stack([np.array(e["ideal_band_template_median"], dtype=np.float64) for e in group], axis=0)
-            if Yid.shape[1] == nb:
-                R = Y - Yid
-                between_var_r = np.var(R, axis=0)
-                imp_resid = _normalize_nonneg(between_var_r / (within_var + float(eps)))
-            else:
-                imp_resid = None
-        else:
-            imp_resid = None
-
-        out["strings"][str(si)] = {
-            "string_idx": int(si),
-            "n_notes": int(len(group)),
-            "n_bands": int(nb),
-            "band_edges_hz": [float(x) for x in edges.tolist()],
-            "importance_raw": [float(x) for x in imp_raw.tolist()],
-            "top_raw": top_list(imp_raw),
-            "importance_residual": None if imp_resid is None else [float(x) for x in imp_resid.tolist()],
-            "top_residual": None if imp_resid is None else top_list(imp_resid),
-        }
-
-    return out
-
-
-# -----------------------------
-=======
->>>>>>> parent of 67013a5 (onset please work)
 # LUT structure
 # -----------------------------
 @dataclass
 class LutEntry:
-    note: str
-    base_note: str
-    string_idx: int
+    note: str          # label, e.g. "E4_5"
+    base_note: str     # e.g. "E4"
+    string_idx: int    # 0..5
     midi: int
     f0_hz: float
     k: int
@@ -719,6 +473,7 @@ class LutEntry:
     analysis_dur_sec: float
     auto_onset: bool
 
+    # aggregated stats across takes
     band_template_median: List[float]
     band_template_std: List[float]
     fingerprint_median: List[float]
@@ -811,16 +566,12 @@ def build_lut(
         "auto_onset": bool(auto_onset),
         "post_onset_sec": float(post_onset),
         "onset": {
-            "frame_ms": float(onset_frame_ms),
-            "hop_ms": float(onset_hop_ms),
+            "frame_ms": float(frame_ms),
+            "hop_ms": float(hop_ms),
             "thresh_ratio": float(onset_thresh_ratio),
             "hold_frames": int(onset_hold_frames),
             "search_start_sec": float(onset_search_start),
             "search_end_sec": float(onset_search_end),
-            "noise_sec": float(onset_noise_sec),
-            "noise_percentile": float(onset_noise_pct),
-            "fallback_peak": bool(onset_fallback_peak),
-            "peak_backtrack_sec": float(onset_peak_backtrack),
         },
         "normalize": {"mode": str(normalize_mode), "target_rms": float(target_rms)},
         "highpass": {"enabled": bool(use_highpass), "hz": float(highpass_hz)},
@@ -855,8 +606,9 @@ def build_lut(
         midi = note_to_midi(base_note)
         f0 = midi_to_freq_hz(midi, a4_hz=a4)
 
-        frame_size = max(256, int(round((frame_ms / 1000.0) * 1.0)))
-        hop_size = max(64, int(round((hop_ms / 1000.0) * 1.0)))
+        # multiframe sizes (use analysis frame/hop, in samples)
+        frame_size = max(256, int(round((frame_ms / 1000.0) * 1.0)))  # temporary, will re-set per file by fs
+        hop_size = max(64, int(round((hop_ms / 1000.0) * 1.0)))       # temporary, will re-set per file by fs
 
         takes: List[Dict[str, Any]] = []
         sources: List[str] = []
@@ -869,49 +621,32 @@ def build_lut(
         for wav_path in paths:
             fs, x = read_wav_mono_float(wav_path)
 
+            # normalization early to make onset detection more stable
             x = normalize_audio(x, mode=normalize_mode, target_rms=target_rms)
 
             if use_highpass:
                 x = highpass_filter(x, fs, cutoff_hz=highpass_hz)
                 x = normalize_audio(x, mode=normalize_mode, target_rms=target_rms)
 
-<<<<<<< HEAD
-            # feature frame/hop (for spectrum features)
-=======
->>>>>>> parent of 67013a5 (onset please work)
+            # compute actual frame/hop in samples per this fs
             frame_size = max(256, int(round((frame_ms / 1000.0) * fs)))
             hop_size = max(64, int(round((hop_ms / 1000.0) * fs)))
 
             if auto_onset:
-                # onset frame/hop (short, for timing)
-                onset_frame_size = max(128, int(round((onset_frame_ms / 1000.0) * fs)))
-                onset_hop_size = max(32, int(round((onset_hop_ms / 1000.0) * fs)))
-
                 onset_sec = detect_onset_sec_energy(
                     x, fs,
-                    frame=onset_frame_size,
-                    hop=onset_hop_size,
+                    frame=frame_size,
+                    hop=hop_size,
                     thresh_ratio=onset_thresh_ratio,
                     hold_frames=onset_hold_frames,
                     search_start_sec=onset_search_start,
                     search_end_sec=onset_search_end if onset_search_end > 0 else None,
-                    noise_sec=onset_noise_sec,
-                    noise_percentile=onset_noise_pct,
-                    fallback_to_peak=onset_fallback_peak,
-                    peak_backtrack_sec=onset_peak_backtrack,
                 )
-                seg_start = float(onset_sec + float(post_onset))
+                seg_start = onset_sec + float(post_onset)
             else:
                 onset_sec = float("nan")
                 seg_start = float(start)
 
-<<<<<<< HEAD
-            # clamp so segment doesn't run off end
-            max_start = max(0.0, (len(x) / fs) - float(dur) - 1e-3)
-            seg_start = float(min(seg_start, max_start))
-
-=======
->>>>>>> parent of 67013a5 (onset please work)
             seg = pick_segment(x, fs, seg_start, float(dur))
             seg = normalize_audio(seg, mode=normalize_mode, target_rms=target_rms)
 
@@ -930,6 +665,7 @@ def build_lut(
                 hop_size=hop_size,
             )
 
+            # harmonic/off-harmonic energy summaries (using band template)
             harm_energy = float(np.sum(band_vec * harm_mask))
             off_energy = float(np.sum(band_vec * (1.0 - harm_mask)))
             harm_ratio = float(harm_energy / (off_energy + 1e-12))
@@ -946,8 +682,6 @@ def build_lut(
                 "segment_dur_sec": float(dur),
                 "frame_size": int(frame_size),
                 "hop_size": int(hop_size),
-                "onset_frame_size": int(onset_frame_size) if auto_onset else None,
-                "onset_hop_size": int(onset_hop_size) if auto_onset else None,
                 "fs": int(fs),
             })
             sources.append(str(wav_path))
@@ -955,15 +689,17 @@ def build_lut(
             band_take_list.append(band_vec)
             fp_take_list.append(fp_vec)
 
+        # aggregate across takes for this class entry
         if band_take_list:
             band_mat = np.stack(band_take_list, axis=0)
             band_med = np.median(band_mat, axis=0)
             band_std = np.std(band_mat, axis=0)
-            band_med = l2_normalize(band_med)
+            band_med = l2_normalize(band_med)  # keep template normalized
         else:
             band_med = np.zeros(len(edges) - 1, dtype=np.float64)
             band_std = np.zeros(len(edges) - 1, dtype=np.float64)
 
+        # fingerprints may have different length (k vs nyq); pad to max
         if fp_take_list:
             maxlen = max(len(v) for v in fp_take_list)
             fp_mat = np.zeros((len(fp_take_list), maxlen), dtype=np.float64)
@@ -1005,6 +741,7 @@ def build_lut(
             old["takes"] = list(old["takes"]) + takes
             old["source_wavs"] = list(old["source_wavs"]) + sources
 
+            # refresh meta fields
             for f in [
                 "note", "base_note", "string_idx", "midi", "f0_hz", "k",
                 "tol_value", "tol_mode", "window",
@@ -1023,38 +760,6 @@ def build_lut(
             lut["entries"].append(entry)
             print(f"[build] added   {entry['note']}: takes={len(sources)}")
 
-    # --- NEW: compute “ideal” per-entry templates from ALL notes on each string
-    wrote = build_string_ideals_from_entries(
-        lut["entries"],
-        degree=4,
-        lam=1e-2,
-        min_notes=6,
-    )
-    lut["meta"]["ideals_by_string"] = {
-        "method": "poly_ridge_fit_per_band_dim",
-        "x": "log(f0_hz)",
-        "degree": 4,
-        "lambda": 1e-2,
-        "min_notes": 6,
-        "stored_fields": ["ideal_band_template_median", "ideal_band_template_std"],
-<<<<<<< HEAD
-        "entries_written": int(wrote_ideals),
-    }
-
-    # --- NEW 2: compute per-string band importance masks
-    lut["string_band_importance"] = compute_string_band_importance(lut, top_n=24)
-    lut["meta"]["string_band_importance"] = {
-        "method": "fisher_ratio_between_over_within",
-        "between": "var_across_notes_on_same_string (band_template_median)",
-        "within": "mean(band_template_std^2) across notes",
-        "stored_at": "lut['string_band_importance']",
-        "notes": "importance_residual uses band_template_median - ideal_band_template_median when available.",
-=======
-        "note": "Fit uses per-entry band_template_median across all notes on the same string.",
-        "entries_written": int(wrote),
->>>>>>> parent of 67013a5 (onset please work)
-    }
-
     save_lut(out_path, lut)
     print(f"Saved LUT -> {out_path} with {len(lut['entries'])} class entries")
 
@@ -1063,13 +768,16 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # Shared defaults tuned for string separation / live robustness
     def add_common(apx: argparse.ArgumentParser) -> None:
         apx.add_argument("--out", required=True)
 
+        # fingerprint params
         apx.add_argument("--k", type=int, default=60)
         apx.add_argument("--tol", type=float, default=20.0)
         apx.add_argument("--tol_mode", type=str, default="cents", choices=["hz", "cents"])
 
+        # segment params (used if not auto-onset; dur always used)
         apx.add_argument("--start", type=float, default=0.10)
         apx.add_argument("--dur", type=float, default=0.20)
 
@@ -1081,6 +789,7 @@ def main():
 
         apx.add_argument("--replace_existing", action="store_true")
 
+        # band template params
         apx.add_argument("--band_fmin", type=float, default=40.0)
         apx.add_argument("--band_fmax", type=float, default=8000.0)
         apx.add_argument("--band_n", type=int, default=480)
@@ -1090,10 +799,12 @@ def main():
         apx.add_argument("--mask_tol", type=float, default=20.0)
         apx.add_argument("--mask_tol_mode", type=str, default="cents", choices=["hz", "cents"])
 
+        # multiframe analysis params (recommended for live)
         apx.add_argument("--feat_agg", type=str, default="median", choices=["median", "mean"])
         apx.add_argument("--frame_ms", type=float, default=46.0, help="analysis frame length in ms")
         apx.add_argument("--hop_ms", type=float, default=12.0, help="analysis hop in ms")
 
+        # onset detection params
         apx.add_argument("--auto_onset", action="store_true", help="detect onset and analyze after pick attack")
         apx.add_argument("--onset_thresh_ratio", type=float, default=6.0)
         apx.add_argument("--onset_hold_frames", type=int, default=3)
@@ -1101,24 +812,13 @@ def main():
         apx.add_argument("--onset_search_end", type=float, default=0.0, help="0 = end of file")
         apx.add_argument("--post_onset", type=float, default=0.06, help="seconds after onset to start analysis")
 
-<<<<<<< HEAD
-        # NEW onset timing knobs (separate from feature frame/hop)
-        apx.add_argument("--onset_frame_ms", type=float, default=10.0, help="onset detection frame length (ms)")
-        apx.add_argument("--onset_hop_ms", type=float, default=3.0, help="onset detection hop (ms)")
-        apx.add_argument("--onset_noise_sec", type=float, default=0.12, help="seconds used to estimate noise floor")
-        apx.add_argument("--onset_noise_pct", type=float, default=25.0, help="percentile for noise floor (lower=more sensitive)")
-        apx.add_argument("--onset_fallback_peak", action="store_true", help="fallback to peak-RMS if threshold never crossed")
-        apx.add_argument("--onset_peak_backtrack", type=float, default=0.03, help="seconds to backtrack from peak fallback")
-
         # normalization
-=======
->>>>>>> parent of 67013a5 (onset please work)
         apx.add_argument("--normalize", type=str, default="p95", choices=["peak", "p95", "rms", "none"])
         apx.add_argument("--target_rms", type=float, default=0.10)
 
     ap_build = sub.add_parser("build", help="Build LUT from labeled recordings (LABEL=wav_path)")
     add_common(ap_build)
-    ap_build.add_argument("labeled", nargs="+")
+    ap_build.add_argument("labeled", nargs="+")  # LABEL=path
 
     ap_build_dir = sub.add_parser("build_dir", help="Build LUT from directory (auto label from filename)")
     add_common(ap_build_dir)
@@ -1159,12 +859,6 @@ def main():
             onset_search_start=args.onset_search_start,
             onset_search_end=args.onset_search_end,
             post_onset=args.post_onset,
-            onset_frame_ms=args.onset_frame_ms,
-            onset_hop_ms=args.onset_hop_ms,
-            onset_noise_sec=args.onset_noise_sec,
-            onset_noise_pct=args.onset_noise_pct,
-            onset_fallback_peak=args.onset_fallback_peak,
-            onset_peak_backtrack=args.onset_peak_backtrack,
             normalize_mode=args.normalize,
             target_rms=args.target_rms,
         )
@@ -1220,12 +914,6 @@ def main():
             onset_search_start=args.onset_search_start,
             onset_search_end=args.onset_search_end,
             post_onset=args.post_onset,
-            onset_frame_ms=args.onset_frame_ms,
-            onset_hop_ms=args.onset_hop_ms,
-            onset_noise_sec=args.onset_noise_sec,
-            onset_noise_pct=args.onset_noise_pct,
-            onset_fallback_peak=args.onset_fallback_peak,
-            onset_peak_backtrack=args.onset_peak_backtrack,
             normalize_mode=args.normalize,
             target_rms=args.target_rms,
         )
