@@ -28,6 +28,7 @@ What this stores:
 - entry-level aggregated statistics across takes (median + std) for more stable matching
 """
 
+
 import argparse
 import json
 import re
@@ -151,13 +152,6 @@ def read_wav_mono_float(wav_path: str) -> Tuple[int, np.ndarray]:
 
 
 def normalize_audio(x: np.ndarray, mode: str = "peak", target_rms: float = 0.1) -> np.ndarray:
-    """
-    mode:
-      - peak: divide by max(abs(x))
-      - p95 : divide by 95th percentile abs
-      - rms : scale so RMS ~= target_rms
-      - none: no normalization
-    """
     mode = (mode or "peak").lower()
     if mode == "none":
         return x
@@ -216,11 +210,6 @@ def detect_onset_sec_energy(
     search_start_sec: float = 0.0,
     search_end_sec: Optional[float] = None,
 ) -> float:
-    """
-    Finds the first frame where RMS exceeds (noise_floor * thresh_ratio) for hold_frames.
-    noise_floor is estimated from the first ~0.25s of the search region.
-    Returns onset time in seconds (within original signal).
-    """
     n = len(x)
     if search_end_sec is None:
         search_end_sec = n / fs
@@ -232,10 +221,8 @@ def detect_onset_sec_energy(
 
     xs = x[start_i:end_i]
     frames = frame_signal(xs, frame=frame, hop=hop)
-    # RMS per frame
     rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
 
-    # estimate noise floor from first 0.25s or first 10 frames, whichever larger
     nf_frames = max(10, int(round(0.25 * fs / hop)))
     nf_frames = min(nf_frames, len(rms))
     noise_floor = float(np.median(rms[:nf_frames]) + 1e-12)
@@ -247,7 +234,6 @@ def detect_onset_sec_energy(
             onset_sample = start_i + i * hop
             return float(onset_sample / fs)
 
-    # fallback: if never crosses, just return search_start
     return float(search_start_sec)
 
 
@@ -351,33 +337,12 @@ def build_harmonic_band_mask(edges: np.ndarray, f0: float, k: int, tol_value: fl
     return mask
 
 
-def compute_band_template_oneframe(
-    seg: np.ndarray,
-    fs: int,
-    window: str,
-    edges: np.ndarray,
-    logmag: bool,
-    agg: str,
-) -> np.ndarray:
-    freqs, mag = spectrum_mag(seg, fs, window=window)
-    y = mag.astype(np.float64)
-    if logmag:
-        y = np.log1p(y)
-    band = pool_to_log_bands(freqs, y, edges, agg=agg)
-    # leave unnormalized here; normalization happens after aggregation
-    return band
-
-
 def aggregate_feature(frames_feat: np.ndarray, agg: str = "median") -> np.ndarray:
-    """
-    frames_feat: shape (T, D)
-    """
     if frames_feat.ndim != 2:
         raise ValueError("frames_feat must be 2D (T, D)")
     agg = (agg or "median").lower()
     if agg == "mean":
         return np.mean(frames_feat, axis=0)
-    # default robust
     return np.median(frames_feat, axis=0)
 
 
@@ -401,25 +366,18 @@ def analyze_segment_multiframe(
     frame_size: int,
     hop_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns:
-      band_template (unit norm)
-      fingerprint (unit sum, same as original style)
-    """
-    # frame segment; if too short, zero-pad to one frame
     if len(seg) < frame_size:
         seg = np.pad(seg, (0, frame_size - len(seg)))
 
-    frames = frame_signal(seg, frame=frame_size, hop=hop_size)  # (T, frame)
-    # pre-windowing per frame
+    frames = frame_signal(seg, frame=frame_size, hop=hop_size)
     w = get_window(window, frame_size, fftbins=True).astype(np.float64)
     frames_w = frames * w[None, :]
 
-    # --- band templates per frame
     bands = []
     fps = []
     for i in range(frames_w.shape[0]):
-        f, mag = spectrum_mag(frames_w[i], fs, window="boxcar")  # already windowed; avoid double windowing
+        # already windowed, avoid double-windowing
+        f, mag = spectrum_mag(frames_w[i], fs, window="boxcar")
         y = mag.astype(np.float64)
         if band_logmag:
             y = np.log1p(y)
@@ -432,7 +390,7 @@ def analyze_segment_multiframe(
         fps.append(fp_i)
 
     bands = np.stack(bands, axis=0) if bands else np.zeros((1, len(edges) - 1), dtype=np.float64)
-    # fingerprints vary in length depending on nyquist & k; pad to max length among frames
+
     if fps:
         maxlen = max(len(v) for v in fps)
         fp_mat = np.zeros((len(fps), maxlen), dtype=np.float64)
@@ -456,9 +414,9 @@ def analyze_segment_multiframe(
 # -----------------------------
 @dataclass
 class LutEntry:
-    note: str          # label, e.g. "E4_5"
-    base_note: str     # e.g. "E4"
-    string_idx: int    # 0..5
+    note: str
+    base_note: str
+    string_idx: int
     midi: int
     f0_hz: float
     k: int
@@ -473,7 +431,6 @@ class LutEntry:
     analysis_dur_sec: float
     auto_onset: bool
 
-    # aggregated stats across takes
     band_template_median: List[float]
     band_template_std: List[float]
     fingerprint_median: List[float]
@@ -527,28 +484,23 @@ def build_lut(
     use_highpass: bool,
     highpass_hz: float,
     replace_existing: bool,
-    # band template params
     band_fmin: float,
     band_fmax: float,
     band_n: int,
     band_pool_agg: str,
     band_logmag: bool,
-    # mask params
     mask_k: int,
     mask_tol: float,
     mask_tol_mode: str,
-    # multiframe params
     feat_agg: str,
     frame_ms: float,
     hop_ms: float,
-    # onset params
     auto_onset: bool,
     onset_thresh_ratio: float,
     onset_hold_frames: int,
     onset_search_start: float,
     onset_search_end: float,
     post_onset: float,
-    # normalization
     normalize_mode: str,
     target_rms: float,
 ) -> None:
@@ -565,6 +517,9 @@ def build_lut(
         "start_sec": float(start),
         "auto_onset": bool(auto_onset),
         "post_onset_sec": float(post_onset),
+        "normalize": {"mode": str(normalize_mode), "target_rms": float(target_rms)},
+        "highpass": {"enabled": bool(use_highpass), "hz": float(highpass_hz)},
+        "multiframe": {"feature_agg": str(feat_agg), "frame_ms": float(frame_ms), "hop_ms": float(hop_ms)},
         "onset": {
             "frame_ms": float(frame_ms),
             "hop_ms": float(hop_ms),
@@ -573,9 +528,6 @@ def build_lut(
             "search_start_sec": float(onset_search_start),
             "search_end_sec": float(onset_search_end),
         },
-        "normalize": {"mode": str(normalize_mode), "target_rms": float(target_rms)},
-        "highpass": {"enabled": bool(use_highpass), "hz": float(highpass_hz)},
-        "multiframe": {"feature_agg": str(feat_agg)},
         "fingerprint": {"k": int(k), "tol": float(tol_value), "tol_mode": str(tol_mode)},
     }
     lut["meta"]["band_template"] = {
@@ -606,10 +558,6 @@ def build_lut(
         midi = note_to_midi(base_note)
         f0 = midi_to_freq_hz(midi, a4_hz=a4)
 
-        # multiframe sizes (use analysis frame/hop, in samples)
-        frame_size = max(256, int(round((frame_ms / 1000.0) * 1.0)))  # temporary, will re-set per file by fs
-        hop_size = max(64, int(round((hop_ms / 1000.0) * 1.0)))       # temporary, will re-set per file by fs
-
         takes: List[Dict[str, Any]] = []
         sources: List[str] = []
 
@@ -621,14 +569,12 @@ def build_lut(
         for wav_path in paths:
             fs, x = read_wav_mono_float(wav_path)
 
-            # normalization early to make onset detection more stable
             x = normalize_audio(x, mode=normalize_mode, target_rms=target_rms)
 
             if use_highpass:
                 x = highpass_filter(x, fs, cutoff_hz=highpass_hz)
                 x = normalize_audio(x, mode=normalize_mode, target_rms=target_rms)
 
-            # compute actual frame/hop in samples per this fs
             frame_size = max(256, int(round((frame_ms / 1000.0) * fs)))
             hop_size = max(64, int(round((hop_ms / 1000.0) * fs)))
 
@@ -665,7 +611,6 @@ def build_lut(
                 hop_size=hop_size,
             )
 
-            # harmonic/off-harmonic energy summaries (using band template)
             harm_energy = float(np.sum(band_vec * harm_mask))
             off_energy = float(np.sum(band_vec * (1.0 - harm_mask)))
             harm_ratio = float(harm_energy / (off_energy + 1e-12))
@@ -689,17 +634,15 @@ def build_lut(
             band_take_list.append(band_vec)
             fp_take_list.append(fp_vec)
 
-        # aggregate across takes for this class entry
         if band_take_list:
             band_mat = np.stack(band_take_list, axis=0)
             band_med = np.median(band_mat, axis=0)
             band_std = np.std(band_mat, axis=0)
-            band_med = l2_normalize(band_med)  # keep template normalized
+            band_med = l2_normalize(band_med)
         else:
             band_med = np.zeros(len(edges) - 1, dtype=np.float64)
             band_std = np.zeros(len(edges) - 1, dtype=np.float64)
 
-        # fingerprints may have different length (k vs nyq); pad to max
         if fp_take_list:
             maxlen = max(len(v) for v in fp_take_list)
             fp_mat = np.zeros((len(fp_take_list), maxlen), dtype=np.float64)
@@ -741,7 +684,6 @@ def build_lut(
             old["takes"] = list(old["takes"]) + takes
             old["source_wavs"] = list(old["source_wavs"]) + sources
 
-            # refresh meta fields
             for f in [
                 "note", "base_note", "string_idx", "midi", "f0_hz", "k",
                 "tol_value", "tol_mode", "window",
@@ -768,16 +710,13 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    # Shared defaults tuned for string separation / live robustness
     def add_common(apx: argparse.ArgumentParser) -> None:
         apx.add_argument("--out", required=True)
 
-        # fingerprint params
         apx.add_argument("--k", type=int, default=60)
         apx.add_argument("--tol", type=float, default=20.0)
         apx.add_argument("--tol_mode", type=str, default="cents", choices=["hz", "cents"])
 
-        # segment params (used if not auto-onset; dur always used)
         apx.add_argument("--start", type=float, default=0.10)
         apx.add_argument("--dur", type=float, default=0.20)
 
@@ -789,7 +728,6 @@ def main():
 
         apx.add_argument("--replace_existing", action="store_true")
 
-        # band template params
         apx.add_argument("--band_fmin", type=float, default=40.0)
         apx.add_argument("--band_fmax", type=float, default=8000.0)
         apx.add_argument("--band_n", type=int, default=480)
@@ -799,26 +737,23 @@ def main():
         apx.add_argument("--mask_tol", type=float, default=20.0)
         apx.add_argument("--mask_tol_mode", type=str, default="cents", choices=["hz", "cents"])
 
-        # multiframe analysis params (recommended for live)
         apx.add_argument("--feat_agg", type=str, default="median", choices=["median", "mean"])
-        apx.add_argument("--frame_ms", type=float, default=46.0, help="analysis frame length in ms")
-        apx.add_argument("--hop_ms", type=float, default=12.0, help="analysis hop in ms")
+        apx.add_argument("--frame_ms", type=float, default=46.0)
+        apx.add_argument("--hop_ms", type=float, default=12.0)
 
-        # onset detection params
-        apx.add_argument("--auto_onset", action="store_true", help="detect onset and analyze after pick attack")
+        apx.add_argument("--auto_onset", action="store_true")
         apx.add_argument("--onset_thresh_ratio", type=float, default=6.0)
         apx.add_argument("--onset_hold_frames", type=int, default=3)
         apx.add_argument("--onset_search_start", type=float, default=0.0)
-        apx.add_argument("--onset_search_end", type=float, default=0.0, help="0 = end of file")
-        apx.add_argument("--post_onset", type=float, default=0.06, help="seconds after onset to start analysis")
+        apx.add_argument("--onset_search_end", type=float, default=0.0)
+        apx.add_argument("--post_onset", type=float, default=0.06)
 
-        # normalization
         apx.add_argument("--normalize", type=str, default="p95", choices=["peak", "p95", "rms", "none"])
         apx.add_argument("--target_rms", type=float, default=0.10)
 
     ap_build = sub.add_parser("build", help="Build LUT from labeled recordings (LABEL=wav_path)")
     add_common(ap_build)
-    ap_build.add_argument("labeled", nargs="+")  # LABEL=path
+    ap_build.add_argument("labeled", nargs="+")
 
     ap_build_dir = sub.add_parser("build_dir", help="Build LUT from directory (auto label from filename)")
     add_common(ap_build_dir)
