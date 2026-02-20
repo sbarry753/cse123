@@ -18,13 +18,13 @@ Dependencies:
 
 Examples:
   # Live, list devices:
-  python lut_match.py --list_devices
+  python lut_match_live.py --list_devices
 
   # Live match:
-  python lut_match.py --lut lut.json --device 3 --sr 48000
+  python lut_match_live.py --lut lut.json --device 3 --sr 48000
 
   # Test on a wav file:
-  python lut_match.py --lut lut.json --wav test.wav
+  python lut_match_live.py --lut lut.json --wav test.wav
 
 Notes:
 - This is monophonic-oriented. Chords may be rejected or misclassified (by design).
