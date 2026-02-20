@@ -41,6 +41,11 @@ Added features:
        lut["string_band_importance"]["strings"][<string_idx>] with:
          importance_raw, top_raw
          importance_residual, top_residual (if ideals exist)
+
+Onset fix:
+- Uses dedicated onset_frame_ms/onset_hop_ms (short) instead of feature frame/hop
+- Robust noise floor (percentile on early window) + fallback to peak-RMS
+- Clamps seg_start so it can’t run off the end of the file
 """
 
 import argparse
@@ -205,7 +210,7 @@ def pick_segment(x: np.ndarray, fs: int, start_sec: float, dur_sec: float) -> np
 
 
 # -----------------------------
-# Onset detection (energy-based)
+# Onset detection (robust energy-based)
 # -----------------------------
 def frame_signal(x: np.ndarray, frame: int, hop: int) -> np.ndarray:
     if frame <= 0 or hop <= 0:
@@ -230,6 +235,7 @@ def detect_onset_sec_energy(
     hold_frames: int = 3,
     search_start_sec: float = 0.0,
     search_end_sec: Optional[float] = None,
+    *,
     noise_sec: float = 0.12,
     noise_percentile: float = 25.0,
     fallback_to_peak: bool = True,
@@ -237,11 +243,12 @@ def detect_onset_sec_energy(
 ) -> float:
     """
     Energy-based onset:
-    - Compute per-frame RMS
-    - noise_floor = percentile(noise window RMS)
-    - onset = first place RMS >= noise_floor*thresh_ratio for hold_frames
+    - Per-frame RMS
+    - noise_floor = percentile(RMS in early noise_sec window)
+    - onset = first window of hold_frames where RMS >= noise_floor*thresh_ratio
+
     Fallback:
-    - if never crosses, pick the max-RMS frame, optionally backtrack a bit
+    - if never crosses threshold, pick peak-RMS frame and optionally backtrack a bit.
     """
     n = len(x)
     if search_end_sec is None:
@@ -256,10 +263,9 @@ def detect_onset_sec_energy(
     frames = frame_signal(xs, frame=frame, hop=hop)
     rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
 
-    # --- robust noise floor from first noise_sec of search region
     nf_frames = int(round((noise_sec * fs) / hop))
     nf_frames = max(8, min(nf_frames, len(rms)))
-    noise_slice = rms[:nf_frames]
+    noise_slice = rms[:nf_frames] if nf_frames > 0 else rms
     noise_floor = float(np.percentile(noise_slice, noise_percentile) + 1e-12)
 
     thresh = noise_floor * float(thresh_ratio)
@@ -270,7 +276,6 @@ def detect_onset_sec_energy(
             onset_sample = start_i + i * hop
             return float(onset_sample / fs)
 
-    # --- fallback: if it never crosses threshold, take peak RMS frame
     if fallback_to_peak and len(rms) > 0:
         i_peak = int(np.argmax(rms))
         back = int(round((peak_backtrack_sec * fs) / hop))
@@ -519,7 +524,7 @@ def build_string_ideals_from_entries(
         N, D = Y.shape
 
         X = _poly_design(x, degree=int(degree))
-        Xq = X  # predict at same x positions (ideal per note entry)
+        Xq = X
 
         Yhat = np.zeros_like(Y)
         resid_std = np.zeros(D, dtype=np.float64)
@@ -606,17 +611,14 @@ def compute_string_band_importance(
         if len(group) < 2:
             continue
 
-        # (N, D)
         Y = np.stack([np.array(e["band_template_median"], dtype=np.float64) for e in group], axis=0)
         S = np.stack([np.array(e["band_template_std"], dtype=np.float64) for e in group], axis=0)
 
         if Y.shape[1] != nb or S.shape[1] != nb:
-            # If someone changed band_n between runs, skip importance (inconsistent dims).
             continue
 
         within_var = np.mean(S * S, axis=0)
         between_var = np.var(Y, axis=0)
-
         imp_raw = _normalize_nonneg(between_var / (within_var + float(eps)))
 
         has_ideal = all(("ideal_band_template_median" in e) for e in group)
@@ -650,9 +652,9 @@ def compute_string_band_importance(
 # -----------------------------
 @dataclass
 class LutEntry:
-    note: str          # label, e.g. "E4_5"
-    base_note: str     # e.g. "E4"
-    string_idx: int    # 0..5
+    note: str
+    base_note: str
+    string_idx: int
     midi: int
     f0_hz: float
     k: int
@@ -765,12 +767,16 @@ def build_lut(
         "auto_onset": bool(auto_onset),
         "post_onset_sec": float(post_onset),
         "onset": {
-            "frame_ms": float(frame_ms),
-            "hop_ms": float(hop_ms),
+            "frame_ms": float(onset_frame_ms),
+            "hop_ms": float(onset_hop_ms),
             "thresh_ratio": float(onset_thresh_ratio),
             "hold_frames": int(onset_hold_frames),
             "search_start_sec": float(onset_search_start),
             "search_end_sec": float(onset_search_end),
+            "noise_sec": float(onset_noise_sec),
+            "noise_percentile": float(onset_noise_pct),
+            "fallback_peak": bool(onset_fallback_peak),
+            "peak_backtrack_sec": float(onset_peak_backtrack),
         },
         "normalize": {"mode": str(normalize_mode), "target_rms": float(target_rms)},
         "highpass": {"enabled": bool(use_highpass), "hz": float(highpass_hz)},
@@ -822,44 +828,37 @@ def build_lut(
                 x = highpass_filter(x, fs, cutoff_hz=highpass_hz)
                 x = normalize_audio(x, mode=normalize_mode, target_rms=target_rms)
 
-            # compute frame/hop in samples for this file
+            # feature frame/hop (for spectrum features)
             frame_size = max(256, int(round((frame_ms / 1000.0) * fs)))
             hop_size = max(64, int(round((hop_ms / 1000.0) * fs)))
 
-            onset_frame_size = max(128, int(round((onset_frame_ms / 1000.0) * fs)))
-            onset_hop_size   = max(32,  int(round((onset_hop_ms   / 1000.0) * fs)))
-
-            onset_sec = detect_onset_sec_energy(
-                x, fs,
-                frame=onset_frame_size,
-                hop=onset_hop_size,
-                thresh_ratio=onset_thresh_ratio,
-                hold_frames=onset_hold_frames,
-                search_start_sec=onset_search_start,
-                search_end_sec=onset_search_end if onset_search_end > 0 else None,
-                noise_sec=onset_noise_sec,
-                noise_percentile=onset_noise_pct,
-                fallback_to_peak=onset_fallback_peak,
-                peak_backtrack_sec=onset_peak_backtrack,
-            )
-            seg_start = onset_sec + float(post_onset)
             if auto_onset:
+                # onset frame/hop (short, for timing)
+                onset_frame_size = max(128, int(round((onset_frame_ms / 1000.0) * fs)))
+                onset_hop_size = max(32, int(round((onset_hop_ms / 1000.0) * fs)))
+
                 onset_sec = detect_onset_sec_energy(
                     x, fs,
-                    frame=frame_size,
-                    hop=hop_size,
+                    frame=onset_frame_size,
+                    hop=onset_hop_size,
                     thresh_ratio=onset_thresh_ratio,
                     hold_frames=onset_hold_frames,
                     search_start_sec=onset_search_start,
                     search_end_sec=onset_search_end if onset_search_end > 0 else None,
+                    noise_sec=onset_noise_sec,
+                    noise_percentile=onset_noise_pct,
+                    fallback_to_peak=onset_fallback_peak,
+                    peak_backtrack_sec=onset_peak_backtrack,
                 )
-                seg_start = onset_sec + float(post_onset)
+                seg_start = float(onset_sec + float(post_onset))
             else:
                 onset_sec = float("nan")
                 seg_start = float(start)
+
+            # clamp so segment doesn't run off end
             max_start = max(0.0, (len(x) / fs) - float(dur) - 1e-3)
             seg_start = float(min(seg_start, max_start))
-            
+
             seg = pick_segment(x, fs, seg_start, float(dur))
             seg = normalize_audio(seg, mode=normalize_mode, target_rms=target_rms)
 
@@ -894,6 +893,8 @@ def build_lut(
                 "segment_dur_sec": float(dur),
                 "frame_size": int(frame_size),
                 "hop_size": int(hop_size),
+                "onset_frame_size": int(onset_frame_size) if auto_onset else None,
+                "onset_hop_size": int(onset_hop_size) if auto_onset else None,
                 "fs": int(fs),
             })
             sources.append(str(wav_path))
@@ -952,7 +953,6 @@ def build_lut(
             old["takes"] = list(old["takes"]) + takes
             old["source_wavs"] = list(old["source_wavs"]) + sources
 
-            # refresh meta fields
             for f in [
                 "note", "base_note", "string_idx", "midi", "f0_hz", "k",
                 "tol_value", "tol_mode", "window",
@@ -978,7 +978,6 @@ def build_lut(
         lam=1e-2,
         min_notes=6,
     )
-    lut["meta"].setdefault("ideals_by_string", {})
     lut["meta"]["ideals_by_string"] = {
         "method": "poly_ridge_fit_per_band_dim",
         "x": "log(f0_hz)",
@@ -991,7 +990,6 @@ def build_lut(
 
     # --- NEW 2: compute per-string band importance masks
     lut["string_band_importance"] = compute_string_band_importance(lut, top_n=24)
-    lut["meta"].setdefault("string_band_importance", {})
     lut["meta"]["string_band_importance"] = {
         "method": "fisher_ratio_between_over_within",
         "between": "var_across_notes_on_same_string (band_template_median)",
@@ -1008,7 +1006,6 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    # Shared defaults tuned for string separation / live robustness
     def add_common(apx: argparse.ArgumentParser) -> None:
         apx.add_argument("--out", required=True)
 
@@ -1052,12 +1049,13 @@ def main():
         apx.add_argument("--onset_search_end", type=float, default=0.0, help="0 = end of file")
         apx.add_argument("--post_onset", type=float, default=0.06, help="seconds after onset to start analysis")
 
+        # NEW onset timing knobs (separate from feature frame/hop)
         apx.add_argument("--onset_frame_ms", type=float, default=10.0, help="onset detection frame length (ms)")
         apx.add_argument("--onset_hop_ms", type=float, default=3.0, help="onset detection hop (ms)")
         apx.add_argument("--onset_noise_sec", type=float, default=0.12, help="seconds used to estimate noise floor")
-        apx.add_argument("--onset_noise_pct", type=float, default=25.0, help="percentile for noise floor (lower = safer)")
-        apx.add_argument("--onset_fallback_peak", action="store_true", help="if threshold never crossed, fallback to peak-RMS frame")
-        apx.add_argument("--onset_peak_backtrack", type=float, default=0.03, help="seconds to backtrack from peak-RMS fallback")
+        apx.add_argument("--onset_noise_pct", type=float, default=25.0, help="percentile for noise floor (lower=more sensitive)")
+        apx.add_argument("--onset_fallback_peak", action="store_true", help="fallback to peak-RMS if threshold never crossed")
+        apx.add_argument("--onset_peak_backtrack", type=float, default=0.03, help="seconds to backtrack from peak fallback")
 
         # normalization
         apx.add_argument("--normalize", type=str, default="p95", choices=["peak", "p95", "rms", "none"])
@@ -1106,6 +1104,12 @@ def main():
             onset_search_start=args.onset_search_start,
             onset_search_end=args.onset_search_end,
             post_onset=args.post_onset,
+            onset_frame_ms=args.onset_frame_ms,
+            onset_hop_ms=args.onset_hop_ms,
+            onset_noise_sec=args.onset_noise_sec,
+            onset_noise_pct=args.onset_noise_pct,
+            onset_fallback_peak=args.onset_fallback_peak,
+            onset_peak_backtrack=args.onset_peak_backtrack,
             normalize_mode=args.normalize,
             target_rms=args.target_rms,
         )
@@ -1161,6 +1165,12 @@ def main():
             onset_search_start=args.onset_search_start,
             onset_search_end=args.onset_search_end,
             post_onset=args.post_onset,
+            onset_frame_ms=args.onset_frame_ms,
+            onset_hop_ms=args.onset_hop_ms,
+            onset_noise_sec=args.onset_noise_sec,
+            onset_noise_pct=args.onset_noise_pct,
+            onset_fallback_peak=args.onset_fallback_peak,
+            onset_peak_backtrack=args.onset_peak_backtrack,
             normalize_mode=args.normalize,
             target_rms=args.target_rms,
         )
