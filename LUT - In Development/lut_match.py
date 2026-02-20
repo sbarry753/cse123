@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-# lut_match.py
+# lut_match_live.py
 """
-Note matcher for LUTs produced by lut_build.py
-(type: harmonic_fingerprint_lut_v3_multiframe_onset_stringaware)
+Live (or file-based) note matcher for LUTs produced by lut_build.py (v3_multiframe_onset_stringaware).
 
-Key improvements vs older matcher:
-- Pulls analysis defaults from LUT meta (band template params, window, logmag, etc.)
-- Optional onset-aligned analysis segment to match builder behavior:
-    detect onset -> start = onset + post_onset -> dur seconds
-- Optional per-string discriminative band weighting using LUT's string_band_importance
-  (raw or residual weights if ideals exist)
-- Optional std weighting and harmonic off-band penalties
+What it does:
+- Continuously grabs audio from your input device (mic / interface)
+- Computes the SAME band-template feature style as the LUT builder (log-frequency pooled spectrum)
+- Scores against LUT entries (uses entry-level median template + optional std weighting)
+- Applies a rejection rule so it doesn't hallucinate notes in noise/chords/silence
+- Prints detected note label like "E4_5" with a confidence score
+
+Optional:
+- Can run on a WAV file instead of mic (for testing)
 
 Dependencies:
   pip install numpy scipy sounddevice
 
 Examples:
-  # list devices
-  python lut_match_live_v2.py --lut lut.json --list_devices
+  # Live, list devices:
+  python lut_match.py --list_devices
 
-  # live match (uses LUT defaults unless overridden)
-  python lut_match_live_v2.py --lut lut.json --device 3 --sr 48000 --use_onset
+  # Live match:
+  python lut_match.py --lut lut.json --device 3 --sr 48000
 
-  # test on wav
-  python lut_match_live_v2.py --lut lut.json --wav test.wav --use_onset
+  # Test on a wav file:
+  python lut_match.py --lut lut.json --wav test.wav
+
+Notes:
+- This is monophonic-oriented. Chords may be rejected or misclassified (by design).
+- For best results: record/build LUT with the same pickup/amp/room chain you use live.
 """
 
 import argparse
@@ -32,11 +37,12 @@ import queue
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy.io import wavfile
 from scipy.signal import butter, sosfilt, get_window
+from scipy.io import wavfile
 
 try:
     import sounddevice as sd
@@ -45,7 +51,7 @@ except Exception:
 
 
 # -----------------------------
-# Basic utilities
+# Utility
 # -----------------------------
 def load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -69,7 +75,7 @@ def normalize_audio(x: np.ndarray, mode: str = "p95", target_rms: float = 0.1) -
     if mode == "rms":
         rms = float(np.sqrt(np.mean(x * x)) + 1e-12)
         return x * (float(target_rms) / rms)
-    raise ValueError("normalize must be one of: peak|p95|rms|none")
+    raise ValueError("normalize_mode must be one of: peak|p95|rms|none")
 
 
 def highpass_filter(x: np.ndarray, fs: int, cutoff_hz: float = 80.0, order: int = 4) -> np.ndarray:
@@ -86,15 +92,6 @@ def make_log_band_edges(fmin_hz: float, fmax_hz: float, n_bands: int) -> np.ndar
     return np.geomspace(fmin_hz, fmax_hz, n_bands + 1).astype(np.float64)
 
 
-def spectrum_mag(seg: np.ndarray, fs: int, window: str = "hann") -> Tuple[np.ndarray, np.ndarray]:
-    N = len(seg)
-    w = get_window(window, N, fftbins=True).astype(np.float64)
-    X = np.fft.rfft(seg * w)
-    freqs = np.fft.rfftfreq(N, 1.0 / fs)
-    mag = np.abs(X).astype(np.float64)
-    return freqs, mag
-
-
 def pool_to_log_bands(freqs: np.ndarray, mag: np.ndarray, edges: np.ndarray, agg: str = "max") -> np.ndarray:
     out = np.zeros(len(edges) - 1, dtype=np.float64)
     agg = (agg or "max").lower()
@@ -107,6 +104,15 @@ def pool_to_log_bands(freqs: np.ndarray, mag: np.ndarray, edges: np.ndarray, agg
             band = mag[mask]
             out[i] = float(np.max(band)) if agg == "max" else float(np.mean(band))
     return out
+
+
+def spectrum_mag(seg: np.ndarray, fs: int, window: str = "hann") -> Tuple[np.ndarray, np.ndarray]:
+    N = len(seg)
+    w = get_window(window, N, fftbins=True)
+    X = np.fft.rfft(seg * w)
+    freqs = np.fft.rfftfreq(N, 1.0 / fs)
+    mag = np.abs(X)
+    return freqs, mag
 
 
 def frame_signal(x: np.ndarray, frame: int, hop: int) -> np.ndarray:
@@ -132,62 +138,6 @@ def aggregate_feature(frames_feat: np.ndarray, agg: str = "median") -> np.ndarra
     return np.median(frames_feat, axis=0)
 
 
-# -----------------------------
-# Onset detection (same style as builder)
-# -----------------------------
-def detect_onset_sec_energy(
-    x: np.ndarray,
-    fs: int,
-    frame: int,
-    hop: int,
-    thresh_ratio: float = 6.0,
-    hold_frames: int = 3,
-    search_start_sec: float = 0.0,
-    search_end_sec: Optional[float] = None,
-) -> float:
-    """
-    Finds first frame where RMS exceeds (noise_floor * thresh_ratio) for hold_frames.
-    noise_floor estimated from first ~0.25s of search region.
-    """
-    n = len(x)
-    if search_end_sec is None:
-        search_end_sec = n / fs
-
-    start_i = int(max(0, round(search_start_sec * fs)))
-    end_i = int(min(n, round(search_end_sec * fs)))
-    if end_i <= start_i + frame:
-        return float(search_start_sec)
-
-    xs = x[start_i:end_i]
-    frames = frame_signal(xs, frame=frame, hop=hop)
-    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
-
-    nf_frames = max(10, int(round(0.25 * fs / hop)))
-    nf_frames = min(nf_frames, len(rms))
-    noise_floor = float(np.median(rms[:nf_frames]) + 1e-12)
-    thresh = noise_floor * float(thresh_ratio)
-
-    hold_frames = max(1, int(hold_frames))
-    for i in range(0, len(rms) - hold_frames + 1):
-        if np.all(rms[i:i + hold_frames] >= thresh):
-            onset_sample = start_i + i * hop
-            return float(onset_sample / fs)
-
-    return float(search_start_sec)
-
-
-def pick_segment(x: np.ndarray, fs: int, start_sec: float, dur_sec: float) -> np.ndarray:
-    start = int(round(start_sec * fs))
-    length = int(round(dur_sec * fs))
-    seg = x[start:start + length]
-    if len(seg) < length:
-        seg = np.pad(seg, (0, length - len(seg)))
-    return seg
-
-
-# -----------------------------
-# Feature extraction (band template only, builder-compatible)
-# -----------------------------
 def compute_band_feature_multiframe(
     seg: np.ndarray,
     fs: int,
@@ -200,6 +150,12 @@ def compute_band_feature_multiframe(
     frame_size: int,
     hop_size: int,
 ) -> np.ndarray:
+    """
+    Produces the same kind of band_template feature as the builder:
+      - per-frame: FFT mag (optionally log1p), pooled into log bands
+      - aggregate frames (median/mean)
+      - L2 normalize
+    """
     if len(seg) < frame_size:
         seg = np.pad(seg, (0, frame_size - len(seg)))
 
@@ -209,7 +165,7 @@ def compute_band_feature_multiframe(
 
     feats = []
     for i in range(frames_w.shape[0]):
-        # already windowed; use boxcar to match builder’s “already windowed” behavior
+        # already windowed, so use boxcar to avoid double-windowing
         freqs, mag = spectrum_mag(frames_w[i], fs, window="boxcar")
         y = mag.astype(np.float64)
         if band_logmag:
@@ -220,6 +176,11 @@ def compute_band_feature_multiframe(
     mat = np.stack(feats, axis=0) if feats else np.zeros((1, len(edges) - 1), dtype=np.float64)
     v = aggregate_feature(mat, agg=feat_agg)
     return l2_normalize(v)
+
+
+def short_time_rms(x: np.ndarray, frame: int, hop: int) -> np.ndarray:
+    frames = frame_signal(x, frame=frame, hop=hop)
+    return np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
 
 
 # -----------------------------
@@ -234,7 +195,7 @@ class LutClass:
     f0_hz: float
     band_med: np.ndarray
     band_std: np.ndarray
-    harm_mask: Optional[np.ndarray]
+    harm_mask: Optional[np.ndarray]  # from first take if present
 
 
 def load_lut_classes(lut_path: str) -> Tuple[Dict[str, Any], List[LutClass]]:
@@ -249,25 +210,23 @@ def load_lut_classes(lut_path: str) -> Tuple[Dict[str, Any], List[LutClass]]:
         label = str(e.get("note", "")).strip()
         if not label:
             continue
-
         band_med = np.array(e.get("band_template_median", []), dtype=np.float64)
         band_std = np.array(e.get("band_template_std", []), dtype=np.float64)
-
         if band_med.size == 0:
+            # fallback: if older LUT, try per-take
             takes = e.get("takes", [])
             if takes:
                 band_med = np.array(takes[0].get("band_template", []), dtype=np.float64)
                 band_std = np.zeros_like(band_med)
-
         if band_std.size != band_med.size:
             band_std = np.zeros_like(band_med)
 
         harm_mask = None
         takes = e.get("takes", [])
         if takes and isinstance(takes, list) and isinstance(takes[0], dict) and "harm_band_mask" in takes[0]:
-            hm = np.array(takes[0].get("harm_band_mask", []), dtype=np.float64)
-            if hm.size == band_med.size:
-                harm_mask = hm
+            harm_mask = np.array(takes[0].get("harm_band_mask", []), dtype=np.float64)
+            if harm_mask.size != band_med.size:
+                harm_mask = None
 
         classes.append(
             LutClass(
@@ -285,62 +244,36 @@ def load_lut_classes(lut_path: str) -> Tuple[Dict[str, Any], List[LutClass]]:
     if not classes:
         raise RuntimeError("No usable entries found in LUT.")
 
-    return lut, classes
+    return meta, classes
 
 
 # -----------------------------
-# Scoring
+# Scoring + rejection
 # -----------------------------
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12))
 
 
+def weighted_cosine_sim(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
+    """
+    Weighted cosine: sim(a*w, b*w)
+    w should be >=0.
+    """
+    aw = a * w
+    bw = b * w
+    return cosine_sim(aw, bw)
+
+
 def compute_weight_from_std(std: np.ndarray, eps: float = 1e-3, power: float = 1.0) -> np.ndarray:
+    """
+    Lower std => higher weight.
+    """
     w = 1.0 / (std + float(eps))
     if power != 1.0:
         w = w ** float(power)
+    # normalize weights (optional)
     w /= (np.mean(w) + 1e-12)
     return w
-
-
-def load_string_importance_weights(
-    lut: Dict[str, Any],
-    *,
-    use_importance: str,  # "none"|"raw"|"residual"
-) -> Dict[int, np.ndarray]:
-    """
-    Returns dict: string_idx -> weights (len = n_bands)
-    """
-    use_importance = (use_importance or "none").lower()
-    out: Dict[int, np.ndarray] = {}
-
-    if use_importance == "none":
-        return out
-
-    sbi = lut.get("string_band_importance", {})
-    strings = sbi.get("strings", {})
-    if not isinstance(strings, dict):
-        return out
-
-    for k, v in strings.items():
-        try:
-            si = int(k)
-        except Exception:
-            continue
-        if not isinstance(v, dict):
-            continue
-
-        if use_importance == "residual" and v.get("importance_residual") is not None:
-            w = np.array(v.get("importance_residual", []), dtype=np.float64)
-        else:
-            w = np.array(v.get("importance_raw", []), dtype=np.float64)
-
-        if w.size > 0:
-            w[w < 0.0] = 0.0
-            w = w / (np.mean(w) + 1e-12)  # keep scale stable
-            out[si] = w
-
-    return out
 
 
 def score_against_lut(
@@ -351,42 +284,22 @@ def score_against_lut(
     std_eps: float,
     std_power: float,
     offharm_penalty_alpha: float,
-    string_importance: Dict[int, np.ndarray],
 ) -> List[Tuple[float, LutClass]]:
     scored: List[Tuple[float, LutClass]] = []
-
     for c in classes:
         if feat.size != c.band_med.size:
             continue
 
-        w_total = None
-
-        # per-string importance weights
-        if c.string_idx in string_importance:
-            w_total = string_importance[c.string_idx].copy()
-            if w_total.size != feat.size:
-                w_total = None
-
-        # std-based weights
         if use_std_weight:
-            w_std = compute_weight_from_std(c.band_std, eps=std_eps, power=std_power)
-            if w_total is None:
-                w_total = w_std
-            else:
-                w_total = w_total * w_std
-
-        if w_total is None:
-            sim = cosine_sim(feat, c.band_med)
+            w = compute_weight_from_std(c.band_std, eps=std_eps, power=std_power)
+            sim = weighted_cosine_sim(feat, c.band_med, w)
         else:
-            # weighted cosine via scaling vectors
-            aw = feat * w_total
-            bw = c.band_med * w_total
-            sim = cosine_sim(aw, bw)
+            sim = cosine_sim(feat, c.band_med)
 
         penalty = 0.0
         if offharm_penalty_alpha > 0 and c.harm_mask is not None and c.harm_mask.size == feat.size:
+            # penalty is energy outside harmonic mask
             penalty = float(np.sum(feat * (1.0 - c.harm_mask)))
-
         score = float(sim - offharm_penalty_alpha * penalty)
         scored.append((score, c))
 
@@ -394,7 +307,13 @@ def score_against_lut(
     return scored
 
 
-def should_accept(best_score: float, second_score: float, *, abs_thresh: float, margin_thresh: float) -> bool:
+def should_accept(
+    best_score: float,
+    second_score: float,
+    *,
+    abs_thresh: float,
+    margin_thresh: float,
+) -> bool:
     if best_score < abs_thresh:
         return False
     if (best_score - second_score) < margin_thresh:
@@ -403,46 +322,32 @@ def should_accept(best_score: float, second_score: float, *, abs_thresh: float, 
 
 
 # -----------------------------
-# Live runtime config
+# Live processing
 # -----------------------------
 @dataclass
 class RuntimeConfig:
     sr: int
-
-    # feature settings
+    frame_ms: float
+    hop_ms: float
+    seg_ms: float
+    # activity detection (gate)
+    gate_frame_ms: float
+    gate_hop_ms: float
+    gate_open_ratio: float
+    gate_close_ratio: float
+    gate_hold_frames: int
+    # signal conditioning
+    highpass: bool
+    highpass_hz: float
+    normalize_mode: str
+    target_rms: float
+    # feature
     band_fmin: float
     band_fmax: float
     band_n: int
     band_pool_agg: str
     band_logmag: bool
-    window: str
     feat_agg: str
-    frame_ms: float
-    hop_ms: float
-
-    # onset-aligned segment
-    use_onset: bool
-    post_onset: float
-    dur: float
-    onset_thresh_ratio: float
-    onset_hold_frames: int
-    onset_search_start: float
-    onset_search_end: float  # 0 => end
-    onset_frame_ms: float
-    onset_hop_ms: float
-
-    # conditioning
-    highpass: bool
-    highpass_hz: float
-    normalize_mode: str
-    target_rms: float
-
-    # activity gate (to avoid doing onset detect in silence)
-    gate_frame_ms: float
-    gate_open_ratio: float
-    gate_close_ratio: float
-    gate_hold_frames: int
-
     # scoring
     use_std_weight: bool
     std_eps: float
@@ -450,28 +355,35 @@ class RuntimeConfig:
     offharm_alpha: float
     abs_score_thresh: float
     margin_thresh: float
-    use_importance: str  # none|raw|residual
-
     # output smoothing
     stable_count: int
     min_interval_ms: float
 
 
 class ActivityGate:
+    """
+    Simple RMS-based gate with hysteresis:
+    - noise floor estimated on the fly from recent low-energy frames (median)
+    - open when rms > floor*open_ratio for hold_frames
+    - close when rms < floor*close_ratio for hold_frames
+    """
     def __init__(self, open_ratio: float, close_ratio: float, hold_frames: int):
         self.open_ratio = float(open_ratio)
         self.close_ratio = float(close_ratio)
         self.hold_frames = max(1, int(hold_frames))
+
         self.is_open = False
         self._above = 0
         self._below = 0
         self._noise_hist: List[float] = []
 
     def update(self, rms_val: float) -> bool:
+        # update noise floor estimate using lower half of observed RMS values
         self._noise_hist.append(float(rms_val))
         if len(self._noise_hist) > 200:
             self._noise_hist = self._noise_hist[-200:]
 
+        # robust floor: median of lowest 30% of recent samples
         arr = np.array(self._noise_hist, dtype=np.float64)
         if arr.size < 10:
             floor = float(np.median(arr) + 1e-12)
@@ -484,12 +396,18 @@ class ActivityGate:
         close_th = floor * self.close_ratio
 
         if not self.is_open:
-            self._above = self._above + 1 if rms_val >= open_th else 0
+            if rms_val >= open_th:
+                self._above += 1
+            else:
+                self._above = 0
             if self._above >= self.hold_frames:
                 self.is_open = True
                 self._above = 0
         else:
-            self._below = self._below + 1 if rms_val <= close_th else 0
+            if rms_val <= close_th:
+                self._below += 1
+            else:
+                self._below = 0
             if self._below >= self.hold_frames:
                 self.is_open = False
                 self._below = 0
@@ -497,29 +415,33 @@ class ActivityGate:
         return self.is_open
 
 
-def run_match_loop_from_stream(lut: Dict[str, Any], classes: List[LutClass], cfg: RuntimeConfig, device: Optional[int]) -> None:
+def pick_latest_segment(buf: np.ndarray, seg_len: int) -> np.ndarray:
+    if buf.size < seg_len:
+        x = np.zeros(seg_len, dtype=np.float64)
+        x[-buf.size:] = buf
+        return x
+    return buf[-seg_len:]
+
+
+def run_match_loop_from_stream(meta: Dict[str, Any], classes: List[LutClass], cfg: RuntimeConfig, device: Optional[int]) -> None:
     if sd is None:
-        raise RuntimeError("sounddevice not installed. pip install sounddevice")
+        raise RuntimeError("sounddevice is not installed. pip install sounddevice")
 
     edges = make_log_band_edges(cfg.band_fmin, cfg.band_fmax, cfg.band_n)
-    string_importance = load_string_importance_weights(lut, use_importance=cfg.use_importance)
 
-    feat_frame = max(256, int(round(cfg.frame_ms / 1000.0 * cfg.sr)))
-    feat_hop = max(64, int(round(cfg.hop_ms / 1000.0 * cfg.sr)))
+    seg_len = int(round(cfg.seg_ms / 1000.0 * cfg.sr))
+    gate_frame = int(round(cfg.gate_frame_ms / 1000.0 * cfg.sr))
+    gate_hop = int(round(cfg.gate_hop_ms / 1000.0 * cfg.sr))
 
-    onset_frame = max(256, int(round(cfg.onset_frame_ms / 1000.0 * cfg.sr)))
-    onset_hop = max(64, int(round(cfg.onset_hop_ms / 1000.0 * cfg.sr)))
-
-    gate_frame = max(256, int(round(cfg.gate_frame_ms / 1000.0 * cfg.sr)))
-
-    # for onset mode we need enough buffer to include pre-onset and post-onset+dur
-    need_sec = 2.0 if cfg.use_onset else 1.0
-    max_keep = int(round(need_sec * cfg.sr))
+    feat_frame = int(round(cfg.frame_ms / 1000.0 * cfg.sr))
+    feat_hop = int(round(cfg.hop_ms / 1000.0 * cfg.sr))
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=32)
 
     def callback(indata, frames, time_info, status):
         if status:
+            # don't spam; uncomment if needed
+            # print(status, file=sys.stderr)
             pass
         x = indata[:, 0].astype(np.float64, copy=False)
         try:
@@ -529,10 +451,12 @@ def run_match_loop_from_stream(lut: Dict[str, Any], classes: List[LutClass], cfg
 
     gate = ActivityGate(cfg.gate_open_ratio, cfg.gate_close_ratio, cfg.gate_hold_frames)
 
+    # simple stability filter
     last_emit_t = 0.0
     last_label = None
     stable_hits = 0
 
+    # ring buffer for recent audio
     buf = np.zeros(0, dtype=np.float64)
 
     print("Listening... (Ctrl+C to stop)")
@@ -552,11 +476,14 @@ def run_match_loop_from_stream(lut: Dict[str, Any], classes: List[LutClass], cfg
                     continue
 
                 buf = np.concatenate([buf, chunk])
+                # keep ~2 seconds max
+                max_keep = int(2.0 * cfg.sr)
                 if buf.size > max_keep:
                     buf = buf[-max_keep:]
 
-                # activity gate on last gate_frame samples
+                # update activity gate on the newest buffer region
                 if buf.size >= gate_frame:
+                    # compute RMS on last gate_frame window
                     tail = buf[-gate_frame:]
                     rms_val = float(np.sqrt(np.mean(tail * tail) + 1e-12))
                     active = gate.update(rms_val)
@@ -564,40 +491,24 @@ def run_match_loop_from_stream(lut: Dict[str, Any], classes: List[LutClass], cfg
                     active = False
 
                 if not active:
+                    # reset stability when inactive
                     last_label = None
                     stable_hits = 0
                     continue
 
-                x = buf.copy()
+                seg = pick_latest_segment(buf, seg_len)
 
-                # conditioning (match builder order: normalize -> optional highpass -> normalize)
+                # conditioning
+                x = seg.copy()
                 x = normalize_audio(x, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
                 if cfg.highpass:
                     x = highpass_filter(x, cfg.sr, cutoff_hz=cfg.highpass_hz)
                     x = normalize_audio(x, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
 
-                if cfg.use_onset:
-                    onset_sec = detect_onset_sec_energy(
-                        x, cfg.sr,
-                        frame=onset_frame,
-                        hop=onset_hop,
-                        thresh_ratio=cfg.onset_thresh_ratio,
-                        hold_frames=cfg.onset_hold_frames,
-                        search_start_sec=cfg.onset_search_start,
-                        search_end_sec=None if cfg.onset_search_end <= 0 else cfg.onset_search_end,
-                    )
-                    seg_start = onset_sec + cfg.post_onset
-                    seg = pick_segment(x, cfg.sr, seg_start, cfg.dur)
-                else:
-                    # fallback: take last dur seconds from buffer
-                    seg = pick_segment(x, cfg.sr, max(0.0, (len(x) / cfg.sr) - cfg.dur), cfg.dur)
-
-                seg = normalize_audio(seg, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
-
                 feat = compute_band_feature_multiframe(
-                    seg, cfg.sr,
+                    x, cfg.sr,
                     edges=edges,
-                    window=cfg.window,
+                    window="hann",
                     band_pool_agg=cfg.band_pool_agg,
                     band_logmag=cfg.band_logmag,
                     feat_agg=cfg.feat_agg,
@@ -611,17 +522,22 @@ def run_match_loop_from_stream(lut: Dict[str, Any], classes: List[LutClass], cfg
                     std_eps=cfg.std_eps,
                     std_power=cfg.std_power,
                     offharm_penalty_alpha=cfg.offharm_alpha,
-                    string_importance=string_importance,
                 )
                 if len(scored) < 2:
                     continue
-
                 (s1, c1), (s2, _c2) = scored[0], scored[1]
-                if not should_accept(s1, s2, abs_thresh=cfg.abs_score_thresh, margin_thresh=cfg.margin_thresh):
+
+                accept = should_accept(
+                    s1, s2,
+                    abs_thresh=cfg.abs_score_thresh,
+                    margin_thresh=cfg.margin_thresh,
+                )
+                if not accept:
                     last_label = None
                     stable_hits = 0
                     continue
 
+                # stability filter (require same label stable_count times)
                 if last_label == c1.label:
                     stable_hits += 1
                 else:
@@ -629,16 +545,16 @@ def run_match_loop_from_stream(lut: Dict[str, Any], classes: List[LutClass], cfg
                     stable_hits = 1
 
                 now = time.time()
-                if stable_hits >= cfg.stable_count and (now - last_emit_t) >= (cfg.min_interval_ms / 1000.0):
+                min_dt = cfg.min_interval_ms / 1000.0
+                if stable_hits >= cfg.stable_count and (now - last_emit_t) >= min_dt:
                     last_emit_t = now
                     print(f"{c1.label:8s}  score={s1:.3f}  margin={(s1 - s2):.3f}  midi={c1.midi}")
-
         except KeyboardInterrupt:
             print("\nStopped.")
 
 
 # -----------------------------
-# WAV-file mode
+# WAV-file mode (for testing)
 # -----------------------------
 def read_wav_mono_float(path: str) -> Tuple[int, np.ndarray]:
     fs, x = wavfile.read(path)
@@ -651,73 +567,50 @@ def read_wav_mono_float(path: str) -> Tuple[int, np.ndarray]:
     return int(fs), x
 
 
-def run_match_on_wav(lut: Dict[str, Any], classes: List[LutClass], cfg: RuntimeConfig, wav_path: str) -> None:
+def run_match_on_wav(meta: Dict[str, Any], classes: List[LutClass], cfg: RuntimeConfig, wav_path: str) -> None:
     fs, x = read_wav_mono_float(wav_path)
     if fs != cfg.sr:
         print(f"[warn] wav sr={fs} but --sr={cfg.sr}. Using wav sr.", file=sys.stderr)
         cfg = RuntimeConfig(**{**cfg.__dict__, "sr": fs})
 
     edges = make_log_band_edges(cfg.band_fmin, cfg.band_fmax, cfg.band_n)
-    string_importance = load_string_importance_weights(lut, use_importance=cfg.use_importance)
-
-    feat_frame = max(256, int(round(cfg.frame_ms / 1000.0 * cfg.sr)))
-    feat_hop = max(64, int(round(cfg.hop_ms / 1000.0 * cfg.sr)))
-    onset_frame = max(256, int(round(cfg.onset_frame_ms / 1000.0 * cfg.sr)))
-    onset_hop = max(64, int(round(cfg.onset_hop_ms / 1000.0 * cfg.sr)))
-
-    hop_len = int(round(0.05 * cfg.sr))  # scan step 50ms
-    win_len = int(round(1.5 * cfg.sr))   # scan window to search onset in
+    seg_len = int(round(cfg.seg_ms / 1000.0 * cfg.sr))
+    hop_len = int(round(0.05 * cfg.sr))  # 50ms step through file
+    feat_frame = int(round(cfg.frame_ms / 1000.0 * cfg.sr))
+    feat_hop = int(round(cfg.hop_ms / 1000.0 * cfg.sr))
 
     print(f"Scanning {wav_path} ...")
     t = 0
-    while t < x.size:
-        win = x[t:min(x.size, t + win_len)].copy()
-        win = normalize_audio(win, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
+    while t + seg_len <= x.size:
+        seg = x[t:t + seg_len]
+
+        y = normalize_audio(seg, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
         if cfg.highpass:
-            win = highpass_filter(win, cfg.sr, cutoff_hz=cfg.highpass_hz)
-            win = normalize_audio(win, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
-
-        if cfg.use_onset:
-            onset_sec = detect_onset_sec_energy(
-                win, cfg.sr,
-                frame=onset_frame,
-                hop=onset_hop,
-                thresh_ratio=cfg.onset_thresh_ratio,
-                hold_frames=cfg.onset_hold_frames,
-                search_start_sec=0.0,
-                search_end_sec=None if cfg.onset_search_end <= 0 else cfg.onset_search_end,
-            )
-            seg_start = onset_sec + cfg.post_onset
-            seg = pick_segment(win, cfg.sr, seg_start, cfg.dur)
-        else:
-            seg = pick_segment(win, cfg.sr, max(0.0, (len(win) / cfg.sr) - cfg.dur), cfg.dur)
-
-        seg = normalize_audio(seg, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
+            y = highpass_filter(y, cfg.sr, cutoff_hz=cfg.highpass_hz)
+            y = normalize_audio(y, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
 
         feat = compute_band_feature_multiframe(
-            seg, cfg.sr,
+            y, cfg.sr,
             edges=edges,
-            window=cfg.window,
+            window="hann",
             band_pool_agg=cfg.band_pool_agg,
             band_logmag=cfg.band_logmag,
             feat_agg=cfg.feat_agg,
             frame_size=feat_frame,
             hop_size=feat_hop,
         )
-
         scored = score_against_lut(
             feat, classes,
             use_std_weight=cfg.use_std_weight,
             std_eps=cfg.std_eps,
             std_power=cfg.std_power,
             offharm_penalty_alpha=cfg.offharm_alpha,
-            string_importance=string_importance,
         )
         if len(scored) >= 2:
             (s1, c1), (s2, _c2) = scored[0], scored[1]
             if should_accept(s1, s2, abs_thresh=cfg.abs_score_thresh, margin_thresh=cfg.margin_thresh):
                 sec = t / cfg.sr
-                print(f"{sec:8.3f}s  {c1.label:8s}  score={s1:.3f}  margin={(s1-s2):.3f}  midi={c1.midi}")
+                print(f"{sec:8.3f}s  {c1.label:8s} score={s1:.3f} margin={(s1-s2):.3f} midi={c1.midi}")
 
         t += hop_len
 
@@ -727,60 +620,49 @@ def run_match_on_wav(lut: Dict[str, Any], classes: List[LutClass], cfg: RuntimeC
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--lut", required=True)
-    ap.add_argument("--sr", type=int, default=48000)
-    ap.add_argument("--device", type=int, default=None)
-    ap.add_argument("--list_devices", action="store_true")
-    ap.add_argument("--wav", type=str, default=None)
+    ap.add_argument("--lut", required=True, help="Path to lut.json built by lut_build.py")
+    ap.add_argument("--sr", type=int, default=48000, help="Sample rate to use for live input")
+    ap.add_argument("--device", type=int, default=None, help="Input device index (use --list_devices)")
+    ap.add_argument("--list_devices", action="store_true", help="List audio devices and exit")
+    ap.add_argument("--wav", type=str, default=None, help="If provided, run matcher on this WAV instead of mic")
 
-    # overrides (otherwise LUT meta used)
-    ap.add_argument("--frame_ms", type=float, default=None)
-    ap.add_argument("--hop_ms", type=float, default=None)
-    ap.add_argument("--feat_agg", type=str, default=None, choices=["median", "mean"])
-    ap.add_argument("--window", type=str, default=None)
+    # analysis window sizes
+    ap.add_argument("--seg_ms", type=float, default=220.0, help="Segment length (ms) used for classification")
+    ap.add_argument("--frame_ms", type=float, default=46.0, help="Feature frame length (ms)")
+    ap.add_argument("--hop_ms", type=float, default=12.0, help="Feature hop length (ms)")
+    ap.add_argument("--feat_agg", type=str, default="median", choices=["median", "mean"])
 
+    # band template settings (should match LUT meta; defaults pulled from LUT if present)
     ap.add_argument("--band_fmin", type=float, default=None)
     ap.add_argument("--band_fmax", type=float, default=None)
     ap.add_argument("--band_n", type=int, default=None)
     ap.add_argument("--band_pool_agg", type=str, default=None, choices=["max", "mean"])
-    ap.add_argument("--band_logmag", action="store_true", help="Force logmag on")
+    ap.add_argument("--band_logmag", action="store_true", help="Force logmag on (else use LUT meta if available)")
 
     # conditioning
     ap.add_argument("--highpass", action="store_true")
     ap.add_argument("--highpass_hz", type=float, default=80.0)
-    ap.add_argument("--normalize", type=str, default=None, choices=["peak", "p95", "rms", "none"])
-    ap.add_argument("--target_rms", type=float, default=None)
+    ap.add_argument("--normalize", type=str, default="p95", choices=["peak", "p95", "rms", "none"])
+    ap.add_argument("--target_rms", type=float, default=0.10)
 
-    # onset-aligned segment
-    ap.add_argument("--use_onset", action="store_true", help="Use onset detection + post_onset + dur")
-    ap.add_argument("--dur", type=float, default=None, help="analysis duration seconds")
-    ap.add_argument("--post_onset", type=float, default=None)
-    ap.add_argument("--onset_thresh_ratio", type=float, default=None)
-    ap.add_argument("--onset_hold_frames", type=int, default=None)
-    ap.add_argument("--onset_search_start", type=float, default=None)
-    ap.add_argument("--onset_search_end", type=float, default=None, help="0 => end")
-    ap.add_argument("--onset_frame_ms", type=float, default=None)
-    ap.add_argument("--onset_hop_ms", type=float, default=None)
-
-    # gate
-    ap.add_argument("--gate_frame_ms", type=float, default=40.0)
+    # activity gate
     ap.add_argument("--gate_open_ratio", type=float, default=6.0)
     ap.add_argument("--gate_close_ratio", type=float, default=3.0)
     ap.add_argument("--gate_hold_frames", type=int, default=3)
+    ap.add_argument("--gate_frame_ms", type=float, default=40.0)
+    ap.add_argument("--gate_hop_ms", type=float, default=10.0)
 
-    # scoring
-    ap.add_argument("--abs_score", type=float, default=0.55)
-    ap.add_argument("--margin", type=float, default=0.06)
-    ap.add_argument("--use_std_weight", action="store_true")
+    # scoring & rejection
+    ap.add_argument("--abs_score", type=float, default=0.55, help="Absolute score threshold")
+    ap.add_argument("--margin", type=float, default=0.06, help="Best-vs-2nd margin threshold")
+    ap.add_argument("--use_std_weight", action="store_true", help="Use LUT std to weight stable bands more")
     ap.add_argument("--std_eps", type=float, default=1e-3)
     ap.add_argument("--std_power", type=float, default=1.0)
-    ap.add_argument("--offharm_alpha", type=float, default=0.0)
-
-    ap.add_argument("--use_importance", type=str, default="none", choices=["none", "raw", "residual"])
+    ap.add_argument("--offharm_alpha", type=float, default=0.0, help="Penalty for off-harmonic energy (0 disables)")
 
     # output smoothing
-    ap.add_argument("--stable_count", type=int, default=2)
-    ap.add_argument("--min_interval_ms", type=float, default=120.0)
+    ap.add_argument("--stable_count", type=int, default=2, help="Require same label this many times before printing")
+    ap.add_argument("--min_interval_ms", type=float, default=120.0, help="Min time between prints")
 
     args = ap.parse_args()
 
@@ -791,104 +673,61 @@ def main():
         print(sd.query_devices())
         return
 
-    lut, classes = load_lut_classes(args.lut)
-    meta = lut.get("meta", {})
-    band_meta = meta.get("band_template", {}) or {}
-    analysis_meta = meta.get("analysis", {}) or {}
-    onset_meta = (analysis_meta.get("onset", {}) or {})
-    norm_meta = (analysis_meta.get("normalize", {}) or {})
-    hp_meta = (analysis_meta.get("highpass", {}) or {})
+    meta, classes = load_lut_classes(args.lut)
 
-    # pull defaults from LUT meta unless overridden
+    # pull band params from LUT meta if user didn't override
+    band_meta = (meta.get("band_template") or {})
     band_fmin = args.band_fmin if args.band_fmin is not None else float(band_meta.get("fmin_hz", 40.0))
     band_fmax = args.band_fmax if args.band_fmax is not None else float(band_meta.get("fmax_hz", 8000.0))
     band_n = args.band_n if args.band_n is not None else int(band_meta.get("n_bands", 480))
-    band_pool_agg = args.band_pool_agg if args.band_pool_agg is not None else str(band_meta.get("pool_agg", "max"))
-
-    # logmag: if flag set -> True, else use LUT meta
-    band_logmag = True if args.band_logmag else bool(band_meta.get("logmag", False))
-
-    window = args.window if args.window is not None else str(analysis_meta.get("window", "hann"))
-    feat_agg = args.feat_agg if args.feat_agg is not None else str((analysis_meta.get("multiframe", {}) or {}).get("feature_agg", "median"))
-
-    frame_ms = args.frame_ms if args.frame_ms is not None else float(onset_meta.get("frame_ms", analysis_meta.get("frame_ms", 46.0)))
-    hop_ms = args.hop_ms if args.hop_ms is not None else float(onset_meta.get("hop_ms", analysis_meta.get("hop_ms", 12.0)))
-
-    dur = args.dur if args.dur is not None else float(analysis_meta.get("dur_sec", 0.20))
-    post_onset = args.post_onset if args.post_onset is not None else float(analysis_meta.get("post_onset_sec", 0.06))
-
-    onset_thresh_ratio = args.onset_thresh_ratio if args.onset_thresh_ratio is not None else float(onset_meta.get("thresh_ratio", 6.0))
-    onset_hold_frames = args.onset_hold_frames if args.onset_hold_frames is not None else int(onset_meta.get("hold_frames", 3))
-    onset_search_start = args.onset_search_start if args.onset_search_start is not None else float(onset_meta.get("search_start_sec", 0.0))
-    onset_search_end = args.onset_search_end if args.onset_search_end is not None else float(onset_meta.get("search_end_sec", 0.0))
-
-    # allow separate onset frame/hop, default to feature frame/hop
-    onset_frame_ms = args.onset_frame_ms if args.onset_frame_ms is not None else float(onset_meta.get("frame_ms", frame_ms))
-    onset_hop_ms = args.onset_hop_ms if args.onset_hop_ms is not None else float(onset_meta.get("hop_ms", hop_ms))
-
-    normalize_mode = args.normalize if args.normalize is not None else str(norm_meta.get("mode", "p95"))
-    target_rms = args.target_rms if args.target_rms is not None else float(norm_meta.get("target_rms", 0.10))
-
-    # highpass: if flag set -> True, else use LUT meta default
-    highpass = True if args.highpass else bool(hp_meta.get("enabled", False))
+    band_pool_agg = args.band_pool_agg if args.band_pool_agg is not None else str(band_meta.get("pool_agg", band_meta.get("agg", "max")))
+    # if flag not set, respect LUT meta; if set, force True
+    band_logmag = bool(args.band_logmag) if args.band_logmag else bool(band_meta.get("logmag", False))
 
     cfg = RuntimeConfig(
         sr=int(args.sr),
+        frame_ms=float(args.frame_ms),
+        hop_ms=float(args.hop_ms),
+        seg_ms=float(args.seg_ms),
+        gate_frame_ms=float(args.gate_frame_ms),
+        gate_hop_ms=float(args.gate_hop_ms),
+        gate_open_ratio=float(args.gate_open_ratio),
+        gate_close_ratio=float(args.gate_close_ratio),
+        gate_hold_frames=int(args.gate_hold_frames),
+        highpass=bool(args.highpass),
+        highpass_hz=float(args.highpass_hz),
+        normalize_mode=str(args.normalize),
+        target_rms=float(args.target_rms),
         band_fmin=float(band_fmin),
         band_fmax=float(band_fmax),
         band_n=int(band_n),
         band_pool_agg=str(band_pool_agg),
         band_logmag=bool(band_logmag),
-        window=str(window),
-        feat_agg=str(feat_agg),
-        frame_ms=float(frame_ms),
-        hop_ms=float(hop_ms),
-
-        use_onset=bool(args.use_onset),
-        post_onset=float(post_onset),
-        dur=float(dur),
-        onset_thresh_ratio=float(onset_thresh_ratio),
-        onset_hold_frames=int(onset_hold_frames),
-        onset_search_start=float(onset_search_start),
-        onset_search_end=float(onset_search_end),
-        onset_frame_ms=float(onset_frame_ms),
-        onset_hop_ms=float(onset_hop_ms),
-
-        highpass=bool(highpass),
-        highpass_hz=float(args.highpass_hz),
-        normalize_mode=str(normalize_mode),
-        target_rms=float(target_rms),
-
-        gate_frame_ms=float(args.gate_frame_ms),
-        gate_open_ratio=float(args.gate_open_ratio),
-        gate_close_ratio=float(args.gate_close_ratio),
-        gate_hold_frames=int(args.gate_hold_frames),
-
+        feat_agg=str(args.feat_agg),
         use_std_weight=bool(args.use_std_weight),
         std_eps=float(args.std_eps),
         std_power=float(args.std_power),
         offharm_alpha=float(args.offharm_alpha),
         abs_score_thresh=float(args.abs_score),
         margin_thresh=float(args.margin),
-        use_importance=str(args.use_importance),
-
         stable_count=int(args.stable_count),
         min_interval_ms=float(args.min_interval_ms),
     )
 
-    # sanity check
-    d0 = classes[0].band_med.size
+    # quick sanity check for feature dim mismatch
+    d = classes[0].band_med.size
+    if d != cfg.band_n:
+        # cfg.band_n should equal number of bands; band feature length is band_n
+        # if LUT had different n_bands, we already pulled it, so this should match.
+        pass
     for c in classes:
-        if c.band_med.size != d0:
+        if c.band_med.size != classes[0].band_med.size:
             raise RuntimeError("LUT entries have inconsistent band sizes.")
-    if d0 != cfg.band_n:
-        print(f"[warn] LUT band dim={d0} but cfg.band_n={cfg.band_n}. Using LUT dim.", file=sys.stderr)
-        cfg = RuntimeConfig(**{**cfg.__dict__, "band_n": d0})
 
     if args.wav:
-        run_match_on_wav(lut, classes, cfg, args.wav)
+        run_match_on_wav(meta, classes, cfg, args.wav)
     else:
-        run_match_loop_from_stream(lut, classes, cfg, device=args.device)
+        run_match_loop_from_stream(meta, classes, cfg, device=args.device)
 
 
 if __name__ == "__main__":
