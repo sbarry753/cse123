@@ -1,77 +1,81 @@
 #!/usr/bin/env python3
-# lut_match.py
+# lut_match_live.py
 """
-Matcher (mono + poly) for the LUT built by lut_build.py (string-aware).
+Live (or file-based) note matcher for LUTs produced by lut_build.py (v3_multiframe_onset_stringaware).
 
-Monophonic:
-  python lut_match.py match --lut lut.json --wav unknown.wav --start 0.12 --dur 0.18 --plot
+What it does:
+- Continuously grabs audio from your input device (mic / interface)
+- Computes the SAME band-template feature style as the LUT builder (log-frequency pooled spectrum)
+- Scores against LUT entries (uses entry-level median template + optional std weighting)
+- Applies a rejection rule so it doesn't hallucinate notes in noise/chords/silence
+- Prints detected note label like "E4_5" with a confidence score
 
-Polyphonic:
-  python lut_match.py match_poly --lut lut.json --wav chord.wav --start 0.10 --dur 0.25 \
-    --algo omp --prune 40 --thresh 0.25 --collapsed --plot
+Optional:
+- Can run on a WAV file instead of mic (for testing)
+
+Dependencies:
+  pip install numpy scipy sounddevice
+
+Examples:
+  # Live, list devices:
+  python lut_match.py --list_devices
+
+  # Live match:
+  python lut_match.py --lut lut.json --device 3 --sr 48000
+
+  # Test on a wav file:
+  python lut_match.py --lut lut.json --wav test.wav
+
+Notes:
+- This is monophonic-oriented. Chords may be rejected or misclassified (by design).
+- For best results: record/build LUT with the same pickup/amp/room chain you use live.
 """
 
 import argparse
 import json
-import re
-from typing import Dict, List, Tuple, Optional
+import queue
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.signal import butter, sosfilt, get_window
 from scipy.io import wavfile
-from scipy.signal import get_window, butter, sosfilt
-from scipy.optimize import nnls
-import matplotlib.pyplot as plt
+
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
 
 
 # -----------------------------
-# Shared small utilities
+# Utility
 # -----------------------------
-def split_label(label: str) -> Tuple[str, int]:
-    s = label.strip().replace("♯", "#").replace("♭", "b")
-    m = re.match(r"^([A-Ga-g])([#bB]?)(-?\d+)(?:_([0-5]))?$", s)
-    if not m:
-        return label, 0
-    base = f"{m.group(1).upper()}{(m.group(2) or '').replace('B','b')}{m.group(3)}"
-    idx = int(m.group(4)) if m.group(4) is not None else 0
-    # normalize flats/sharps
-    base = base.replace("♯", "#").replace("♭", "b")
-    return base, idx
-
-
-def load_lut(path: str) -> Dict:
+def load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data.setdefault("entries", [])
-    data.setdefault("meta", {})
-    return data
+        return json.load(f)
 
 
-# -----------------------------
-# Audio + spectrum
-# -----------------------------
-def read_wav_mono_float(wav_path: str) -> Tuple[int, np.ndarray]:
-    fs, x = wavfile.read(wav_path)
-    if isinstance(x, np.ndarray) and x.ndim > 1:
-        x = x.mean(axis=1)
-    if x.dtype.kind in "iu":
-        maxv = float(np.iinfo(x.dtype).max)
-        x = x.astype(np.float64) / maxv
-    else:
-        x = x.astype(np.float64)
-    return int(fs), x
+def l2_normalize(v: np.ndarray) -> np.ndarray:
+    return v / (np.linalg.norm(v) + 1e-12)
 
 
-def normalize_peak(x: np.ndarray) -> np.ndarray:
-    return x / (float(np.max(np.abs(x)) + 1e-12))
-
-
-def pick_segment(x: np.ndarray, fs: int, start_sec: float, dur_sec: float) -> np.ndarray:
-    start = int(round(start_sec * fs))
-    length = int(round(dur_sec * fs))
-    seg = x[start:start + length]
-    if len(seg) < length:
-        seg = np.pad(seg, (0, length - len(seg)))
-    return seg
+def normalize_audio(x: np.ndarray, mode: str = "p95", target_rms: float = 0.1) -> np.ndarray:
+    mode = (mode or "p95").lower()
+    if mode == "none":
+        return x
+    if mode == "peak":
+        d = float(np.max(np.abs(x)) + 1e-12)
+        return x / d
+    if mode in ("p95", "pct", "percentile"):
+        d = float(np.percentile(np.abs(x), 95) + 1e-12)
+        return x / d
+    if mode == "rms":
+        rms = float(np.sqrt(np.mean(x * x)) + 1e-12)
+        return x * (float(target_rms) / rms)
+    raise ValueError("normalize_mode must be one of: peak|p95|rms|none")
 
 
 def highpass_filter(x: np.ndarray, fs: int, cutoff_hz: float = 80.0, order: int = 4) -> np.ndarray:
@@ -81,18 +85,6 @@ def highpass_filter(x: np.ndarray, fs: int, cutoff_hz: float = 80.0, order: int 
     return sosfilt(sos, x)
 
 
-def spectrum_mag(seg: np.ndarray, fs: int, window: str = "hann") -> Tuple[np.ndarray, np.ndarray]:
-    N = len(seg)
-    w = get_window(window, N, fftbins=True)
-    X = np.fft.rfft(seg * w)
-    freqs = np.fft.rfftfreq(N, 1.0 / fs)
-    mag = np.abs(X)
-    return freqs, mag
-
-
-# -----------------------------
-# Band templates (must match LUT meta)
-# -----------------------------
 def make_log_band_edges(fmin_hz: float, fmax_hz: float, n_bands: int) -> np.ndarray:
     fmin_hz = max(1e-3, float(fmin_hz))
     fmax_hz = max(fmin_hz * 1.001, float(fmax_hz))
@@ -114,394 +106,628 @@ def pool_to_log_bands(freqs: np.ndarray, mag: np.ndarray, edges: np.ndarray, agg
     return out
 
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    n = min(len(a), len(b))
-    if n == 0:
-        return 0.0
-    a = a[:n]
-    b = b[:n]
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-    return float(np.dot(a, b) / denom)
+def spectrum_mag(seg: np.ndarray, fs: int, window: str = "hann") -> Tuple[np.ndarray, np.ndarray]:
+    N = len(seg)
+    w = get_window(window, N, fftbins=True)
+    X = np.fft.rfft(seg * w)
+    freqs = np.fft.rfftfreq(N, 1.0 / fs)
+    mag = np.abs(X)
+    return freqs, mag
 
 
-def build_live_band(seg: np.ndarray, fs: int, lut_meta: Dict, window: str) -> np.ndarray:
-    bt = lut_meta.get("band_template", {}) if isinstance(lut_meta, dict) else {}
-    fmin = float(bt.get("fmin_hz", 40.0))
-    fmax = float(bt.get("fmax_hz", 8000.0))
-    nb = int(bt.get("n_bands", 480))
-    agg = str(bt.get("agg", "max"))
-    logmag = bool(bt.get("logmag", True))
-
-    edges = make_log_band_edges(fmin, fmax, nb)
-    freqs, mag = spectrum_mag(seg, fs, window=window)
-    y = mag.astype(np.float64)
-    if logmag:
-        y = np.log1p(y)
-    band = pool_to_log_bands(freqs, y, edges, agg=agg)
-    band /= (np.linalg.norm(band) + 1e-12)
-    return band
+def frame_signal(x: np.ndarray, frame: int, hop: int) -> np.ndarray:
+    if frame <= 0 or hop <= 0:
+        raise ValueError("frame and hop must be > 0")
+    n = len(x)
+    if n <= frame:
+        return np.zeros((1, frame), dtype=np.float64)
+    count = 1 + (n - frame) // hop
+    out = np.zeros((count, frame), dtype=np.float64)
+    for i in range(count):
+        s = i * hop
+        out[i] = x[s:s + frame]
+    return out
 
 
-def score_take_band(live_band: np.ndarray, take: Dict, offharm_alpha: float) -> float:
-    tb = take.get("band_template", None)
-    if tb is None:
-        return -1e9
-    take_band = np.array(tb, dtype=np.float64)
-    sim = cosine_similarity(live_band, take_band)
-
-    if offharm_alpha <= 0.0:
-        return float(sim)
-
-    hm = take.get("harm_band_mask", None)
-    if hm is None:
-        return float(sim)
-
-    harm_mask = (np.array(hm, dtype=np.float64) > 0.5).astype(np.float64)
-    inv = 1.0 - harm_mask
-
-    yin = float(np.sum(np.abs(live_band) * harm_mask)) + 1e-12
-    yout = float(np.sum(np.abs(live_band) * inv))
-    live_ratio = yout / yin
-
-    tin = float(np.sum(np.abs(take_band) * harm_mask)) + 1e-12
-    tout = float(np.sum(np.abs(take_band) * inv))
-    take_ratio = tout / tin
-
-    pen = abs(live_ratio - take_ratio)
-    return float(sim - offharm_alpha * pen)
+def aggregate_feature(frames_feat: np.ndarray, agg: str = "median") -> np.ndarray:
+    agg = (agg or "median").lower()
+    if frames_feat.ndim != 2:
+        raise ValueError("frames_feat must be (T, D)")
+    if agg == "mean":
+        return np.mean(frames_feat, axis=0)
+    return np.median(frames_feat, axis=0)
 
 
-def collapse_take_scores(scores: List[float], mode: str, topk: int) -> float:
-    if not scores:
-        return 0.0
-    mode = mode.lower()
-    if mode == "max":
-        return float(max(scores))
-    if mode == "mean":
-        return float(np.mean(scores))
-    if mode == "topk":
-        k = max(1, int(topk))
-        ss = sorted(scores, reverse=True)[:k]
-        return float(np.mean(ss))
-    raise ValueError("score_mode must be max|mean|topk")
+def compute_band_feature_multiframe(
+    seg: np.ndarray,
+    fs: int,
+    *,
+    edges: np.ndarray,
+    window: str,
+    band_pool_agg: str,
+    band_logmag: bool,
+    feat_agg: str,
+    frame_size: int,
+    hop_size: int,
+) -> np.ndarray:
+    """
+    Produces the same kind of band_template feature as the builder:
+      - per-frame: FFT mag (optionally log1p), pooled into log bands
+      - aggregate frames (median/mean)
+      - L2 normalize
+    """
+    if len(seg) < frame_size:
+        seg = np.pad(seg, (0, frame_size - len(seg)))
+
+    frames = frame_signal(seg, frame=frame_size, hop=hop_size)
+    w = get_window(window, frame_size, fftbins=True).astype(np.float64)
+    frames_w = frames * w[None, :]
+
+    feats = []
+    for i in range(frames_w.shape[0]):
+        # already windowed, so use boxcar to avoid double-windowing
+        freqs, mag = spectrum_mag(frames_w[i], fs, window="boxcar")
+        y = mag.astype(np.float64)
+        if band_logmag:
+            y = np.log1p(y)
+        band = pool_to_log_bands(freqs, y, edges, agg=band_pool_agg)
+        feats.append(band)
+
+    mat = np.stack(feats, axis=0) if feats else np.zeros((1, len(edges) - 1), dtype=np.float64)
+    v = aggregate_feature(mat, agg=feat_agg)
+    return l2_normalize(v)
+
+
+def short_time_rms(x: np.ndarray, frame: int, hop: int) -> np.ndarray:
+    frames = frame_signal(x, frame=frame, hop=hop)
+    return np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
 
 
 # -----------------------------
-# Match (mono)
+# LUT model
 # -----------------------------
-def match_mono(lut_path: str,
-               wav_path: str,
-               start: float,
-               dur: float,
-               window: Optional[str],
-               use_highpass: bool,
-               highpass_hz: float,
-               top_n: int,
-               plot: bool,
-               score_mode: str,
-               topk: int,
-               offharm_alpha: float):
-    lut = load_lut(lut_path)
+@dataclass
+class LutClass:
+    label: str
+    base_note: str
+    string_idx: int
+    midi: int
+    f0_hz: float
+    band_med: np.ndarray
+    band_std: np.ndarray
+    harm_mask: Optional[np.ndarray]  # from first take if present
+
+
+def load_lut_classes(lut_path: str) -> Tuple[Dict[str, Any], List[LutClass]]:
+    lut = load_json(lut_path)
+    meta = lut.get("meta", {})
     entries = lut.get("entries", [])
-    if not entries:
-        raise ValueError("LUT has no entries.")
 
-    fs, x = read_wav_mono_float(wav_path)
-    x = normalize_peak(x)
-    seg = pick_segment(x, fs, start, dur)
-    if use_highpass:
-        seg = highpass_filter(seg, fs, cutoff_hz=highpass_hz)
-    seg = normalize_peak(seg)
-
-    win = window or str(entries[0].get("window", "hann"))
-    live_band = build_live_band(seg, fs, lut.get("meta", {}), window=win)
-
-    results: List[Tuple[str, float, int]] = []
+    classes: List[LutClass] = []
     for e in entries:
-        label = str(e.get("note", "?"))
-        takes = e.get("takes", [])
-        take_scores = [score_take_band(live_band, t, offharm_alpha=offharm_alpha) for t in takes if isinstance(t, dict)]
-        score = collapse_take_scores(take_scores, mode=score_mode, topk=topk)
-        best_take = int(np.argmax(take_scores)) if take_scores else -1
-        results.append((label, float(score), best_take))
-
-    results.sort(key=lambda t: t[1], reverse=True)
-    best_label, best_score, best_take = results[0]
-    base, sidx = split_label(best_label)
-
-    print(f"\nBest match: {best_label}  score={best_score:.4f}  base={base}  string={sidx}  best_take={best_take}")
-    print(f"\nTop {top_n} matches:")
-    for lab, sc, bt in results[:top_n]:
-        b, si = split_label(lab)
-        print(f"  {lab:8s} score={sc:.4f}  base={b:4s} string={si}  best_take={bt}")
-
-    if plot:
-        freqs, mag = spectrum_mag(seg, fs, window=win)
-        plt.figure(figsize=(12, 4))
-        plt.plot(freqs, mag)
-        plt.title("Live Segment Magnitude Spectrum")
-        plt.xlabel("Hz")
-        plt.ylabel("|X(f)|")
-        plt.xlim(0, min(8000, freqs[-1]))
-        plt.tight_layout()
-        plt.show()
-
-        labels = [r[0] for r in results[:top_n]]
-        vals = [r[1] for r in results[:top_n]]
-        plt.figure(figsize=(12, 4))
-        plt.bar(labels, vals)
-        plt.title(f"Top {top_n} Class Scores (mono)")
-        plt.xlabel("Class label (note_string)")
-        plt.ylabel("Score")
-        plt.tight_layout()
-        plt.show()
-
-
-# -----------------------------
-# Match (poly)
-# -----------------------------
-def quick_prune(entries: List[Dict], live_band: np.ndarray, prune: int) -> List[str]:
-    scored: List[Tuple[str, float]] = []
-    for e in entries:
-        label = str(e.get("note", "?"))
-        best = -1e9
-        for t in e.get("takes", []):
-            if not isinstance(t, dict) or "band_template" not in t:
-                continue
-            tb = np.array(t["band_template"], dtype=np.float64)
-            best = max(best, cosine_similarity(live_band, tb))
-        scored.append((label, float(best)))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [lab for lab, _ in scored[:max(1, int(prune))]]
-
-
-def solve_nonneg_omp(A: np.ndarray,
-                     y: np.ndarray,
-                     max_notes: int,
-                     min_corr: float = 1e-3,
-                     min_improve: float = 1e-4) -> np.ndarray:
-    _m, n = A.shape
-    selected: List[int] = []
-    r = y.copy()
-    prev_norm = float(np.linalg.norm(r))
-    x_full = np.zeros(n, dtype=np.float64)
-
-    for _ in range(int(max_notes)):
-        scores = A.T @ r
-        j = int(np.argmax(scores))
-        best = float(scores[j])
-        if best < float(min_corr):
-            break
-        if j not in selected:
-            selected.append(j)
-
-        As = A[:, selected]
-        x_s, _ = nnls(As, y)
-        r_new = y - As @ x_s
-        new_norm = float(np.linalg.norm(r_new))
-        if (prev_norm - new_norm) < float(min_improve):
-            if selected:
-                selected.pop()
-            break
-        r = r_new
-        prev_norm = new_norm
-
-    if selected:
-        As = A[:, selected]
-        x_s, _ = nnls(As, y)
-        for idx, val in zip(selected, x_s):
-            x_full[idx] = float(val)
-    return x_full
-
-
-def match_poly(lut_path: str,
-               wav_path: str,
-               start: float,
-               dur: float,
-               algo: str,
-               window: Optional[str],
-               use_highpass: bool,
-               highpass_hz: float,
-               prune: int,
-               max_notes: int,
-               thresh: float,
-               collapsed: bool,
-               plot: bool):
-    lut = load_lut(lut_path)
-    entries = lut.get("entries", [])
-    if not entries:
-        raise ValueError("LUT has no entries.")
-
-    fs, x = read_wav_mono_float(wav_path)
-    x = normalize_peak(x)
-    seg = pick_segment(x, fs, start, dur)
-    if use_highpass:
-        seg = highpass_filter(seg, fs, cutoff_hz=highpass_hz)
-    seg = normalize_peak(seg)
-
-    win = window or str(entries[0].get("window", "hann"))
-    live_band = build_live_band(seg, fs, lut.get("meta", {}), window=win)
-    y = live_band / (np.linalg.norm(live_band) + 1e-12)
-
-    keep = set(quick_prune(entries, live_band, prune=prune))
-
-    cols: List[np.ndarray] = []
-    col_label: List[str] = []
-    for e in entries:
-        label = str(e.get("note", "?"))
-        if label not in keep:
+        if not isinstance(e, dict):
             continue
-        for t in e.get("takes", []):
-            if not isinstance(t, dict) or "band_template" not in t:
-                continue
-            templ = np.array(t["band_template"], dtype=np.float64)
-            nrm = float(np.linalg.norm(templ))
-            if nrm < 1e-9:
-                continue
-            cols.append(templ / (nrm + 1e-12))
-            col_label.append(label)
+        label = str(e.get("note", "")).strip()
+        if not label:
+            continue
+        band_med = np.array(e.get("band_template_median", []), dtype=np.float64)
+        band_std = np.array(e.get("band_template_std", []), dtype=np.float64)
+        if band_med.size == 0:
+            # fallback: if older LUT, try per-take
+            takes = e.get("takes", [])
+            if takes:
+                band_med = np.array(takes[0].get("band_template", []), dtype=np.float64)
+                band_std = np.zeros_like(band_med)
+        if band_std.size != band_med.size:
+            band_std = np.zeros_like(band_med)
 
-    if not cols:
-        print("No templates built. Rebuild LUT with lut_build.py.")
-        return
+        harm_mask = None
+        takes = e.get("takes", [])
+        if takes and isinstance(takes, list) and isinstance(takes[0], dict) and "harm_band_mask" in takes[0]:
+            harm_mask = np.array(takes[0].get("harm_band_mask", []), dtype=np.float64)
+            if harm_mask.size != band_med.size:
+                harm_mask = None
 
-    A = np.column_stack(cols)
+        classes.append(
+            LutClass(
+                label=label,
+                base_note=str(e.get("base_note", "")),
+                string_idx=int(e.get("string_idx", 0)),
+                midi=int(e.get("midi", -1)),
+                f0_hz=float(e.get("f0_hz", 0.0)),
+                band_med=l2_normalize(band_med),
+                band_std=band_std,
+                harm_mask=harm_mask,
+            )
+        )
 
-    algo_l = (algo or "omp").lower()
-    if algo_l == "nnls":
-        xw, _ = nnls(A, y)
-    elif algo_l == "omp":
-        xw = solve_nonneg_omp(A, y, max_notes=max_notes)
+    if not classes:
+        raise RuntimeError("No usable entries found in LUT.")
+
+    return meta, classes
+
+
+# -----------------------------
+# Scoring + rejection
+# -----------------------------
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12))
+
+
+def weighted_cosine_sim(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
+    """
+    Weighted cosine: sim(a*w, b*w)
+    w should be >=0.
+    """
+    aw = a * w
+    bw = b * w
+    return cosine_sim(aw, bw)
+
+
+def compute_weight_from_std(std: np.ndarray, eps: float = 1e-3, power: float = 1.0) -> np.ndarray:
+    """
+    Lower std => higher weight.
+    """
+    w = 1.0 / (std + float(eps))
+    if power != 1.0:
+        w = w ** float(power)
+    # normalize weights (optional)
+    w /= (np.mean(w) + 1e-12)
+    return w
+
+
+def score_against_lut(
+    feat: np.ndarray,
+    classes: List[LutClass],
+    *,
+    use_std_weight: bool,
+    std_eps: float,
+    std_power: float,
+    offharm_penalty_alpha: float,
+) -> List[Tuple[float, LutClass]]:
+    scored: List[Tuple[float, LutClass]] = []
+    for c in classes:
+        if feat.size != c.band_med.size:
+            continue
+
+        if use_std_weight:
+            w = compute_weight_from_std(c.band_std, eps=std_eps, power=std_power)
+            sim = weighted_cosine_sim(feat, c.band_med, w)
+        else:
+            sim = cosine_sim(feat, c.band_med)
+
+        penalty = 0.0
+        if offharm_penalty_alpha > 0 and c.harm_mask is not None and c.harm_mask.size == feat.size:
+            # penalty is energy outside harmonic mask
+            penalty = float(np.sum(feat * (1.0 - c.harm_mask)))
+        score = float(sim - offharm_penalty_alpha * penalty)
+        scored.append((score, c))
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return scored
+
+
+def should_accept(
+    best_score: float,
+    second_score: float,
+    *,
+    abs_thresh: float,
+    margin_thresh: float,
+) -> bool:
+    if best_score < abs_thresh:
+        return False
+    if (best_score - second_score) < margin_thresh:
+        return False
+    return True
+
+
+# -----------------------------
+# Live processing
+# -----------------------------
+@dataclass
+class RuntimeConfig:
+    sr: int
+    frame_ms: float
+    hop_ms: float
+    seg_ms: float
+    # activity detection (gate)
+    gate_frame_ms: float
+    gate_hop_ms: float
+    gate_open_ratio: float
+    gate_close_ratio: float
+    gate_hold_frames: int
+    # signal conditioning
+    highpass: bool
+    highpass_hz: float
+    normalize_mode: str
+    target_rms: float
+    # feature
+    band_fmin: float
+    band_fmax: float
+    band_n: int
+    band_pool_agg: str
+    band_logmag: bool
+    feat_agg: str
+    # scoring
+    use_std_weight: bool
+    std_eps: float
+    std_power: float
+    offharm_alpha: float
+    abs_score_thresh: float
+    margin_thresh: float
+    # output smoothing
+    stable_count: int
+    min_interval_ms: float
+
+
+class ActivityGate:
+    """
+    Simple RMS-based gate with hysteresis:
+    - noise floor estimated on the fly from recent low-energy frames (median)
+    - open when rms > floor*open_ratio for hold_frames
+    - close when rms < floor*close_ratio for hold_frames
+    """
+    def __init__(self, open_ratio: float, close_ratio: float, hold_frames: int):
+        self.open_ratio = float(open_ratio)
+        self.close_ratio = float(close_ratio)
+        self.hold_frames = max(1, int(hold_frames))
+
+        self.is_open = False
+        self._above = 0
+        self._below = 0
+        self._noise_hist: List[float] = []
+
+    def update(self, rms_val: float) -> bool:
+        # update noise floor estimate using lower half of observed RMS values
+        self._noise_hist.append(float(rms_val))
+        if len(self._noise_hist) > 200:
+            self._noise_hist = self._noise_hist[-200:]
+
+        # robust floor: median of lowest 30% of recent samples
+        arr = np.array(self._noise_hist, dtype=np.float64)
+        if arr.size < 10:
+            floor = float(np.median(arr) + 1e-12)
+        else:
+            arr_sorted = np.sort(arr)
+            k = max(5, int(0.3 * arr_sorted.size))
+            floor = float(np.median(arr_sorted[:k]) + 1e-12)
+
+        open_th = floor * self.open_ratio
+        close_th = floor * self.close_ratio
+
+        if not self.is_open:
+            if rms_val >= open_th:
+                self._above += 1
+            else:
+                self._above = 0
+            if self._above >= self.hold_frames:
+                self.is_open = True
+                self._above = 0
+        else:
+            if rms_val <= close_th:
+                self._below += 1
+            else:
+                self._below = 0
+            if self._below >= self.hold_frames:
+                self.is_open = False
+                self._below = 0
+
+        return self.is_open
+
+
+def pick_latest_segment(buf: np.ndarray, seg_len: int) -> np.ndarray:
+    if buf.size < seg_len:
+        x = np.zeros(seg_len, dtype=np.float64)
+        x[-buf.size:] = buf
+        return x
+    return buf[-seg_len:]
+
+
+def run_match_loop_from_stream(meta: Dict[str, Any], classes: List[LutClass], cfg: RuntimeConfig, device: Optional[int]) -> None:
+    if sd is None:
+        raise RuntimeError("sounddevice is not installed. pip install sounddevice")
+
+    edges = make_log_band_edges(cfg.band_fmin, cfg.band_fmax, cfg.band_n)
+
+    seg_len = int(round(cfg.seg_ms / 1000.0 * cfg.sr))
+    gate_frame = int(round(cfg.gate_frame_ms / 1000.0 * cfg.sr))
+    gate_hop = int(round(cfg.gate_hop_ms / 1000.0 * cfg.sr))
+
+    feat_frame = int(round(cfg.frame_ms / 1000.0 * cfg.sr))
+    feat_hop = int(round(cfg.hop_ms / 1000.0 * cfg.sr))
+
+    audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=32)
+
+    def callback(indata, frames, time_info, status):
+        if status:
+            # don't spam; uncomment if needed
+            # print(status, file=sys.stderr)
+            pass
+        x = indata[:, 0].astype(np.float64, copy=False)
+        try:
+            audio_q.put_nowait(x)
+        except queue.Full:
+            pass
+
+    gate = ActivityGate(cfg.gate_open_ratio, cfg.gate_close_ratio, cfg.gate_hold_frames)
+
+    # simple stability filter
+    last_emit_t = 0.0
+    last_label = None
+    stable_hits = 0
+
+    # ring buffer for recent audio
+    buf = np.zeros(0, dtype=np.float64)
+
+    print("Listening... (Ctrl+C to stop)")
+    with sd.InputStream(
+        samplerate=cfg.sr,
+        channels=1,
+        dtype="float32",
+        callback=callback,
+        device=device,
+        blocksize=int(round(0.02 * cfg.sr)),  # ~20ms
+    ):
+        try:
+            while True:
+                try:
+                    chunk = audio_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                buf = np.concatenate([buf, chunk])
+                # keep ~2 seconds max
+                max_keep = int(2.0 * cfg.sr)
+                if buf.size > max_keep:
+                    buf = buf[-max_keep:]
+
+                # update activity gate on the newest buffer region
+                if buf.size >= gate_frame:
+                    # compute RMS on last gate_frame window
+                    tail = buf[-gate_frame:]
+                    rms_val = float(np.sqrt(np.mean(tail * tail) + 1e-12))
+                    active = gate.update(rms_val)
+                else:
+                    active = False
+
+                if not active:
+                    # reset stability when inactive
+                    last_label = None
+                    stable_hits = 0
+                    continue
+
+                seg = pick_latest_segment(buf, seg_len)
+
+                # conditioning
+                x = seg.copy()
+                x = normalize_audio(x, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
+                if cfg.highpass:
+                    x = highpass_filter(x, cfg.sr, cutoff_hz=cfg.highpass_hz)
+                    x = normalize_audio(x, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
+
+                feat = compute_band_feature_multiframe(
+                    x, cfg.sr,
+                    edges=edges,
+                    window="hann",
+                    band_pool_agg=cfg.band_pool_agg,
+                    band_logmag=cfg.band_logmag,
+                    feat_agg=cfg.feat_agg,
+                    frame_size=feat_frame,
+                    hop_size=feat_hop,
+                )
+
+                scored = score_against_lut(
+                    feat, classes,
+                    use_std_weight=cfg.use_std_weight,
+                    std_eps=cfg.std_eps,
+                    std_power=cfg.std_power,
+                    offharm_penalty_alpha=cfg.offharm_alpha,
+                )
+                if len(scored) < 2:
+                    continue
+                (s1, c1), (s2, _c2) = scored[0], scored[1]
+
+                accept = should_accept(
+                    s1, s2,
+                    abs_thresh=cfg.abs_score_thresh,
+                    margin_thresh=cfg.margin_thresh,
+                )
+                if not accept:
+                    last_label = None
+                    stable_hits = 0
+                    continue
+
+                # stability filter (require same label stable_count times)
+                if last_label == c1.label:
+                    stable_hits += 1
+                else:
+                    last_label = c1.label
+                    stable_hits = 1
+
+                now = time.time()
+                min_dt = cfg.min_interval_ms / 1000.0
+                if stable_hits >= cfg.stable_count and (now - last_emit_t) >= min_dt:
+                    last_emit_t = now
+                    print(f"{c1.label:8s}  score={s1:.3f}  margin={(s1 - s2):.3f}  midi={c1.midi}")
+        except KeyboardInterrupt:
+            print("\nStopped.")
+
+
+# -----------------------------
+# WAV-file mode (for testing)
+# -----------------------------
+def read_wav_mono_float(path: str) -> Tuple[int, np.ndarray]:
+    fs, x = wavfile.read(path)
+    if isinstance(x, np.ndarray) and x.ndim > 1:
+        x = x.mean(axis=1)
+    if x.dtype.kind in "iu":
+        x = x.astype(np.float64) / (float(np.iinfo(x.dtype).max) + 1e-12)
     else:
-        raise ValueError("algo must be nnls|omp")
-
-    label_strength: Dict[str, float] = {}
-    for w, lab in zip(xw, col_label):
-        label_strength[lab] = max(label_strength.get(lab, 0.0), float(w))
-
-    if not label_strength:
-        print("No note strengths found.")
-        return
-
-    m = max(label_strength.values()) + 1e-12
-    items = sorted(((lab, s / m) for lab, s in label_strength.items()), key=lambda p: p[1], reverse=True)
-
-    out: List[Tuple[str, float]] = []
-    for lab, s in items:
-        if len(out) >= int(max_notes):
-            break
-        if float(s) < float(thresh):
-            break
-        out.append((lab, float(s)))
-
-    print("\nDetected classes (poly):")
-    if not out:
-        print("  (none above threshold)")
-    else:
-        for lab, s in out:
-            b, si = split_label(lab)
-            print(f"  {lab:8s} strength={s:.3f}  base={b:4s} string={si}")
-
-    if collapsed:
-        base_strength: Dict[str, float] = {}
-        for lab, s in label_strength.items():
-            b, _si = split_label(lab)
-            base_strength[b] = max(base_strength.get(b, 0.0), float(s))
-        m2 = max(base_strength.values()) + 1e-12
-        base_items = sorted(((b, v / m2) for b, v in base_strength.items()), key=lambda p: p[1], reverse=True)
-        print("\nCollapsed base-note strengths:")
-        for b, v in base_items[:12]:
-            print(f"  {b:4s} strength={v:.3f}")
-
-    if plot:
-        freqs, mag = spectrum_mag(seg, fs, window=win)
-        plt.figure(figsize=(12, 4))
-        plt.plot(freqs, mag)
-        plt.title("Live Segment Magnitude Spectrum")
-        plt.xlabel("Hz")
-        plt.ylabel("|X(f)|")
-        plt.xlim(0, min(8000, freqs[-1]))
-        plt.tight_layout()
-        plt.show()
-
-        top_show = min(12, len(items))
-        labels = [lab for lab, _ in items[:top_show]]
-        vals = [s for _lab, s in items[:top_show]]
-        plt.figure(figsize=(12, 4))
-        plt.bar(labels, vals)
-        plt.title(f"Top Class Strengths (poly) algo={algo_l} prune={prune}")
-        plt.xlabel("Class label (note_string)")
-        plt.ylabel("Strength (normalized)")
-        plt.tight_layout()
-        plt.show()
+        x = x.astype(np.float64)
+    return int(fs), x
 
 
+def run_match_on_wav(meta: Dict[str, Any], classes: List[LutClass], cfg: RuntimeConfig, wav_path: str) -> None:
+    fs, x = read_wav_mono_float(wav_path)
+    if fs != cfg.sr:
+        print(f"[warn] wav sr={fs} but --sr={cfg.sr}. Using wav sr.", file=sys.stderr)
+        cfg = RuntimeConfig(**{**cfg.__dict__, "sr": fs})
+
+    edges = make_log_band_edges(cfg.band_fmin, cfg.band_fmax, cfg.band_n)
+    seg_len = int(round(cfg.seg_ms / 1000.0 * cfg.sr))
+    hop_len = int(round(0.05 * cfg.sr))  # 50ms step through file
+    feat_frame = int(round(cfg.frame_ms / 1000.0 * cfg.sr))
+    feat_hop = int(round(cfg.hop_ms / 1000.0 * cfg.sr))
+
+    print(f"Scanning {wav_path} ...")
+    t = 0
+    while t + seg_len <= x.size:
+        seg = x[t:t + seg_len]
+
+        y = normalize_audio(seg, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
+        if cfg.highpass:
+            y = highpass_filter(y, cfg.sr, cutoff_hz=cfg.highpass_hz)
+            y = normalize_audio(y, mode=cfg.normalize_mode, target_rms=cfg.target_rms)
+
+        feat = compute_band_feature_multiframe(
+            y, cfg.sr,
+            edges=edges,
+            window="hann",
+            band_pool_agg=cfg.band_pool_agg,
+            band_logmag=cfg.band_logmag,
+            feat_agg=cfg.feat_agg,
+            frame_size=feat_frame,
+            hop_size=feat_hop,
+        )
+        scored = score_against_lut(
+            feat, classes,
+            use_std_weight=cfg.use_std_weight,
+            std_eps=cfg.std_eps,
+            std_power=cfg.std_power,
+            offharm_penalty_alpha=cfg.offharm_alpha,
+        )
+        if len(scored) >= 2:
+            (s1, c1), (s2, _c2) = scored[0], scored[1]
+            if should_accept(s1, s2, abs_thresh=cfg.abs_score_thresh, margin_thresh=cfg.margin_thresh):
+                sec = t / cfg.sr
+                print(f"{sec:8.3f}s  {c1.label:8s} score={s1:.3f} margin={(s1-s2):.3f} midi={c1.midi}")
+
+        t += hop_len
+
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--lut", required=True, help="Path to lut.json built by lut_build.py")
+    ap.add_argument("--sr", type=int, default=48000, help="Sample rate to use for live input")
+    ap.add_argument("--device", type=int, default=None, help="Input device index (use --list_devices)")
+    ap.add_argument("--list_devices", action="store_true", help="List audio devices and exit")
+    ap.add_argument("--wav", type=str, default=None, help="If provided, run matcher on this WAV instead of mic")
 
-    ap_m = sub.add_parser("match", help="Monophonic match")
-    ap_m.add_argument("--lut", required=True)
-    ap_m.add_argument("--wav", required=True)
-    ap_m.add_argument("--start", type=float, default=0.10)
-    ap_m.add_argument("--dur", type=float, default=0.20)
-    ap_m.add_argument("--window", type=str, default=None)
-    ap_m.add_argument("--highpass", action="store_true")
-    ap_m.add_argument("--highpass_hz", type=float, default=80.0)
-    ap_m.add_argument("--top", type=int, default=8)
-    ap_m.add_argument("--plot", action="store_true")
-    ap_m.add_argument("--score_mode", type=str, default="max", choices=["max", "mean", "topk"])
-    ap_m.add_argument("--topk", type=int, default=3)
-    ap_m.add_argument("--offharm_alpha", type=float, default=1.0)
+    # analysis window sizes
+    ap.add_argument("--seg_ms", type=float, default=220.0, help="Segment length (ms) used for classification")
+    ap.add_argument("--frame_ms", type=float, default=46.0, help="Feature frame length (ms)")
+    ap.add_argument("--hop_ms", type=float, default=12.0, help="Feature hop length (ms)")
+    ap.add_argument("--feat_agg", type=str, default="median", choices=["median", "mean"])
 
-    ap_p = sub.add_parser("match_poly", help="Polyphonic match")
-    ap_p.add_argument("--lut", required=True)
-    ap_p.add_argument("--wav", required=True)
-    ap_p.add_argument("--start", type=float, default=0.10)
-    ap_p.add_argument("--dur", type=float, default=0.25)
-    ap_p.add_argument("--algo", type=str, default="omp", choices=["nnls", "omp"])
-    ap_p.add_argument("--window", type=str, default=None)
-    ap_p.add_argument("--highpass", action="store_true")
-    ap_p.add_argument("--highpass_hz", type=float, default=80.0)
-    ap_p.add_argument("--prune", type=int, default=40)
-    ap_p.add_argument("--max_notes", type=int, default=6)
-    ap_p.add_argument("--thresh", type=float, default=0.25)
-    ap_p.add_argument("--collapsed", action="store_true")
-    ap_p.add_argument("--plot", action="store_true")
+    # band template settings (should match LUT meta; defaults pulled from LUT if present)
+    ap.add_argument("--band_fmin", type=float, default=None)
+    ap.add_argument("--band_fmax", type=float, default=None)
+    ap.add_argument("--band_n", type=int, default=None)
+    ap.add_argument("--band_pool_agg", type=str, default=None, choices=["max", "mean"])
+    ap.add_argument("--band_logmag", action="store_true", help="Force logmag on (else use LUT meta if available)")
+
+    # conditioning
+    ap.add_argument("--highpass", action="store_true")
+    ap.add_argument("--highpass_hz", type=float, default=80.0)
+    ap.add_argument("--normalize", type=str, default="p95", choices=["peak", "p95", "rms", "none"])
+    ap.add_argument("--target_rms", type=float, default=0.10)
+
+    # activity gate
+    ap.add_argument("--gate_open_ratio", type=float, default=6.0)
+    ap.add_argument("--gate_close_ratio", type=float, default=3.0)
+    ap.add_argument("--gate_hold_frames", type=int, default=3)
+    ap.add_argument("--gate_frame_ms", type=float, default=40.0)
+    ap.add_argument("--gate_hop_ms", type=float, default=10.0)
+
+    # scoring & rejection
+    ap.add_argument("--abs_score", type=float, default=0.55, help="Absolute score threshold")
+    ap.add_argument("--margin", type=float, default=0.06, help="Best-vs-2nd margin threshold")
+    ap.add_argument("--use_std_weight", action="store_true", help="Use LUT std to weight stable bands more")
+    ap.add_argument("--std_eps", type=float, default=1e-3)
+    ap.add_argument("--std_power", type=float, default=1.0)
+    ap.add_argument("--offharm_alpha", type=float, default=0.0, help="Penalty for off-harmonic energy (0 disables)")
+
+    # output smoothing
+    ap.add_argument("--stable_count", type=int, default=2, help="Require same label this many times before printing")
+    ap.add_argument("--min_interval_ms", type=float, default=120.0, help="Min time between prints")
 
     args = ap.parse_args()
 
-    if args.cmd == "match":
-        match_mono(
-            lut_path=args.lut,
-            wav_path=args.wav,
-            start=args.start,
-            dur=args.dur,
-            window=args.window,
-            use_highpass=args.highpass,
-            highpass_hz=args.highpass_hz,
-            top_n=args.top,
-            plot=args.plot,
-            score_mode=args.score_mode,
-            topk=args.topk,
-            offharm_alpha=args.offharm_alpha,
-        )
-    elif args.cmd == "match_poly":
-        match_poly(
-            lut_path=args.lut,
-            wav_path=args.wav,
-            start=args.start,
-            dur=args.dur,
-            algo=args.algo,
-            window=args.window,
-            use_highpass=args.highpass,
-            highpass_hz=args.highpass_hz,
-            prune=args.prune,
-            max_notes=args.max_notes,
-            thresh=args.thresh,
-            collapsed=args.collapsed,
-            plot=args.plot,
-        )
+    if args.list_devices:
+        if sd is None:
+            print("sounddevice not installed.")
+            return
+        print(sd.query_devices())
+        return
+
+    meta, classes = load_lut_classes(args.lut)
+
+    # pull band params from LUT meta if user didn't override
+    band_meta = (meta.get("band_template") or {})
+    band_fmin = args.band_fmin if args.band_fmin is not None else float(band_meta.get("fmin_hz", 40.0))
+    band_fmax = args.band_fmax if args.band_fmax is not None else float(band_meta.get("fmax_hz", 8000.0))
+    band_n = args.band_n if args.band_n is not None else int(band_meta.get("n_bands", 480))
+    band_pool_agg = args.band_pool_agg if args.band_pool_agg is not None else str(band_meta.get("pool_agg", band_meta.get("agg", "max")))
+    # if flag not set, respect LUT meta; if set, force True
+    band_logmag = bool(args.band_logmag) if args.band_logmag else bool(band_meta.get("logmag", False))
+
+    cfg = RuntimeConfig(
+        sr=int(args.sr),
+        frame_ms=float(args.frame_ms),
+        hop_ms=float(args.hop_ms),
+        seg_ms=float(args.seg_ms),
+        gate_frame_ms=float(args.gate_frame_ms),
+        gate_hop_ms=float(args.gate_hop_ms),
+        gate_open_ratio=float(args.gate_open_ratio),
+        gate_close_ratio=float(args.gate_close_ratio),
+        gate_hold_frames=int(args.gate_hold_frames),
+        highpass=bool(args.highpass),
+        highpass_hz=float(args.highpass_hz),
+        normalize_mode=str(args.normalize),
+        target_rms=float(args.target_rms),
+        band_fmin=float(band_fmin),
+        band_fmax=float(band_fmax),
+        band_n=int(band_n),
+        band_pool_agg=str(band_pool_agg),
+        band_logmag=bool(band_logmag),
+        feat_agg=str(args.feat_agg),
+        use_std_weight=bool(args.use_std_weight),
+        std_eps=float(args.std_eps),
+        std_power=float(args.std_power),
+        offharm_alpha=float(args.offharm_alpha),
+        abs_score_thresh=float(args.abs_score),
+        margin_thresh=float(args.margin),
+        stable_count=int(args.stable_count),
+        min_interval_ms=float(args.min_interval_ms),
+    )
+
+    # quick sanity check for feature dim mismatch
+    d = classes[0].band_med.size
+    if d != cfg.band_n:
+        # cfg.band_n should equal number of bands; band feature length is band_n
+        # if LUT had different n_bands, we already pulled it, so this should match.
+        pass
+    for c in classes:
+        if c.band_med.size != classes[0].band_med.size:
+            raise RuntimeError("LUT entries have inconsistent band sizes.")
+
+    if args.wav:
+        run_match_on_wav(meta, classes, cfg, args.wav)
+    else:
+        run_match_loop_from_stream(meta, classes, cfg, device=args.device)
 
 
 if __name__ == "__main__":

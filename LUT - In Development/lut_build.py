@@ -11,23 +11,35 @@ No suffix => _0.
 
 Build commands:
   1) Build from labeled pairs (LABEL=path):
-     python lut_build.py build --out lut.json --k 60 --tol 15 --start 0.12 --dur 0.18 \
+     python lut_build.py build --out lut.json --k 60 --tol 15 --tol_mode cents \
+       --auto_onset --post_onset 0.06 --dur 0.18 \
+       --frame_ms 46 --hop_ms 12 \
        E4_5=samples/E4_5.wav E4_0=samples/E4.wav
 
   2) Build from directory (auto label from filename):
-     python lut_build.py build_dir --out lut.json --dir samples --k 60 --tol 15 --start 0.12 --dur 0.18
+     python lut_build.py build_dir --out lut.json --dir samples --k 60 --tol 15 --tol_mode cents \
+       --auto_onset --post_onset 0.06 --dur 0.18 --frame_ms 46 --hop_ms 12
 
-This builder stores:
-- harmonic fingerprint (compat/debug)
-- per-take log-frequency band template (main feature for distinctiveness)
+What this stores:
+- per-take harmonic fingerprint (compat/debug)
+- per-take log-frequency band template (main feature)
 - harmonic band mask (for optional off-harmonic penalties at match time)
+- per-take harmonic/off-harmonic energy summaries (useful for rejection / penalties)
+- entry-level aggregated statistics across takes (median + std) for more stable matching
+
+Added:
+- “Ideal” per-note-per-string templates computed mathematically from ALL notes on that string:
+  Each log-band dimension is fit as a smooth function of log(f0) across the string using polynomial ridge regression.
+  Stored per entry as:
+    - ideal_band_template_median
+    - ideal_band_template_std  (fit residual std per band dim)
 """
 
 import argparse
 import json
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from pathlib import Path
 from collections import defaultdict
 
@@ -139,14 +151,40 @@ def read_wav_mono_float(wav_path: str) -> Tuple[int, np.ndarray]:
         x = x.mean(axis=1)
     if x.dtype.kind in "iu":
         maxv = float(np.iinfo(x.dtype).max)
-        x = x.astype(np.float64) / maxv
+        x = x.astype(np.float64) / (maxv + 1e-12)
     else:
         x = x.astype(np.float64)
     return int(fs), x
 
 
-def normalize_peak(x: np.ndarray) -> np.ndarray:
-    return x / (float(np.max(np.abs(x)) + 1e-12))
+def normalize_audio(x: np.ndarray, mode: str = "peak", target_rms: float = 0.1) -> np.ndarray:
+    """
+    mode:
+      - peak: divide by max(abs(x))
+      - p95 : divide by 95th percentile abs
+      - rms : scale so RMS ~= target_rms
+      - none: no normalization
+    """
+    mode = (mode or "peak").lower()
+    if mode == "none":
+        return x
+    if mode == "peak":
+        d = float(np.max(np.abs(x)) + 1e-12)
+        return x / d
+    if mode in ("p95", "pct", "percentile"):
+        d = float(np.percentile(np.abs(x), 95) + 1e-12)
+        return x / d
+    if mode == "rms":
+        rms = float(np.sqrt(np.mean(x * x)) + 1e-12)
+        return x * (float(target_rms) / rms)
+    raise ValueError("normalize_mode must be one of: peak|p95|rms|none")
+
+
+def highpass_filter(x: np.ndarray, fs: int, cutoff_hz: float = 80.0, order: int = 4) -> np.ndarray:
+    if cutoff_hz <= 0:
+        return x
+    sos = butter(order, cutoff_hz / (fs * 0.5), btype="highpass", output="sos")
+    return sosfilt(sos, x)
 
 
 def pick_segment(x: np.ndarray, fs: int, start_sec: float, dur_sec: float) -> np.ndarray:
@@ -158,15 +196,67 @@ def pick_segment(x: np.ndarray, fs: int, start_sec: float, dur_sec: float) -> np
     return seg
 
 
-def highpass_filter(x: np.ndarray, fs: int, cutoff_hz: float = 80.0, order: int = 4) -> np.ndarray:
-    if cutoff_hz <= 0:
-        return x
-    sos = butter(order, cutoff_hz / (fs * 0.5), btype="highpass", output="sos")
-    return sosfilt(sos, x)
+# -----------------------------
+# Onset detection (energy-based)
+# -----------------------------
+def frame_signal(x: np.ndarray, frame: int, hop: int) -> np.ndarray:
+    if frame <= 0 or hop <= 0:
+        raise ValueError("frame and hop must be > 0")
+    n = len(x)
+    if n <= frame:
+        return np.zeros((1, frame), dtype=np.float64)
+    count = 1 + (n - frame) // hop
+    out = np.zeros((count, frame), dtype=np.float64)
+    for i in range(count):
+        s = i * hop
+        out[i] = x[s:s + frame]
+    return out
+
+
+def detect_onset_sec_energy(
+    x: np.ndarray,
+    fs: int,
+    frame: int,
+    hop: int,
+    thresh_ratio: float = 6.0,
+    hold_frames: int = 3,
+    search_start_sec: float = 0.0,
+    search_end_sec: Optional[float] = None,
+) -> float:
+    """
+    Finds the first frame where RMS exceeds (noise_floor * thresh_ratio) for hold_frames.
+    noise_floor is estimated from the first ~0.25s of the search region.
+    Returns onset time in seconds (within original signal).
+    """
+    n = len(x)
+    if search_end_sec is None:
+        search_end_sec = n / fs
+
+    start_i = int(max(0, round(search_start_sec * fs)))
+    end_i = int(min(n, round(search_end_sec * fs)))
+    if end_i <= start_i + frame:
+        return float(search_start_sec)
+
+    xs = x[start_i:end_i]
+    frames = frame_signal(xs, frame=frame, hop=hop)
+    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+
+    nf_frames = max(10, int(round(0.25 * fs / hop)))
+    nf_frames = min(nf_frames, len(rms))
+    noise_floor = float(np.median(rms[:nf_frames]) + 1e-12)
+    thresh = noise_floor * float(thresh_ratio)
+
+    hold_frames = max(1, int(hold_frames))
+    for i in range(0, len(rms) - hold_frames + 1):
+        if np.all(rms[i:i + hold_frames] >= thresh):
+            onset_sample = start_i + i * hop
+            return float(onset_sample / fs)
+
+    return float(search_start_sec)
 
 
 # -----------------------------
-# Spectrum + harmonic fingerprint (compat/debug)
+# Spectrum + harmonic fingerprint
 # -----------------------------
 def spectrum_mag(seg: np.ndarray, fs: int, window: str = "hann") -> Tuple[np.ndarray, np.ndarray]:
     N = len(seg)
@@ -184,7 +274,29 @@ def band_energy_max(freqs: np.ndarray, mag: np.ndarray, center_hz: float, tol_hz
     return float(np.max(mag[mask])) if np.any(mask) else 0.0
 
 
-def fingerprint_for_note(seg: np.ndarray, fs: int, f0: float, k: int, tol_hz: float, window: str) -> np.ndarray:
+def cents_to_hz_width(center_hz: float, tol_cents: float) -> float:
+    r = 2.0 ** (tol_cents / 1200.0)
+    return float(center_hz * (r - 1.0))
+
+
+def get_tol_hz(center_hz: float, tol_value: float, tol_mode: str) -> float:
+    tol_mode = (tol_mode or "cents").lower()
+    if tol_mode == "hz":
+        return float(tol_value)
+    if tol_mode == "cents":
+        return cents_to_hz_width(center_hz, float(tol_value))
+    raise ValueError("tol_mode must be hz|cents")
+
+
+def fingerprint_for_note_oneframe(
+    seg: np.ndarray,
+    fs: int,
+    f0: float,
+    k: int,
+    tol_value: float,
+    tol_mode: str,
+    window: str,
+) -> np.ndarray:
     freqs, mag = spectrum_mag(seg, fs, window=window)
     nyq = float(freqs[-1])
     amps: List[float] = []
@@ -192,6 +304,7 @@ def fingerprint_for_note(seg: np.ndarray, fs: int, f0: float, k: int, tol_hz: fl
         fh = h * f0
         if fh >= nyq:
             break
+        tol_hz = get_tol_hz(fh, tol_value, tol_mode)
         amps.append(band_energy_max(freqs, mag, fh, tol_hz))
     v = np.array(amps, dtype=np.float64)
     s = float(np.sum(v))
@@ -199,7 +312,7 @@ def fingerprint_for_note(seg: np.ndarray, fs: int, f0: float, k: int, tol_hz: fl
 
 
 # -----------------------------
-# NEW: log-band templates
+# Log-band templates
 # -----------------------------
 def make_log_band_edges(fmin_hz: float, fmax_hz: float, n_bands: int) -> np.ndarray:
     fmin_hz = max(1e-3, float(fmin_hz))
@@ -222,20 +335,6 @@ def pool_to_log_bands(freqs: np.ndarray, mag: np.ndarray, edges: np.ndarray, agg
     return out
 
 
-def cents_to_hz_width(center_hz: float, tol_cents: float) -> float:
-    r = 2.0 ** (tol_cents / 1200.0)
-    return float(center_hz * (r - 1.0))
-
-
-def get_tol_hz(center_hz: float, tol_value: float, tol_mode: str) -> float:
-    tol_mode = (tol_mode or "cents").lower()
-    if tol_mode == "hz":
-        return float(tol_value)
-    if tol_mode == "cents":
-        return cents_to_hz_width(center_hz, float(tol_value))
-    raise ValueError("tol_mode must be hz|cents")
-
-
 def build_harmonic_band_mask(edges: np.ndarray, f0: float, k: int, tol_value: float, tol_mode: str) -> np.ndarray:
     nb = len(edges) - 1
     mask = np.zeros(nb, dtype=np.float64)
@@ -256,26 +355,181 @@ def build_harmonic_band_mask(edges: np.ndarray, f0: float, k: int, tol_value: fl
     return mask
 
 
-def make_band_template(seg: np.ndarray,
-                       fs: int,
-                       window: str,
-                       edges: np.ndarray,
-                       logmag: bool,
-                       agg: str,
-                       f0: float,
-                       mask_k: int,
-                       mask_tol: float,
-                       mask_tol_mode: str) -> Tuple[np.ndarray, np.ndarray]:
+def compute_band_template_oneframe(
+    seg: np.ndarray,
+    fs: int,
+    window: str,
+    edges: np.ndarray,
+    logmag: bool,
+    agg: str,
+) -> np.ndarray:
     freqs, mag = spectrum_mag(seg, fs, window=window)
     y = mag.astype(np.float64)
     if logmag:
         y = np.log1p(y)
-
     band = pool_to_log_bands(freqs, y, edges, agg=agg)
-    band /= (np.linalg.norm(band) + 1e-12)
+    return band
 
-    harm_mask = build_harmonic_band_mask(edges, f0=f0, k=mask_k, tol_value=mask_tol, tol_mode=mask_tol_mode)
-    return band, harm_mask
+
+def aggregate_feature(frames_feat: np.ndarray, agg: str = "median") -> np.ndarray:
+    """
+    frames_feat: shape (T, D)
+    """
+    if frames_feat.ndim != 2:
+        raise ValueError("frames_feat must be 2D (T, D)")
+    agg = (agg or "median").lower()
+    if agg == "mean":
+        return np.mean(frames_feat, axis=0)
+    return np.median(frames_feat, axis=0)
+
+
+def l2_normalize(v: np.ndarray) -> np.ndarray:
+    return v / (np.linalg.norm(v) + 1e-12)
+
+
+def analyze_segment_multiframe(
+    seg: np.ndarray,
+    fs: int,
+    *,
+    window: str,
+    edges: np.ndarray,
+    band_logmag: bool,
+    band_agg: str,
+    feat_agg: str,
+    f0: float,
+    fp_k: int,
+    fp_tol: float,
+    fp_tol_mode: str,
+    frame_size: int,
+    hop_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      band_template (unit norm)
+      fingerprint (unit sum, same as original style)
+    """
+    if len(seg) < frame_size:
+        seg = np.pad(seg, (0, frame_size - len(seg)))
+
+    frames = frame_signal(seg, frame=frame_size, hop=hop_size)
+    w = get_window(window, frame_size, fftbins=True).astype(np.float64)
+    frames_w = frames * w[None, :]
+
+    bands = []
+    fps = []
+    for i in range(frames_w.shape[0]):
+        f, mag = spectrum_mag(frames_w[i], fs, window="boxcar")
+        y = mag.astype(np.float64)
+        if band_logmag:
+            y = np.log1p(y)
+        band_i = pool_to_log_bands(f, y, edges, agg=band_agg)
+        bands.append(band_i)
+
+        fp_i = fingerprint_for_note_oneframe(
+            frames_w[i], fs, f0=f0, k=fp_k, tol_value=fp_tol, tol_mode=fp_tol_mode, window="boxcar"
+        )
+        fps.append(fp_i)
+
+    bands = np.stack(bands, axis=0) if bands else np.zeros((1, len(edges) - 1), dtype=np.float64)
+
+    if fps:
+        maxlen = max(len(v) for v in fps)
+        fp_mat = np.zeros((len(fps), maxlen), dtype=np.float64)
+        for i, v in enumerate(fps):
+            fp_mat[i, :len(v)] = v
+    else:
+        fp_mat = np.zeros((1, fp_k), dtype=np.float64)
+
+    band_vec = aggregate_feature(bands, agg=feat_agg)
+    band_vec = l2_normalize(band_vec)
+
+    fp_vec = aggregate_feature(fp_mat, agg=feat_agg)
+    s = float(np.sum(fp_vec))
+    fp_vec = (fp_vec / (s + 1e-12)) if s > 1e-18 else np.zeros_like(fp_vec)
+
+    return band_vec, fp_vec
+
+
+# -----------------------------
+# “Ideal” per-string math model (your request)
+# -----------------------------
+def _poly_design(x: np.ndarray, degree: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    return np.vstack([x**p for p in range(degree + 1)]).T
+
+
+def _ridge_fit_predict(X: np.ndarray, y: np.ndarray, lam: float, Xq: np.ndarray) -> np.ndarray:
+    d = X.shape[1]
+    A = X.T @ X + float(lam) * np.eye(d)
+    b = X.T @ y
+    w = np.linalg.solve(A, b)
+    return Xq @ w
+
+
+def build_string_ideals_from_entries(
+    entries: List[Dict[str, Any]],
+    *,
+    degree: int = 4,
+    lam: float = 1e-2,
+    min_notes: int = 6,
+) -> int:
+    """
+    For each string, fit each band dimension y_d as a smooth function of x=log(f0_hz) across ALL notes on that string.
+    Then for each entry on that string, predict its “ideal” band template at its f0.
+
+    Mutates entries in-place:
+      - ideal_band_template_median
+      - ideal_band_template_std
+
+    Returns number of entries that received an ideal.
+    """
+    by_string: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if "band_template_median" not in e or "f0_hz" not in e:
+            continue
+        try:
+            si = int(e.get("string_idx", -1))
+        except Exception:
+            continue
+        if si < 0:
+            continue
+        by_string[si].append(e)
+
+    wrote = 0
+    for si, group in by_string.items():
+        if len(group) < int(min_notes):
+            continue
+
+        f0 = np.array([float(e["f0_hz"]) for e in group], dtype=np.float64)
+        x = np.log(np.maximum(f0, 1e-9))  # (N,)
+
+        Y = np.stack([np.array(e["band_template_median"], dtype=np.float64) for e in group], axis=0)
+        N, D = Y.shape
+
+        X = _poly_design(x, degree=int(degree))  # (N, P)
+        Xq = X  # predict at training x (ideal per note)
+
+        Yhat = np.zeros_like(Y)
+        resid_std = np.zeros(D, dtype=np.float64)
+
+        for d in range(D):
+            y = Y[:, d]
+            yhat = _ridge_fit_predict(X, y, lam=float(lam), Xq=Xq)
+            Yhat[:, d] = yhat
+            resid_std[d] = float(np.std(y - yhat))
+
+        for i, e in enumerate(group):
+            v = Yhat[i].copy()
+            v[v < 0.0] = 0.0
+            v = l2_normalize(v)
+
+            e["ideal_band_template_median"] = [float(z) for z in v.tolist()]
+            e["ideal_band_template_std"] = [float(z) for z in resid_std.tolist()]
+            wrote += 1
+
+    return wrote
 
 
 # -----------------------------
@@ -289,12 +543,21 @@ class LutEntry:
     midi: int
     f0_hz: float
     k: int
-    tol_hz: float
+    tol_value: float
+    tol_mode: str
     window: str
+
     takes: List[Dict[str, Any]]
     source_wavs: List[str]
+
     analysis_start_sec: float
     analysis_dur_sec: float
+    auto_onset: bool
+
+    band_template_median: List[float]
+    band_template_std: List[float]
+    fingerprint_median: List[float]
+    fingerprint_std: List[float]
 
 
 def load_lut(path: str) -> Dict[str, Any]:
@@ -331,38 +594,76 @@ def parse_labeled_args(pairs: List[str]) -> List[Tuple[str, str]]:
     return out
 
 
-def build_lut(out_path: str,
-              labeled: List[Tuple[str, str]],
-              k: int,
-              tol_hz: float,
-              start: float,
-              dur: float,
-              a4: float,
-              window: str,
-              use_highpass: bool,
-              highpass_hz: float,
-              replace_existing: bool,
-              band_fmin: float,
-              band_fmax: float,
-              band_n: int,
-              band_agg: str,
-              band_logmag: bool,
-              mask_k: int,
-              mask_tol: float,
-              mask_tol_mode: str) -> None:
+def build_lut(
+    out_path: str,
+    labeled: List[Tuple[str, str]],
+    k: int,
+    tol_value: float,
+    tol_mode: str,
+    start: float,
+    dur: float,
+    a4: float,
+    window: str,
+    use_highpass: bool,
+    highpass_hz: float,
+    replace_existing: bool,
+    # band template params
+    band_fmin: float,
+    band_fmax: float,
+    band_n: int,
+    band_pool_agg: str,
+    band_logmag: bool,
+    # mask params
+    mask_k: int,
+    mask_tol: float,
+    mask_tol_mode: str,
+    # multiframe params
+    feat_agg: str,
+    frame_ms: float,
+    hop_ms: float,
+    # onset params
+    auto_onset: bool,
+    onset_thresh_ratio: float,
+    onset_hold_frames: int,
+    onset_search_start: float,
+    onset_search_end: float,
+    post_onset: float,
+    # normalization
+    normalize_mode: str,
+    target_rms: float,
+) -> None:
     if (not replace_existing) and Path(out_path).exists():
         lut = load_lut(out_path)
     else:
         lut = {"meta": {}, "entries": []}
 
-    lut["meta"]["type"] = "harmonic_fingerprint_lut_v2_stringaware"
+    lut["meta"]["type"] = "harmonic_fingerprint_lut_v3_multiframe_onset_stringaware"
     lut["meta"]["a4_hz"] = float(a4)
+    lut["meta"]["analysis"] = {
+        "window": str(window),
+        "dur_sec": float(dur),
+        "start_sec": float(start),
+        "auto_onset": bool(auto_onset),
+        "post_onset_sec": float(post_onset),
+        "onset": {
+            "frame_ms": float(frame_ms),
+            "hop_ms": float(hop_ms),
+            "thresh_ratio": float(onset_thresh_ratio),
+            "hold_frames": int(onset_hold_frames),
+            "search_start_sec": float(onset_search_start),
+            "search_end_sec": float(onset_search_end),
+        },
+        "normalize": {"mode": str(normalize_mode), "target_rms": float(target_rms)},
+        "highpass": {"enabled": bool(use_highpass), "hz": float(highpass_hz)},
+        "multiframe": {"feature_agg": str(feat_agg)},
+        "fingerprint": {"k": int(k), "tol": float(tol_value), "tol_mode": str(tol_mode)},
+    }
     lut["meta"]["band_template"] = {
         "enabled": True,
         "fmin_hz": float(band_fmin),
         "fmax_hz": float(band_fmax),
         "n_bands": int(band_n),
-        "agg": str(band_agg),
+        "pool_agg": str(band_pool_agg),
         "logmag": bool(band_logmag),
         "harm_mask": {"k": int(mask_k), "tol": float(mask_tol), "tol_mode": str(mask_tol_mode)},
     }
@@ -379,37 +680,112 @@ def build_lut(out_path: str,
         grouped[label.strip().upper()].append(wav_path)
 
     for key, paths in grouped.items():
-        label = key  # already upper
-        # preserve original casing: labels are canonical anyway
+        label = key
         base_note, string_idx = split_label(label)
 
         midi = note_to_midi(base_note)
         f0 = midi_to_freq_hz(midi, a4_hz=a4)
 
+        frame_size = max(256, int(round((frame_ms / 1000.0) * 1.0)))
+        hop_size = max(64, int(round((hop_ms / 1000.0) * 1.0)))
+
         takes: List[Dict[str, Any]] = []
         sources: List[str] = []
 
+        band_take_list = []
+        fp_take_list = []
+
+        harm_mask = build_harmonic_band_mask(edges, f0=f0, k=mask_k, tol_value=mask_tol, tol_mode=mask_tol_mode)
+
         for wav_path in paths:
             fs, x = read_wav_mono_float(wav_path)
-            x = normalize_peak(x)
-            seg = pick_segment(x, fs, start, dur)
-            if use_highpass:
-                seg = highpass_filter(seg, fs, cutoff_hz=highpass_hz)
-            seg = normalize_peak(seg)
 
-            fp = fingerprint_for_note(seg, fs, f0=f0, k=k, tol_hz=tol_hz, window=window)
-            band_vec, harm_mask = make_band_template(
-                seg=seg, fs=fs, window=window, edges=edges,
-                logmag=band_logmag, agg=band_agg,
-                f0=f0, mask_k=mask_k, mask_tol=mask_tol, mask_tol_mode=mask_tol_mode
+            x = normalize_audio(x, mode=normalize_mode, target_rms=target_rms)
+
+            if use_highpass:
+                x = highpass_filter(x, fs, cutoff_hz=highpass_hz)
+                x = normalize_audio(x, mode=normalize_mode, target_rms=target_rms)
+
+            frame_size = max(256, int(round((frame_ms / 1000.0) * fs)))
+            hop_size = max(64, int(round((hop_ms / 1000.0) * fs)))
+
+            if auto_onset:
+                onset_sec = detect_onset_sec_energy(
+                    x, fs,
+                    frame=frame_size,
+                    hop=hop_size,
+                    thresh_ratio=onset_thresh_ratio,
+                    hold_frames=onset_hold_frames,
+                    search_start_sec=onset_search_start,
+                    search_end_sec=onset_search_end if onset_search_end > 0 else None,
+                )
+                seg_start = onset_sec + float(post_onset)
+            else:
+                onset_sec = float("nan")
+                seg_start = float(start)
+
+            seg = pick_segment(x, fs, seg_start, float(dur))
+            seg = normalize_audio(seg, mode=normalize_mode, target_rms=target_rms)
+
+            band_vec, fp_vec = analyze_segment_multiframe(
+                seg=seg, fs=fs,
+                window=window,
+                edges=edges,
+                band_logmag=band_logmag,
+                band_agg=band_pool_agg,
+                feat_agg=feat_agg,
+                f0=f0,
+                fp_k=k,
+                fp_tol=tol_value,
+                fp_tol_mode=tol_mode,
+                frame_size=frame_size,
+                hop_size=hop_size,
             )
 
+            harm_energy = float(np.sum(band_vec * harm_mask))
+            off_energy = float(np.sum(band_vec * (1.0 - harm_mask)))
+            harm_ratio = float(harm_energy / (off_energy + 1e-12))
+
             takes.append({
-                "fingerprint": [float(v) for v in fp.tolist()],
+                "fingerprint": [float(v) for v in fp_vec.tolist()],
                 "band_template": [float(v) for v in band_vec.tolist()],
                 "harm_band_mask": [float(v) for v in harm_mask.tolist()],
+                "harm_energy": harm_energy,
+                "off_energy": off_energy,
+                "harm_ratio": harm_ratio,
+                "onset_sec": None if not np.isfinite(onset_sec) else float(onset_sec),
+                "segment_start_sec": float(seg_start),
+                "segment_dur_sec": float(dur),
+                "frame_size": int(frame_size),
+                "hop_size": int(hop_size),
+                "fs": int(fs),
             })
             sources.append(str(wav_path))
+
+            band_take_list.append(band_vec)
+            fp_take_list.append(fp_vec)
+
+        if band_take_list:
+            band_mat = np.stack(band_take_list, axis=0)
+            band_med = np.median(band_mat, axis=0)
+            band_std = np.std(band_mat, axis=0)
+            band_med = l2_normalize(band_med)
+        else:
+            band_med = np.zeros(len(edges) - 1, dtype=np.float64)
+            band_std = np.zeros(len(edges) - 1, dtype=np.float64)
+
+        if fp_take_list:
+            maxlen = max(len(v) for v in fp_take_list)
+            fp_mat = np.zeros((len(fp_take_list), maxlen), dtype=np.float64)
+            for i, v in enumerate(fp_take_list):
+                fp_mat[i, :len(v)] = v
+            fp_med = np.median(fp_mat, axis=0)
+            fp_std = np.std(fp_mat, axis=0)
+            s = float(np.sum(fp_med))
+            fp_med = (fp_med / (s + 1e-12)) if s > 1e-18 else np.zeros_like(fp_med)
+        else:
+            fp_med = np.zeros(k, dtype=np.float64)
+            fp_std = np.zeros(k, dtype=np.float64)
 
         entry = LutEntry(
             note=f"{base_note}_{string_idx}",
@@ -418,12 +794,18 @@ def build_lut(out_path: str,
             midi=midi,
             f0_hz=float(f0),
             k=int(k),
-            tol_hz=float(tol_hz),
+            tol_value=float(tol_value),
+            tol_mode=str(tol_mode),
             window=str(window),
             takes=takes,
             source_wavs=sources,
             analysis_start_sec=float(start),
             analysis_dur_sec=float(dur),
+            auto_onset=bool(auto_onset),
+            band_template_median=[float(v) for v in band_med.tolist()],
+            band_template_std=[float(v) for v in band_std.tolist()],
+            fingerprint_median=[float(v) for v in fp_med.tolist()],
+            fingerprint_std=[float(v) for v in fp_std.tolist()],
         ).__dict__
 
         if key in existing_idx and not replace_existing:
@@ -432,17 +814,16 @@ def build_lut(out_path: str,
             old.setdefault("source_wavs", [])
             old["takes"] = list(old["takes"]) + takes
             old["source_wavs"] = list(old["source_wavs"]) + sources
-            # refresh meta fields
-            old["note"] = entry["note"]
-            old["base_note"] = entry["base_note"]
-            old["string_idx"] = entry["string_idx"]
-            old["midi"] = entry["midi"]
-            old["f0_hz"] = entry["f0_hz"]
-            old["k"] = entry["k"]
-            old["tol_hz"] = entry["tol_hz"]
-            old["window"] = entry["window"]
-            old["analysis_start_sec"] = entry["analysis_start_sec"]
-            old["analysis_dur_sec"] = entry["analysis_dur_sec"]
+
+            for f in [
+                "note", "base_note", "string_idx", "midi", "f0_hz", "k",
+                "tol_value", "tol_mode", "window",
+                "analysis_start_sec", "analysis_dur_sec", "auto_onset",
+                "band_template_median", "band_template_std",
+                "fingerprint_median", "fingerprint_std",
+            ]:
+                old[f] = entry[f]
+
             lut["entries"][existing_idx[key]] = old
             print(f"[build] merged  {entry['note']}: added_takes={len(sources)} total_takes={len(old['takes'])}")
         elif key in existing_idx and replace_existing:
@@ -452,6 +833,25 @@ def build_lut(out_path: str,
             lut["entries"].append(entry)
             print(f"[build] added   {entry['note']}: takes={len(sources)}")
 
+    # --- NEW: compute “ideal” per-entry templates from ALL notes on each string
+    wrote = build_string_ideals_from_entries(
+        lut["entries"],
+        degree=4,
+        lam=1e-2,
+        min_notes=6,
+    )
+    lut["meta"].setdefault("ideals_by_string", {})
+    lut["meta"]["ideals_by_string"] = {
+        "method": "poly_ridge_fit_per_band_dim",
+        "x": "log(f0_hz)",
+        "degree": 4,
+        "lambda": 1e-2,
+        "min_notes": 6,
+        "stored_fields": ["ideal_band_template_median", "ideal_band_template_std"],
+        "note": "Fit uses per-entry band_template_median across all notes on the same string.",
+        "entries_written": int(wrote),
+    }
+
     save_lut(out_path, lut)
     print(f"Saved LUT -> {out_path} with {len(lut['entries'])} class entries")
 
@@ -460,51 +860,55 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    ap_build = sub.add_parser("build", help="Build LUT from labeled recordings (LABEL=wav_path)")
-    ap_build.add_argument("--out", required=True)
-    ap_build.add_argument("--k", type=int, default=60)
-    ap_build.add_argument("--tol", type=float, default=15.0)
-    ap_build.add_argument("--start", type=float, default=0.10)
-    ap_build.add_argument("--dur", type=float, default=0.20)
-    ap_build.add_argument("--a4", type=float, default=440.0)
-    ap_build.add_argument("--window", type=str, default="hann")
-    ap_build.add_argument("--highpass", action="store_true")
-    ap_build.add_argument("--highpass_hz", type=float, default=80.0)
-    ap_build.add_argument("--replace_existing", action="store_true")
-    ap_build.add_argument("labeled", nargs="+")  # LABEL=path
+    def add_common(apx: argparse.ArgumentParser) -> None:
+        apx.add_argument("--out", required=True)
 
-    # band template params (defaults tuned for string separation)
-    ap_build.add_argument("--band_fmin", type=float, default=40.0)
-    ap_build.add_argument("--band_fmax", type=float, default=8000.0)
-    ap_build.add_argument("--band_n", type=int, default=480)
-    ap_build.add_argument("--band_agg", type=str, default="max", choices=["max", "mean"])
-    ap_build.add_argument("--band_logmag", action="store_true")
-    ap_build.add_argument("--mask_k", type=int, default=24)
-    ap_build.add_argument("--mask_tol", type=float, default=20.0)
-    ap_build.add_argument("--mask_tol_mode", type=str, default="cents", choices=["hz", "cents"])
+        apx.add_argument("--k", type=int, default=60)
+        apx.add_argument("--tol", type=float, default=20.0)
+        apx.add_argument("--tol_mode", type=str, default="cents", choices=["hz", "cents"])
+
+        apx.add_argument("--start", type=float, default=0.10)
+        apx.add_argument("--dur", type=float, default=0.20)
+
+        apx.add_argument("--a4", type=float, default=440.0)
+        apx.add_argument("--window", type=str, default="hann")
+
+        apx.add_argument("--highpass", action="store_true")
+        apx.add_argument("--highpass_hz", type=float, default=80.0)
+
+        apx.add_argument("--replace_existing", action="store_true")
+
+        apx.add_argument("--band_fmin", type=float, default=40.0)
+        apx.add_argument("--band_fmax", type=float, default=8000.0)
+        apx.add_argument("--band_n", type=int, default=480)
+        apx.add_argument("--band_pool_agg", type=str, default="max", choices=["max", "mean"])
+        apx.add_argument("--band_logmag", action="store_true")
+        apx.add_argument("--mask_k", type=int, default=24)
+        apx.add_argument("--mask_tol", type=float, default=20.0)
+        apx.add_argument("--mask_tol_mode", type=str, default="cents", choices=["hz", "cents"])
+
+        apx.add_argument("--feat_agg", type=str, default="median", choices=["median", "mean"])
+        apx.add_argument("--frame_ms", type=float, default=46.0, help="analysis frame length in ms")
+        apx.add_argument("--hop_ms", type=float, default=12.0, help="analysis hop in ms")
+
+        apx.add_argument("--auto_onset", action="store_true", help="detect onset and analyze after pick attack")
+        apx.add_argument("--onset_thresh_ratio", type=float, default=6.0)
+        apx.add_argument("--onset_hold_frames", type=int, default=3)
+        apx.add_argument("--onset_search_start", type=float, default=0.0)
+        apx.add_argument("--onset_search_end", type=float, default=0.0, help="0 = end of file")
+        apx.add_argument("--post_onset", type=float, default=0.06, help="seconds after onset to start analysis")
+
+        apx.add_argument("--normalize", type=str, default="p95", choices=["peak", "p95", "rms", "none"])
+        apx.add_argument("--target_rms", type=float, default=0.10)
+
+    ap_build = sub.add_parser("build", help="Build LUT from labeled recordings (LABEL=wav_path)")
+    add_common(ap_build)
+    ap_build.add_argument("labeled", nargs="+")
 
     ap_build_dir = sub.add_parser("build_dir", help="Build LUT from directory (auto label from filename)")
-    ap_build_dir.add_argument("--out", required=True)
+    add_common(ap_build_dir)
     ap_build_dir.add_argument("--dir", required=True)
     ap_build_dir.add_argument("--recursive", action="store_true")
-    ap_build_dir.add_argument("--k", type=int, default=60)
-    ap_build_dir.add_argument("--tol", type=float, default=15.0)
-    ap_build_dir.add_argument("--start", type=float, default=0.10)
-    ap_build_dir.add_argument("--dur", type=float, default=0.20)
-    ap_build_dir.add_argument("--a4", type=float, default=440.0)
-    ap_build_dir.add_argument("--window", type=str, default="hann")
-    ap_build_dir.add_argument("--highpass", action="store_true")
-    ap_build_dir.add_argument("--highpass_hz", type=float, default=80.0)
-    ap_build_dir.add_argument("--replace_existing", action="store_true")
-
-    ap_build_dir.add_argument("--band_fmin", type=float, default=40.0)
-    ap_build_dir.add_argument("--band_fmax", type=float, default=8000.0)
-    ap_build_dir.add_argument("--band_n", type=int, default=480)
-    ap_build_dir.add_argument("--band_agg", type=str, default="max", choices=["max", "mean"])
-    ap_build_dir.add_argument("--band_logmag", action="store_true")
-    ap_build_dir.add_argument("--mask_k", type=int, default=24)
-    ap_build_dir.add_argument("--mask_tol", type=float, default=20.0)
-    ap_build_dir.add_argument("--mask_tol_mode", type=str, default="cents", choices=["hz", "cents"])
 
     args = ap.parse_args()
 
@@ -514,7 +918,8 @@ def main():
             out_path=args.out,
             labeled=labeled,
             k=args.k,
-            tol_hz=args.tol,
+            tol_value=args.tol,
+            tol_mode=args.tol_mode,
             start=args.start,
             dur=args.dur,
             a4=args.a4,
@@ -525,11 +930,22 @@ def main():
             band_fmin=args.band_fmin,
             band_fmax=args.band_fmax,
             band_n=args.band_n,
-            band_agg=args.band_agg,
+            band_pool_agg=args.band_pool_agg,
             band_logmag=args.band_logmag,
             mask_k=args.mask_k,
             mask_tol=args.mask_tol,
             mask_tol_mode=args.mask_tol_mode,
+            feat_agg=args.feat_agg,
+            frame_ms=args.frame_ms,
+            hop_ms=args.hop_ms,
+            auto_onset=args.auto_onset,
+            onset_thresh_ratio=args.onset_thresh_ratio,
+            onset_hold_frames=args.onset_hold_frames,
+            onset_search_start=args.onset_search_start,
+            onset_search_end=args.onset_search_end,
+            post_onset=args.post_onset,
+            normalize_mode=args.normalize,
+            target_rms=args.target_rms,
         )
         return
 
@@ -557,7 +973,8 @@ def main():
             out_path=args.out,
             labeled=labeled,
             k=args.k,
-            tol_hz=args.tol,
+            tol_value=args.tol,
+            tol_mode=args.tol_mode,
             start=args.start,
             dur=args.dur,
             a4=args.a4,
@@ -568,11 +985,22 @@ def main():
             band_fmin=args.band_fmin,
             band_fmax=args.band_fmax,
             band_n=args.band_n,
-            band_agg=args.band_agg,
+            band_pool_agg=args.band_pool_agg,
             band_logmag=args.band_logmag,
             mask_k=args.mask_k,
             mask_tol=args.mask_tol,
             mask_tol_mode=args.mask_tol_mode,
+            feat_agg=args.feat_agg,
+            frame_ms=args.frame_ms,
+            hop_ms=args.hop_ms,
+            auto_onset=args.auto_onset,
+            onset_thresh_ratio=args.onset_thresh_ratio,
+            onset_hold_frames=args.onset_hold_frames,
+            onset_search_start=args.onset_search_start,
+            onset_search_end=args.onset_search_end,
+            post_onset=args.post_onset,
+            normalize_mode=args.normalize,
+            target_rms=args.target_rms,
         )
         return
 
