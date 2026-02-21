@@ -5,20 +5,20 @@ Group 2 CSE 123
 #### Checklist 
 (-) Not Done (+) Done (~) In Progress
 ~ Personas
-+ Need Statement
-+ Goal Statement
-- Design Objective
-- Conceptualisations
+\+ Need Statement
+\+ Goal Statement
+\- Design Objective
+\- Conceptualisations
 ~ Decision Table
 ~ Basic Plan 
-- Gantt Chart
-- Aesthetic & Functional Prototypes
-- Design for Manufacture & Assembly
-- Test Plan
-- Test Report
-- Life Cycle Assessment
-- Ethics Statement
-- 3D CAD of final deliverable for prototype showcasing
+\- Gantt Chart
+\- Aesthetic & Functional Prototypes
+\- Design for Manufacture & Assembly
+\- Test Plan
+\- Test Report
+\- Life Cycle Assessment
+\- Ethics Statement
+\- 3D CAD of final deliverable for prototype showcasing
 
 #### Timeline
 As for the prototype demo for finals, we’ve decided to implement a breadboard version with the daisy seed to cause a simple effect (distortion or fuzz) live with an input from a guitar and output through a guitar amp. We will be using a single note to demonstrate the logic of the system and the daisy seed should be able to act as a music pedal, implementing that unique sound effect with hopefully >8ms latency. 
