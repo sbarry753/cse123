@@ -9,3 +9,5 @@
 *.log
 build/
 /demo3/Builds
+/NET - In Development/gs_dataset
+/NET - In Development/gs_attack_dataset
