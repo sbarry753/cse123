@@ -25,5 +25,12 @@ Daisy Skeleton Code
 - If on Seed, set *C_DEFS* in the *Makefile* to *SEED*
 - Build: **make build**
 - Flash: **make program-dfu**
+    - When flashing, make sure to put the Daisy in **bootloader mode**
+        - Connect the Seed to your computer with the USB Micro cable.
+        - Press and hold the Boot button
+        - Press and hold the Reset button
+        - Let go of the Reset button
+        - Let go of the Boot button
+
 - Clean: **make clean**
 
