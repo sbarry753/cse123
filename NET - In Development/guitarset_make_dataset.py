@@ -1,46 +1,62 @@
 #!/usr/bin/env python3
 r"""
-guitarset_make_fb_dataset.py  (v3 - GuitarSet HEX DI + robust IDMT + better splits + alignment + streaming shards)
+guitarset_make_fb_dataset.py  (v4 - transient-focused + attack-window dataset)
 
-Builds a framewise guitar note detection dataset from:
-  - GuitarSet (via mirdata)  ✅ now supports HEX pickup DI (6-ch) and synthesizes 0–6 polyphony by mixing string subsets
-  - IDMT-SMT-Guitar          ✅ more robust wav/xml pairing + XML parsing
-  - Extra single-note DI folder (C4_2.wav style naming)
+Builds TWO datasets:
 
-Labels per frame:
-  - active[49] : note sounding (multi-label sigmoid target)
-  - onset[49]  : note attack (multi-label sigmoid target)
-  - count[1]   : polyphonic note count, clipped 0-6 (CE target, int)
+(A) Framewise dataset (for CRNN / framewise note activity + onset + polyphony count)
+    - GuitarSet (mirdata): supports HEX pickup DI (6-ch). Can synthesize 0–6 polyphony mixes by summing string subsets.
+    - IDMT-SMT-Guitar: robust wav/xml pairing + robust XML parsing
+    - Extra single-note DI folder: filenames like "A#3_1.wav" where _num is string id 0..5 (low E..high E)
 
-Features:
-  STFT power -> log-spaced band pooling -> log1p -> per-band zscore
+    Labels per frame:
+      YA[49] : note active (multi-label sigmoid)
+      YO[49] : note onset  (multi-label sigmoid)
+      YC     : polyphony count (0..6) (CE)
 
-Main improvements vs your v2:
-  - Deterministic shuffle splits (no "first N tracks" leakage risk)
-  - GuitarSet: supports --gs_source hex (recommended) and generates multiple random mixes per track
-  - GuitarSet: if notes_string0..notes_string5 exist, labels match the chosen string subset (less label noise)
-  - Annotation alignment fix: shift label times by n_fft/2 to match STFT frame energy center (center=False)
-  - Robust IDMT wav/xml pairing via indexed stems
-  - More robust IDMT pitch parsing (MIDI, pitchname, or Hz)
-  - Optional DC blocker preprocessing (helps DI realism)
-  - Safer shard streaming: flush when buffer hits shard_size or memory budget
+    Features:
+      STFT power -> log-spaced band pooling -> log1p -> per-band zscore
+      Optional: delta features (frame-to-frame diff) concatenated to emphasize attacks.
+
+    Optional: onset oversampling when creating examples (so dataset is not dominated by sustain frames).
+
+(B) Attack-window dataset (for ultra-low latency onset+pitch, e.g. first 5–10 ms)
+    Output directories:
+      out_dir/attack_train/shard_###.npz
+      out_dir/attack_val/shard_###.npz
+
+    Each shard contains:
+      X  : float16 [N, 1, S] raw normalized waveform window (S samples = attack_ms)
+      Y  : int64   [N]       note class (0..48) where 0=E2(MIDI40)
+      S  : int64   [N]       string id (0..5) if known else 0
+      SRC: uint8   [N]       source tag: 0=guitarset, 1=idmt, 2=extra
 
 Install:
   pip install numpy librosa mirdata soundfile scipy lxml
 
-Example:
-python guitarset_make_fb_dataset.py \
-  --out_dir gs_dataset \
-  --download \
-  --gs_source hex \
-  --gs_mixes_per_track 3 \
-  --allow_zero_poly \
-  --extra_dir ../samples \
-  --idmt_dir "C:\Users\...\IDMT-SMT-GUITAR_V2"
+Example (transient learning):
+python guitarset_make_dataset.py ^
+  --out_dir gs_dataset_v4 ^
+  --download ^
+  --gs_source hex ^
+  --gs_mixes_per_track 3 ^
+  --allow_zero_poly ^
+  --idmt_dir "C:\path\IDMT-SMT-GUITAR_V2" ^
+  --extra_dir ".\my_di_notes" ^
+  --sr 48000 ^
+  --hop_length 64 ^
+  --n_fft 512 ^
+  --ctx_ms 20 ^
+  --onset_width 6 ^
+  --delta_feat ^
+  --onset_oversample 1.0 ^
+  --attack_out ^
+  --attack_ms 10 ^
+  --attack_per_onset 2
 
 Notes:
-  - For Daisy Seed DI inference, use --gs_source hex (best domain match).
-  - IDMT should point at root containing dataset1/dataset2/dataset3.
+- For Daisy Seed DI inference, HEX DI is the best domain match if you're training on GuitarSet.
+- If mirdata doesn't have hex audio downloaded, mirdata will throw. Use `--download`, and ensure GuitarSet hex audio is present.
 """
 
 import argparse
@@ -54,8 +70,6 @@ from typing import List, Tuple, Optional, Dict
 import numpy as np
 import librosa
 import mirdata
-import soundfile as sf
-
 from scipy.io import wavfile
 
 
@@ -77,6 +91,8 @@ _NOTE_TO_SEMI = {
     "B": 11,
 }
 
+# Filename note token with optional _stringid suffix:
+# A#3_1.wav, Bb2_0.wav, E4.wav
 _NOTE_RE = re.compile(r"(?i)^([A-G])([#b]?)(-?\d+)(?:_([0-5]))?$")
 
 
@@ -86,7 +102,6 @@ _NOTE_RE = re.compile(r"(?i)^([A-G])([#b]?)(-?\d+)(?:_([0-5]))?$")
 
 def db_to_lin(db: float) -> float:
     return float(10.0 ** (db / 20.0))
-
 
 def dc_block(x: np.ndarray, r: float = 0.995) -> np.ndarray:
     """Simple DC blocker (1st order highpass-ish). Helps DI realism."""
@@ -103,7 +118,6 @@ def dc_block(x: np.ndarray, r: float = 0.995) -> np.ndarray:
         xm1 = xi
         ym1 = yi
     return y
-
 
 def safe_peak_norm(x: np.ndarray, target: float = 0.9) -> np.ndarray:
     peak = float(np.max(np.abs(x)) + 1e-12)
@@ -127,7 +141,7 @@ def note_data_to_active_labels(note_data, n_frames: int, hop_sec: float, frame_t
     for (t0, t1), midi in zip(intervals, pitches):
         if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
             continue
-        m = int(round(midi))
+        m = int(round(float(midi)))
         if m < MIDI_MIN or m > MIDI_MAX:
             continue
         t0s = float(t0) + frame_time_offset
@@ -140,20 +154,19 @@ def note_data_to_active_labels(note_data, n_frames: int, hop_sec: float, frame_t
             y[i0:i1, m - MIDI_MIN] = 1
     return y
 
-
 def active_to_onset_labels(active: np.ndarray, onset_width_frames: int = 2) -> np.ndarray:
     T, D = active.shape
     onset = np.zeros((T, D), dtype=np.uint8)
     prev  = np.zeros((D,), dtype=np.uint8)
+    w = int(max(1, onset_width_frames))
     for t in range(T):
         cur = active[t]
         rising = (cur == 1) & (prev == 0)
         if np.any(rising):
-            t1 = min(T, t + int(onset_width_frames))
+            t1 = min(T, t + w)
             onset[t:t1, rising] = 1
         prev = cur
     return onset
-
 
 def active_to_count_labels(active: np.ndarray) -> np.ndarray:
     """
@@ -196,7 +209,6 @@ def _pitchname_to_midi(name: str) -> int:
         return -1
     return (octave + 1) * 12 + semi
 
-
 def parse_idmt_xml(xml_path: Path) -> Tuple[np.ndarray, np.ndarray]:
     """
     Parse an IDMT-SMT-Guitar XML annotation file.
@@ -233,7 +245,6 @@ def parse_idmt_xml(xml_path: Path) -> Tuple[np.ndarray, np.ndarray]:
             if offset_el is not None and offset_el.text:
                 t1 = float(offset_el.text)
             else:
-                # durationSec fallback
                 dur_sec = event.find("durationSec")
                 if dur_sec is not None and dur_sec.text:
                     t1 = t0 + float(dur_sec.text)
@@ -242,7 +253,7 @@ def parse_idmt_xml(xml_path: Path) -> Tuple[np.ndarray, np.ndarray]:
         else:
             onset_samp = event.find("onsetSample")
             offset_samp = event.find("offsetSample")
-            if onset_samp is None or (onset_samp.text is None):
+            if onset_samp is None or onset_samp.text is None:
                 continue
             t0 = float(onset_samp.text) / sr
             if offset_samp is not None and offset_samp.text:
@@ -265,14 +276,11 @@ def parse_idmt_xml(xml_path: Path) -> Tuple[np.ndarray, np.ndarray]:
         pitch_el = event.find("pitch")
         if pitch_el is not None and pitch_el.text:
             text = pitch_el.text.strip()
-            # integer midi?
             if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
                 midi = int(text)
             else:
-                # pitchname?
                 midi = _pitchname_to_midi(text)
                 if midi < 0:
-                    # Hz fallback
                     try:
                         hz = float(text)
                         midi = int(round(69 + 12 * math.log2(hz / 440.0)))
@@ -293,7 +301,6 @@ def parse_idmt_xml(xml_path: Path) -> Tuple[np.ndarray, np.ndarray]:
         return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
     return np.array(intervals, dtype=np.float64), np.array(midis, dtype=np.float64)
 
-
 def build_idmt_active_from_arrays(
     intervals: np.ndarray,
     midis: np.ndarray,
@@ -305,7 +312,7 @@ def build_idmt_active_from_arrays(
     for (t0, t1), midi in zip(intervals, midis):
         if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
             continue
-        m = int(round(midi))
+        m = int(round(float(midi)))
         if m < MIDI_MIN or m > MIDI_MAX:
             continue
         t0s = float(t0) + frame_time_offset
@@ -315,7 +322,6 @@ def build_idmt_active_from_arrays(
         if i1 > i0:
             active[i0:i1, m - MIDI_MIN] = 1
     return active
-
 
 def discover_idmt_pairs(idmt_root: Path) -> List[Tuple[Path, Path]]:
     """
@@ -333,7 +339,6 @@ def discover_idmt_pairs(idmt_root: Path) -> List[Tuple[Path, Path]]:
         cands = xml_map.get(w.stem.lower())
         if not cands:
             continue
-        # prefer "closest" candidate by path length (heuristic)
         cands_sorted = sorted(cands, key=lambda p: len(p.parts))
         pairs.append((w, cands_sorted[0]))
 
@@ -349,31 +354,30 @@ def load_guitarset_hex6(tr, sr_target: int) -> np.ndarray:
     """
     Load GuitarSet hex pickup audio as (T,6) float32 at sr_target.
 
-    mirdata exposes:
-      - tr.audio_hex_path (str) and tr.audio_hex -> (audio, sr)
-      - optional: tr.audio_hex_cln_path / tr.audio_hex_cln
+    mirdata exposes (varies by version):
+      - tr.audio_hex -> (audio, sr)
+      - tr.audio_hex_cln -> (audio, sr)
+      - tr.audio_hex_path / tr.audio_hex_cln_path
     """
-    # Prefer cleaned if available
     if hasattr(tr, "audio_hex_cln") and tr.audio_hex_cln is not None:
         y, sr = tr.audio_hex_cln
     elif hasattr(tr, "audio_hex") and tr.audio_hex is not None:
         y, sr = tr.audio_hex
     else:
-        # as a last resort, try to load from path fields
         path = None
         if hasattr(tr, "audio_hex_cln_path") and tr.audio_hex_cln_path:
             path = tr.audio_hex_cln_path
         elif hasattr(tr, "audio_hex_path") and tr.audio_hex_path:
             path = tr.audio_hex_path
         if path is None:
-            raise RuntimeError("No hex pickup audio found (audio_hex/audio_hex_path missing).")
+            raise RuntimeError("No hex pickup audio found. (audio_hex/audio_hex_path missing)")
         y, sr = librosa.load(path, sr=None, mono=False)
 
     y = np.asarray(y)
 
-    # mirdata returns multitrack as (6, T) in many setups (mono=False)
+    # Many loaders give (6, T)
     if y.ndim == 2 and y.shape[0] == 6 and y.shape[1] != 6:
-        y = y.T  # -> (T, 6)
+        y = y.T
 
     if y.ndim != 2 or y.shape[1] != 6:
         raise RuntimeError(f"Expected hex audio shape (T,6), got {y.shape}")
@@ -391,18 +395,16 @@ def load_guitarset_hex6(tr, sr_target: int) -> np.ndarray:
 
 def choose_string_subset(rng: np.random.Generator, allow_zero: bool) -> List[int]:
     kmin = 0 if allow_zero else 1
-    k = int(rng.integers(kmin, 7))
+    k = int(rng.integers(kmin, 7))  # 0..6
     if k == 0:
         return []
     return sorted(rng.choice(6, size=k, replace=False).tolist())
-
 
 def mix_strings(hex6: np.ndarray, active_strings: List[int]) -> np.ndarray:
     if len(active_strings) == 0:
         return np.zeros((hex6.shape[0],), dtype=np.float32)
     y = np.sum(hex6[:, active_strings], axis=1).astype(np.float32)
     return safe_peak_norm(y, target=0.9)
-
 
 def guitarset_active_for_strings(tr, strings: List[int], T: int, hop_sec: float, frame_time_offset: float) -> np.ndarray:
     """
@@ -419,7 +421,6 @@ def guitarset_active_for_strings(tr, strings: List[int], T: int, hop_sec: float,
             parts.append(note_data_to_active_labels(nd, n_frames=T, hop_sec=hop_sec, frame_time_offset=frame_time_offset))
         return np.maximum.reduce(parts) if parts else np.zeros((T, N_NOTES), dtype=np.uint8)
 
-    # fallback (label noise possible)
     return note_data_to_active_labels(tr.notes_all, n_frames=T, hop_sec=hop_sec, frame_time_offset=frame_time_offset)
 
 
@@ -431,7 +432,6 @@ def make_log_spaced_edges(fmin: float, fmax: float, n_bands: int) -> np.ndarray:
     fmin = max(10.0, float(fmin))
     fmax = max(fmin * 1.01, float(fmax))
     return np.geomspace(fmin, fmax, int(n_bands) + 1).astype(np.float64)
-
 
 def stft_power(y: np.ndarray, sr: int, n_fft: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray]:
     S = librosa.stft(
@@ -445,7 +445,6 @@ def stft_power(y: np.ndarray, sr: int, n_fft: int, hop_length: int) -> Tuple[np.
     freqs = librosa.fft_frequencies(sr=sr, n_fft=int(n_fft)).astype(np.float64)
     return freqs, P
 
-
 def band_energy_from_power(freqs: np.ndarray, P: np.ndarray, edges: np.ndarray, agg: str = "mean") -> np.ndarray:
     B   = len(edges) - 1
     out = np.zeros((B, P.shape[1]), dtype=np.float32)
@@ -458,44 +457,95 @@ def band_energy_from_power(freqs: np.ndarray, P: np.ndarray, edges: np.ndarray, 
         out[b] = np.max(band, axis=0) if agg == "max" else np.mean(band, axis=0)
     return out
 
-
 def log1p_feat(band_energy: np.ndarray) -> np.ndarray:
     return np.log1p(band_energy).astype(np.float32)
-
 
 def zscore_feat(x_log: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
     y = (x_log - mu[:, None]) / (sigma[:, None] + 1e-6)
     return np.clip(y, -6.0, 6.0).astype(np.float32)
+
+def add_delta_feat(feat: np.ndarray) -> np.ndarray:
+    """feat (B,T) -> (2B,T) by concatenating frame-to-frame difference."""
+    d = np.zeros_like(feat, dtype=np.float32)
+    d[:, 1:] = feat[:, 1:] - feat[:, :-1]
+    return np.concatenate([feat, d], axis=0)
 
 
 # ─────────────────────────────────────────────────
 # Example slicing + shard writing
 # ─────────────────────────────────────────────────
 
-def make_examples(
-    feat:       np.ndarray,   # (B,T)
-    active:     np.ndarray,   # (T,49)
-    onset:      np.ndarray,   # (T,49)
-    count:      np.ndarray,   # (T,) int8
+def make_examples_from_indices(
+    feat: np.ndarray,   # (B,T)
+    active: np.ndarray, # (T,49)
+    onset: np.ndarray,  # (T,49)
+    count: np.ndarray,  # (T,) int8
     ctx_frames: int,
-    stride:     int,
+    indices: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     B, T = feat.shape
-    if T < ctx_frames:
+    idx = indices[(indices >= (ctx_frames - 1)) & (indices < T)]
+    if idx.size == 0:
         return (
             np.zeros((0, B, ctx_frames), np.float16),
             np.zeros((0, N_NOTES),       np.uint8),
             np.zeros((0, N_NOTES),       np.uint8),
             np.zeros((0,),               np.int8),
         )
-    xs, ya, yo, yc = [], [], [], []
-    for t in range(ctx_frames - 1, T, int(stride)):
-        xs.append(feat[:, t - ctx_frames + 1:t + 1].astype(np.float16))
-        ya.append(active[t].astype(np.uint8))
-        yo.append(onset[t].astype(np.uint8))
-        yc.append(count[t])
-    return np.stack(xs, 0), np.stack(ya, 0), np.stack(yo, 0), np.array(yc, dtype=np.int8)
 
+    X  = np.empty((idx.size, B, ctx_frames), dtype=np.float16)
+    YA = np.empty((idx.size, N_NOTES), dtype=np.uint8)
+    YO = np.empty((idx.size, N_NOTES), dtype=np.uint8)
+    YC = np.empty((idx.size,), dtype=np.int8)
+
+    for i, t in enumerate(idx.tolist()):
+        X[i]  = feat[:, t - ctx_frames + 1:t + 1].astype(np.float16)
+        YA[i] = active[t].astype(np.uint8)
+        YO[i] = onset[t].astype(np.uint8)
+        YC[i] = count[t]
+    return X, YA, YO, YC
+
+def sample_frame_indices(onset: np.ndarray, ctx_frames: int, rng: np.random.Generator,
+                         onset_oversample: float, max_n: int = 0) -> np.ndarray:
+    """
+    onset_oversample:
+      0.0 -> uniform (all frames)
+      1.0 -> ~50% onset frames, 50% non-onset
+      3.0 -> ~75% onset frames, 25% non-onset
+    """
+    T = onset.shape[0]
+    valid = np.arange(ctx_frames - 1, T, dtype=np.int64)
+
+    if onset_oversample <= 0.0:
+        idx = valid
+        if max_n and idx.size > max_n:
+            idx = rng.choice(idx, size=max_n, replace=False)
+        return np.sort(idx)
+
+    on = np.where(onset.any(axis=1))[0]
+    on = on[on >= (ctx_frames - 1)]
+    off = valid[~np.isin(valid, on)]
+
+    if on.size == 0:
+        idx = valid
+        if max_n and idx.size > max_n:
+            idx = rng.choice(idx, size=max_n, replace=False)
+        return np.sort(idx)
+
+    onset_frac = float(onset_oversample) / (float(onset_oversample) + 1.0)
+    N = valid.size if max_n == 0 else int(min(max_n, valid.size))
+    n_on = int(round(N * onset_frac))
+    n_off = max(0, N - n_on)
+
+    on_s = rng.choice(on, size=min(n_on, on.size), replace=(n_on > on.size))
+    if off.size > 0 and n_off > 0:
+        off_s = rng.choice(off, size=min(n_off, off.size), replace=(n_off > off.size))
+        idx = np.concatenate([on_s, off_s])
+    else:
+        idx = on_s
+
+    rng.shuffle(idx)
+    return np.sort(idx.astype(np.int64))
 
 def save_shard(out_dir: Path, shard_idx: int, X, YA, YO, YC) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -504,7 +554,7 @@ def save_shard(out_dir: Path, shard_idx: int, X, YA, YO, YC) -> None:
 
 
 # ─────────────────────────────────────────────────
-# Augmentation (your originals, kept)
+# Augmentation (kept from your originals)
 # ─────────────────────────────────────────────────
 
 def one_pole_lpf(x: np.ndarray, a: float) -> np.ndarray:
@@ -514,7 +564,6 @@ def one_pole_lpf(x: np.ndarray, a: float) -> np.ndarray:
         y0   = (1.0 - a) * x[i] + a * y0
         y[i] = y0
     return y
-
 
 def tilt_eq(x: np.ndarray, sr: int, tilt_db: float) -> np.ndarray:
     t = float(tilt_db)
@@ -526,13 +575,11 @@ def tilt_eq(x: np.ndarray, sr: int, tilt_db: float) -> np.ndarray:
     g  = db_to_lin(t)
     return (lp + g * hf).astype(np.float32)
 
-
 def soft_clip(x: np.ndarray, drive: float) -> np.ndarray:
     if drive <= 1e-6:
         return x
     k = 1.0 + 8.0 * float(drive)
     return np.tanh(k * x).astype(np.float32)
-
 
 def add_noise_floor(x: np.ndarray, snr_db: float) -> np.ndarray:
     if snr_db <= 0:
@@ -542,7 +589,6 @@ def add_noise_floor(x: np.ndarray, snr_db: float) -> np.ndarray:
     n         = np.random.randn(x.size).astype(np.float32) * float(noise_rms)
     return (x + n).astype(np.float32)
 
-
 def augment_di(x: np.ndarray, sr: int, rng: np.random.Generator) -> np.ndarray:
     x = x * db_to_lin(float(rng.uniform(-12.0, 12.0)))
     x = tilt_eq(x, sr, tilt_db=float(rng.uniform(-10.0, 10.0)))
@@ -550,11 +596,9 @@ def augment_di(x: np.ndarray, sr: int, rng: np.random.Generator) -> np.ndarray:
     x = add_noise_floor(x, snr_db=float(rng.uniform(30.0, 60.0)))
     return np.clip(x, -1.0, 1.0).astype(np.float32)
 
-
 def augment_guitarset_safe_gain(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     x = x * db_to_lin(float(rng.uniform(-6.0, 6.0)))
     return np.clip(x, -1.0, 1.0).astype(np.float32)
-
 
 def augment_idmt(x: np.ndarray, sr: int, rng: np.random.Generator) -> np.ndarray:
     x = x * db_to_lin(float(rng.uniform(-6.0, 6.0)))
@@ -564,7 +608,7 @@ def augment_idmt(x: np.ndarray, sr: int, rng: np.random.Generator) -> np.ndarray
 
 
 # ─────────────────────────────────────────────────
-# Extra single-note helpers (yours, kept)
+# Extra single-note helpers (kept + string id support)
 # ─────────────────────────────────────────────────
 
 def note_to_midi_token(token: str) -> int:
@@ -578,7 +622,6 @@ def note_to_midi_token(token: str) -> int:
     octv   = int(m.group(3))
     return int((octv + 1) * 12 + semi)
 
-
 def parse_midi_from_filename(p: Path) -> int:
     stem = p.stem
     m    = _NOTE_RE.match(stem)
@@ -587,6 +630,13 @@ def parse_midi_from_filename(p: Path) -> int:
     base = f"{m.group(1)}{m.group(2) or ''}{m.group(3)}"
     return note_to_midi_token(base)
 
+def parse_string_id_from_filename(p: Path) -> int:
+    m = _NOTE_RE.match(p.stem)
+    if not m:
+        return 0
+    if m.group(4) is None:
+        return 0
+    return int(m.group(4))
 
 def load_wav_mono_resample(path: Path, sr_target: int) -> np.ndarray:
     sr, x = wavfile.read(str(path))
@@ -599,7 +649,6 @@ def load_wav_mono_resample(path: Path, sr_target: int) -> np.ndarray:
     if int(sr) != int(sr_target):
         x = librosa.resample(x, orig_sr=int(sr), target_sr=int(sr_target)).astype(np.float32)
     return x
-
 
 def detect_onset_frame_rms(
     x: np.ndarray, *, sr: int, frame: int, hop: int,
@@ -623,11 +672,46 @@ def detect_onset_frame_rms(
 
 
 # ─────────────────────────────────────────────────
+# Attack-window dataset helpers
+# ─────────────────────────────────────────────────
+
+def extract_attack_windows(
+    x: np.ndarray, sr: int, onset_sec: float,
+    win_samp: int, jitter_samp: int, n_per_onset: int,
+    rng: np.random.Generator
+) -> np.ndarray:
+    """Return array [n_per_onset, win_samp] float32, per-window peak normalized."""
+    out = []
+    base = int(round(onset_sec * sr))
+    for _ in range(int(n_per_onset)):
+        j = int(rng.integers(0, max(1, jitter_samp + 1)))
+        s = base + j
+        s = max(0, min(len(x) - win_samp, s))
+        seg = x[s:s + win_samp].astype(np.float32)
+        if seg.size != win_samp:
+            continue
+        seg = seg / (np.max(np.abs(seg)) + 1e-6)
+        out.append(seg)
+    if not out:
+        return np.zeros((0, win_samp), dtype=np.float32)
+    return np.stack(out, axis=0).astype(np.float32)
+
+def flush_attack_shard(out_dir: Path, shard_idx: int, X_list, Y_list, S_list, SRC_list) -> int:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    X = np.concatenate(X_list, axis=0).astype(np.float16)   # [N,1,S]
+    Y = np.concatenate(Y_list, axis=0).astype(np.int64)
+    S = np.concatenate(S_list, axis=0).astype(np.int64)
+    SRC = np.concatenate(SRC_list, axis=0).astype(np.uint8)
+    np.savez_compressed(out_dir / f"shard_{shard_idx:03d}.npz", X=X, Y=Y, S=S, SRC=SRC)
+    return int(X.shape[0])
+
+
+# ─────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="Build framewise guitar note detection dataset.")
+    ap = argparse.ArgumentParser(description="Build transient-focused guitar note datasets (framewise + attack windows).")
 
     ap.add_argument("--data_home",   type=str,   default=None)
     ap.add_argument("--out_dir",     type=str,   required=True)
@@ -651,7 +735,7 @@ def main():
     ap.add_argument("--band_agg",    choices=["mean", "max"], default="mean")
 
     ap.add_argument("--ctx_ms",      type=float, default=60.0)
-    ap.add_argument("--stride",      type=int,   default=1)
+    ap.add_argument("--stride",      type=int,   default=1)  # kept for metadata; actual sampling uses indices
     ap.add_argument("--onset_width", type=int,   default=2)
 
     # sharding / split
@@ -675,6 +759,26 @@ def main():
     # preprocessing realism
     ap.add_argument("--dc_block", action="store_true", help="Apply DC blocking filter before feature extraction.")
 
+    # transient learning upgrades
+    ap.add_argument("--delta_feat", action="store_true",
+                    help="Concatenate delta features (frame-to-frame diff) to emphasize attacks. Doubles channels.")
+    ap.add_argument("--onset_oversample", type=float, default=0.0,
+                    help="If >0: oversample onset frames. 1.0≈50/50 onset/non-onset, 3.0≈75/25.")
+    ap.add_argument("--max_examples_per_track", type=int, default=0,
+                    help="If >0: cap sampled frames per audio item (track mix / idmt file / extra wav).")
+
+    # attack-window dataset
+    ap.add_argument("--attack_out", action="store_true",
+                    help="Also create attack-window dataset (raw audio snippets around onset).")
+    ap.add_argument("--attack_ms", type=float, default=10.0,
+                    help="Length of attack window in ms (e.g. 5 or 10).")
+    ap.add_argument("--attack_hop_ms", type=float, default=2.0,
+                    help="Random jitter up to this many ms after onset when extracting attack windows.")
+    ap.add_argument("--attack_per_onset", type=int, default=2,
+                    help="How many windows to sample per annotated onset event.")
+    ap.add_argument("--attack_shard_size", type=int, default=20000,
+                    help="Windows per attack shard.")
+
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -686,6 +790,10 @@ def main():
 
     # Align labels to STFT energy center (center=False)
     frame_time_offset = (float(args.n_fft) / 2.0) / float(args.sr)
+
+    # Attack window params
+    win_samp = int(round(float(args.attack_ms) * 1e-3 * float(args.sr)))
+    jitter_samp = int(round(float(args.attack_hop_ms) * 1e-3 * float(args.sr)))
 
     # ── GuitarSet ──────────────────────────────────
     ds = mirdata.initialize("guitarset", data_home=args.data_home)
@@ -757,7 +865,7 @@ def main():
                 continue
             rng = np.random.default_rng(seed=hash(tid) & 0xFFFFFFFF)
 
-            for m in range(int(args.gs_mixes_per_track)):
+            for _ in range(int(args.gs_mixes_per_track)):
                 strings = choose_string_subset(rng, allow_zero=bool(args.allow_zero_poly))
                 y_audio = mix_strings(hex6, strings)
                 if args.dc_block:
@@ -770,7 +878,6 @@ def main():
                 band_sum += xlog.sum(axis=1)
                 band_sq  += (xlog * xlog).sum(axis=1)
                 band_count += xlog.shape[1]
-
         else:
             audio = tr.audio_mix if args.gs_source == "mix" else tr.audio_mic
             if audio is None:
@@ -833,8 +940,10 @@ def main():
     var = (band_sq / max(1, band_count) - (mu.astype(np.float64) ** 2)).astype(np.float32)
     sigma = np.sqrt(np.maximum(var, 1e-6)).astype(np.float32)
 
+    bands_in = int(args.bands) * (2 if args.delta_feat else 1)
+
     meta = {
-        "dataset": "GuitarSet + IDMT-SMT-Guitar + extra_single_notes",
+        "dataset": "GuitarSet + IDMT-SMT-Guitar + extra_single_notes (framewise + attack windows)",
         "guitarset": {
             "gs_source": args.gs_source,
             "gs_mixes_per_track": int(args.gs_mixes_per_track),
@@ -846,6 +955,8 @@ def main():
         "n_fft": args.n_fft,
         "frame_time_offset": frame_time_offset,
         "bands": args.bands,
+        "bands_in": bands_in,
+        "delta_feat": bool(args.delta_feat),
         "fmin": args.fmin,
         "fmax": args.fmax,
         "band_agg": args.band_agg,
@@ -853,6 +964,10 @@ def main():
         "ctx_frames": ctx_frames,
         "stride": args.stride,
         "onset_width_frames": args.onset_width,
+        "sampling": {
+            "onset_oversample": float(args.onset_oversample),
+            "max_examples_per_track": int(args.max_examples_per_track),
+        },
         "label": {
             "midi_min": MIDI_MIN,
             "midi_max": MIDI_MAX,
@@ -883,6 +998,13 @@ def main():
         "preproc": {
             "dc_block": bool(args.dc_block),
         },
+        "attack": {
+            "enabled": bool(args.attack_out),
+            "attack_ms": float(args.attack_ms),
+            "attack_hop_ms": float(args.attack_hop_ms),
+            "attack_per_onset": int(args.attack_per_onset),
+            "attack_shard_size": int(args.attack_shard_size),
+        },
     }
 
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -901,13 +1023,13 @@ def main():
                 total += int(a.nbytes)
         return total
 
-    def flush(split_dir: Path, shard_idx: int, X_buf, YA_buf, YO_buf, YC_buf) -> int:
+    def flush_framewise(split_dir: Path, shard_idx: int, X_buf, YA_buf, YO_buf, YC_buf) -> int:
         Xs  = np.concatenate(X_buf,  axis=0)
         YAs = np.concatenate(YA_buf, axis=0)
         YOs = np.concatenate(YO_buf, axis=0)
         YCs = np.concatenate(YC_buf, axis=0)
         save_shard(split_dir, shard_idx, Xs, YAs, YOs, YCs)
-        return Xs.shape[0]
+        return int(Xs.shape[0])
 
     def process_split(
         split_name:  str,
@@ -923,11 +1045,39 @@ def main():
         YO_buf: List[np.ndarray] = []
         YC_buf: List[np.ndarray] = []
 
+        # Attack dataset buffers
+        attack_dir = out_dir / f"attack_{split_name}"
+        a_shard = 0
+        a_count = 0
+        AX_buf: List[np.ndarray] = []    # [n,1,win]
+        AY_buf: List[np.ndarray] = []    # [n]
+        AS_buf: List[np.ndarray] = []    # [n]
+        ASRC_buf: List[np.ndarray] = []  # [n] uint8
+
         print(f"\n[pass2] writing {split_name} shards ...")
+
+        def maybe_flush_framewise():
+            nonlocal shard_idx, cur_in_shard
+            if cur_in_shard >= int(args.shard_size) or buffered_bytes(X_buf, YA_buf, YO_buf, YC_buf) >= flush_bytes_limit:
+                flush_framewise(split_dir, shard_idx, X_buf, YA_buf, YO_buf, YC_buf)
+                shard_idx += 1
+                cur_in_shard = 0
+                X_buf.clear(); YA_buf.clear(); YO_buf.clear(); YC_buf.clear()
+
+        def maybe_flush_attack():
+            nonlocal a_shard, a_count
+            if not args.attack_out:
+                return
+            if a_count >= int(args.attack_shard_size):
+                flush_attack_shard(attack_dir, a_shard, AX_buf, AY_buf, AS_buf, ASRC_buf)
+                a_shard += 1
+                a_count = 0
+                AX_buf.clear(); AY_buf.clear(); AS_buf.clear(); ASRC_buf.clear()
 
         # ── GuitarSet ──
         for tid in gs_ids:
             tr = ds.track(tid)
+            rng = np.random.default_rng(seed=hash((split_name, tid)) & 0xFFFFFFFF)
 
             if args.gs_source == "hex":
                 try:
@@ -936,36 +1086,59 @@ def main():
                     print(f"  [gs skip] {tid}: {ex}")
                     continue
 
-                rng = np.random.default_rng(seed=hash(tid) & 0xFFFFFFFF)
-
-                for m in range(int(args.gs_mixes_per_track)):
+                for _mix_i in range(int(args.gs_mixes_per_track)):
                     strings = choose_string_subset(rng, allow_zero=bool(args.allow_zero_poly))
                     y_audio = mix_strings(hex6, strings)
                     if args.dc_block:
                         y_audio = dc_block(y_audio)
                     y_audio = augment_guitarset_safe_gain(y_audio, rng)
 
+                    # Framewise features
                     freqs, P = stft_power(y_audio, sr=args.sr, n_fft=args.n_fft, hop_length=args.hop_length)
                     band = band_energy_from_power(freqs, P, edges, agg=args.band_agg)
                     feat = zscore_feat(log1p_feat(band), mu=mu, sigma=sigma)
+                    if args.delta_feat:
+                        feat = add_delta_feat(feat)
                     T = feat.shape[1]
 
                     active = guitarset_active_for_strings(tr, strings, T, hop_sec, frame_time_offset)
                     onset = active_to_onset_labels(active, onset_width_frames=args.onset_width)
                     poly_cnt = active_to_count_labels(active)
 
-                    X, YA, YO, YC = make_examples(feat, active, onset, poly_cnt, ctx_frames=ctx_frames, stride=args.stride)
-                    if X.shape[0] == 0:
-                        continue
+                    max_n = int(args.max_examples_per_track) if args.max_examples_per_track else 0
+                    idx = sample_frame_indices(onset, ctx_frames, rng, float(args.onset_oversample), max_n=max_n)
+                    X, YA, YO, YC = make_examples_from_indices(feat, active, onset, poly_cnt, ctx_frames, idx)
 
-                    X_buf.append(X); YA_buf.append(YA); YO_buf.append(YO); YC_buf.append(YC)
-                    cur_in_shard += int(X.shape[0])
+                    if X.shape[0] > 0:
+                        X_buf.append(X); YA_buf.append(YA); YO_buf.append(YO); YC_buf.append(YC)
+                        cur_in_shard += int(X.shape[0])
+                        maybe_flush_framewise()
 
-                    if cur_in_shard >= int(args.shard_size) or buffered_bytes(X_buf, YA_buf, YO_buf, YC_buf) >= flush_bytes_limit:
-                        written = flush(split_dir, shard_idx, X_buf, YA_buf, YO_buf, YC_buf)
-                        shard_idx += 1
-                        cur_in_shard = 0
-                        X_buf.clear(); YA_buf.clear(); YO_buf.clear(); YC_buf.clear()
+                    # Attack windows (prefer per-string annotations when available)
+                    if args.attack_out and len(strings) > 0 and all(hasattr(tr, f"notes_string{s}") for s in range(6)):
+                        for s in strings:
+                            nd = getattr(tr, f"notes_string{s}", None)
+                            if nd is None:
+                                continue
+                            intervals = np.asarray(nd.intervals, dtype=np.float64)
+                            pitches   = np.asarray(nd.pitches,   dtype=np.float64)
+                            for (t0, _t1), midi in zip(intervals, pitches):
+                                m = int(round(float(midi)))
+                                if m < MIDI_MIN or m > MIDI_MAX:
+                                    continue
+                                segs = extract_attack_windows(
+                                    y_audio, args.sr, float(t0),
+                                    win_samp=win_samp, jitter_samp=jitter_samp,
+                                    n_per_onset=int(args.attack_per_onset), rng=rng
+                                )
+                                if segs.shape[0] == 0:
+                                    continue
+                                AX_buf.append(segs[:, None, :].astype(np.float32))
+                                AY_buf.append(np.full((segs.shape[0],), m - MIDI_MIN, dtype=np.int64))
+                                AS_buf.append(np.full((segs.shape[0],), int(s), dtype=np.int64))
+                                ASRC_buf.append(np.full((segs.shape[0],), 0, dtype=np.uint8))
+                                a_count += int(segs.shape[0])
+                                maybe_flush_attack()
 
             else:
                 audio = tr.audio_mix if args.gs_source == "mix" else tr.audio_mic
@@ -977,50 +1150,50 @@ def main():
                     y_audio = librosa.resample(y_audio, orig_sr=int(sr), target_sr=args.sr).astype(np.float32)
                 if args.dc_block:
                     y_audio = dc_block(y_audio)
-                rng = np.random.default_rng(seed=hash(tid) & 0xFFFFFFFF)
                 y_audio = augment_guitarset_safe_gain(y_audio, rng)
 
                 freqs, P = stft_power(y_audio, sr=args.sr, n_fft=args.n_fft, hop_length=args.hop_length)
                 band = band_energy_from_power(freqs, P, edges, agg=args.band_agg)
                 feat = zscore_feat(log1p_feat(band), mu=mu, sigma=sigma)
+                if args.delta_feat:
+                    feat = add_delta_feat(feat)
                 T = feat.shape[1]
 
                 active = note_data_to_active_labels(tr.notes_all, n_frames=T, hop_sec=hop_sec, frame_time_offset=frame_time_offset)
                 onset = active_to_onset_labels(active, onset_width_frames=args.onset_width)
                 poly_cnt = active_to_count_labels(active)
 
-                X, YA, YO, YC = make_examples(feat, active, onset, poly_cnt, ctx_frames=ctx_frames, stride=args.stride)
-                if X.shape[0] == 0:
-                    continue
+                max_n = int(args.max_examples_per_track) if args.max_examples_per_track else 0
+                idx = sample_frame_indices(onset, ctx_frames, rng, float(args.onset_oversample), max_n=max_n)
+                X, YA, YO, YC = make_examples_from_indices(feat, active, onset, poly_cnt, ctx_frames, idx)
 
-                X_buf.append(X); YA_buf.append(YA); YO_buf.append(YO); YC_buf.append(YC)
-                cur_in_shard += int(X.shape[0])
+                if X.shape[0] > 0:
+                    X_buf.append(X); YA_buf.append(YA); YO_buf.append(YO); YC_buf.append(YC)
+                    cur_in_shard += int(X.shape[0])
+                    maybe_flush_framewise()
 
-                if cur_in_shard >= int(args.shard_size) or buffered_bytes(X_buf, YA_buf, YO_buf, YC_buf) >= flush_bytes_limit:
-                    written = flush(split_dir, shard_idx, X_buf, YA_buf, YO_buf, YC_buf)
-                    shard_idx += 1
-                    cur_in_shard = 0
-                    X_buf.clear(); YA_buf.clear(); YO_buf.clear(); YC_buf.clear()
+                # Attack windows: we don't have reliable per-note onset labels without per-string annotations here,
+                # so we skip (hex is the recommended domain for attack windows anyway).
 
         # ── IDMT-SMT-Guitar ──
         if idmt_pairs_:
             print(f"  [idmt] processing {len(idmt_pairs_)} files ...")
         for wav_path, xml_path in idmt_pairs_:
+            rng = np.random.default_rng(seed=hash((split_name, wav_path.name)) & 0xFFFFFFFF)
             try:
                 x = load_wav_mono_resample(wav_path, sr_target=args.sr)
             except Exception as ex:
                 print(f"  [idmt skip] {wav_path.name}: {ex}")
                 continue
-
             if args.dc_block:
                 x = dc_block(x)
-
-            rng = np.random.default_rng(seed=hash(wav_path.name) & 0xFFFFFFFF)
             x = augment_idmt(x, args.sr, rng)
 
             freqs, P = stft_power(x, sr=args.sr, n_fft=args.n_fft, hop_length=args.hop_length)
             band = band_energy_from_power(freqs, P, edges, agg=args.band_agg)
             feat = zscore_feat(log1p_feat(band), mu=mu, sigma=sigma)
+            if args.delta_feat:
+                feat = add_delta_feat(feat)
             T = feat.shape[1]
 
             try:
@@ -1033,23 +1206,40 @@ def main():
             onset = active_to_onset_labels(active, onset_width_frames=args.onset_width)
             poly_cnt = active_to_count_labels(active)
 
-            X, YA, YO, YC = make_examples(feat, active, onset, poly_cnt, ctx_frames=ctx_frames, stride=args.stride)
-            if X.shape[0] == 0:
-                continue
+            max_n = int(args.max_examples_per_track) if args.max_examples_per_track else 0
+            idx = sample_frame_indices(onset, ctx_frames, rng, float(args.onset_oversample), max_n=max_n)
+            X, YA, YO, YC = make_examples_from_indices(feat, active, onset, poly_cnt, ctx_frames, idx)
 
-            X_buf.append(X); YA_buf.append(YA); YO_buf.append(YO); YC_buf.append(YC)
-            cur_in_shard += int(X.shape[0])
+            if X.shape[0] > 0:
+                X_buf.append(X); YA_buf.append(YA); YO_buf.append(YO); YC_buf.append(YC)
+                cur_in_shard += int(X.shape[0])
+                maybe_flush_framewise()
 
-            if cur_in_shard >= int(args.shard_size) or buffered_bytes(X_buf, YA_buf, YO_buf, YC_buf) >= flush_bytes_limit:
-                written = flush(split_dir, shard_idx, X_buf, YA_buf, YO_buf, YC_buf)
-                shard_idx += 1
-                cur_in_shard = 0
-                X_buf.clear(); YA_buf.clear(); YO_buf.clear(); YC_buf.clear()
+            # Attack windows from XML onsets (t0)
+            if args.attack_out:
+                for (t0, _t1), midi in zip(intervals, midis):
+                    m = int(round(float(midi)))
+                    if m < MIDI_MIN or m > MIDI_MAX:
+                        continue
+                    segs = extract_attack_windows(
+                        x, args.sr, float(t0),
+                        win_samp=win_samp, jitter_samp=jitter_samp,
+                        n_per_onset=int(args.attack_per_onset), rng=rng
+                    )
+                    if segs.shape[0] == 0:
+                        continue
+                    AX_buf.append(segs[:, None, :].astype(np.float32))
+                    AY_buf.append(np.full((segs.shape[0],), m - MIDI_MIN, dtype=np.int64))
+                    AS_buf.append(np.zeros((segs.shape[0],), dtype=np.int64))     # unknown string -> 0
+                    ASRC_buf.append(np.full((segs.shape[0],), 1, dtype=np.uint8)) # 1=idmt
+                    a_count += int(segs.shape[0])
+                    maybe_flush_attack()
 
         # ── Extra single-note wavs ──
         if extras_:
             print(f"  [extra] processing {len(extras_)} single-note wavs ...")
         for p in extras_:
+            rng = np.random.default_rng(seed=hash((split_name, p.name)) & 0xFFFFFFFF)
             try:
                 midi = parse_midi_from_filename(p)
                 if midi < MIDI_MIN or midi > MIDI_MAX:
@@ -1057,7 +1247,6 @@ def main():
                 x = load_wav_mono_resample(p, sr_target=args.sr)
                 if args.dc_block:
                     x = dc_block(x)
-                rng = np.random.default_rng(seed=hash(p.name) & 0xFFFFFFFF)
                 x = augment_di(x, args.sr, rng)
             except Exception as ex:
                 print(f"  [extra skip] {p.name}: {ex}")
@@ -1066,6 +1255,8 @@ def main():
             freqs, P = stft_power(x, sr=args.sr, n_fft=args.n_fft, hop_length=args.hop_length)
             band = band_energy_from_power(freqs, P, edges, agg=args.band_agg)
             feat = zscore_feat(log1p_feat(band), mu=mu, sigma=sigma)
+            if args.delta_feat:
+                feat = add_delta_feat(feat)
             T = feat.shape[1]
 
             onset_fr = detect_onset_frame_rms(
@@ -1075,34 +1266,51 @@ def main():
             )
             onset_fr = int(max(0, min(T - 1, onset_fr)))
 
+            # Align extra onset similarly to frame_time_offset
+            onset_shift = int(round(frame_time_offset / hop_sec))
+            onset_fr2 = int(max(0, min(T - 1, onset_fr + onset_shift)))
+
             active = np.zeros((T, N_NOTES), dtype=np.uint8)
             onset = np.zeros((T, N_NOTES), dtype=np.uint8)
             k = midi - MIDI_MIN
 
-            # shift by frame_time_offset so extra labels are aligned similarly:
-            # (approximate by shifting onset_fr forward a bit)
-            onset_fr2 = int(max(0, min(T - 1, onset_fr + round(frame_time_offset / hop_sec))))
             active[onset_fr2:, k] = 1
             onset[onset_fr2:min(T, onset_fr2 + int(args.onset_width)), k] = 1
-
             poly_cnt = active_to_count_labels(active)
 
-            X, YA, YO, YC = make_examples(feat, active, onset, poly_cnt, ctx_frames=ctx_frames, stride=args.stride)
-            if X.shape[0] == 0:
-                continue
+            max_n = int(args.max_examples_per_track) if args.max_examples_per_track else 0
+            idx = sample_frame_indices(onset, ctx_frames, rng, float(args.onset_oversample), max_n=max_n)
+            X, YA, YO, YC = make_examples_from_indices(feat, active, onset, poly_cnt, ctx_frames, idx)
 
-            X_buf.append(X); YA_buf.append(YA); YO_buf.append(YO); YC_buf.append(YC)
-            cur_in_shard += int(X.shape[0])
+            if X.shape[0] > 0:
+                X_buf.append(X); YA_buf.append(YA); YO_buf.append(YO); YC_buf.append(YC)
+                cur_in_shard += int(X.shape[0])
+                maybe_flush_framewise()
 
-            if cur_in_shard >= int(args.shard_size) or buffered_bytes(X_buf, YA_buf, YO_buf, YC_buf) >= flush_bytes_limit:
-                written = flush(split_dir, shard_idx, X_buf, YA_buf, YO_buf, YC_buf)
-                shard_idx += 1
-                cur_in_shard = 0
-                X_buf.clear(); YA_buf.clear(); YO_buf.clear(); YC_buf.clear()
+            # Attack windows using detected onset time
+            if args.attack_out:
+                sid = parse_string_id_from_filename(p)  # 0..5 if present else 0
+                onset_sec = float(onset_fr) * hop_sec
+                segs = extract_attack_windows(
+                    x, args.sr, onset_sec,
+                    win_samp=win_samp, jitter_samp=jitter_samp,
+                    n_per_onset=int(args.attack_per_onset), rng=rng
+                )
+                if segs.shape[0] > 0:
+                    AX_buf.append(segs[:, None, :].astype(np.float32))
+                    AY_buf.append(np.full((segs.shape[0],), (midi - MIDI_MIN), dtype=np.int64))
+                    AS_buf.append(np.full((segs.shape[0],), int(sid), dtype=np.int64))
+                    ASRC_buf.append(np.full((segs.shape[0],), 2, dtype=np.uint8))
+                    a_count += int(segs.shape[0])
+                    maybe_flush_attack()
 
-        # flush remainder
+        # flush remainder framewise
         if cur_in_shard > 0 and X_buf:
-            flush(split_dir, shard_idx, X_buf, YA_buf, YO_buf, YC_buf)
+            flush_framewise(split_dir, shard_idx, X_buf, YA_buf, YO_buf, YC_buf)
+
+        # flush remainder attack
+        if args.attack_out and a_count > 0 and AX_buf:
+            flush_attack_shard(attack_dir, a_shard, AX_buf, AY_buf, AS_buf, ASRC_buf)
 
     process_split("train", train_ids,    idmt_train, extra_train)
     process_split("val",   val_ids_list, idmt_val,   extra_val)
