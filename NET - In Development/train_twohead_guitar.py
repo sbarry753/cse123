@@ -1,33 +1,52 @@
 """
-Two-stage training for <10ms guitar onset note detection.
+Two-stage training for <10ms guitar onset note detection (Daisy-friendly).
 
 Stage 1 (default):
-  - Single-note only (no chords)
+  - Single-note only (no chords unless --include_chords)
   - Loss: Softmax Cross-Entropy (nn.CrossEntropyLoss)
   - Labels: single class index (0..V-1)
-  - Goal: learn discriminative note features fast
+  - Metrics: top1 / top3 / mean_true_p
+  - Goal: VERY accurate pitch classification on transient windows
 
 Stage 2 (--stage2 --include_chords):
   - Multi-label (chords + single notes)
   - Loss: BCEWithLogitsLoss (nn.BCEWithLogitsLoss)
   - Labels: multi-hot vector (V,)
-  - Goal: fine-tune for multi-note detection
+  - Metrics: best-F1 over threshold sweep + fixed-thresh F1
+
+What I implemented for you (the “all those things”):
+  1) Curriculum Augmentation:
+     - For the first N epochs (default 10), use CALM augmentation:
+         * no polarity flip
+         * narrower gain range
+         * lower noise (or 0)
+     - After that, switch to FULL augmentation.
+     - Works for Stage 1 and Stage 2.
+  2) Model capacity knob:
+     - Wider model improves Stage 1 accuracy. Default width increased to 64.
+     - Still small enough to be realistic on embedded, but you can set it back.
+  3) Better LR scheduling for Stage 1:
+     - Default scheduler is STEP (not cosine), which avoids early “LR collapse”.
+     - Optional warmup, optional cosine, optional none.
+  4) Cleaner validation:
+     - Val augmentation disabled (gain/polarity off, noise off).
+     - Stage1 validation defaults to positives-only (p_on=1, p_neg=0).
+  5) Stage 2 threshold sweep:
+     - Computes best threshold on val each epoch (for a realistic F1).
 
 Visualizer:
-  - Animated wiring-diagram style live view:
+  - Animated wiring-diagram live view (optional):
     * green/red edges by weight sign
     * node glow from activations
-    * waveform + top-k predictions
-    * TRUE note label(s)
+    * waveform + top-k predictions + TRUE label
     * animated "signal path" pulse
-Command:
-    python train_twohead_guitar.py --viz --viz_every 10 --viz_weight_every 4 --viz_pulse_speed 0.5 --dataset labels --out DebugViz
+
 Resume:
   - --resume path/to/onset_last.pt
   - Restores model/optimizer/scaler/scheduler and continues epochs
 
 Export:
-  - Weights exported as C header arrays for Daisy bare metal inference
+  - Exports a C header on new best checkpoints (Stage1 uses best top1; Stage2 uses best F1).
 """
 
 import os
@@ -44,20 +63,19 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import autocast, GradScaler  # new AMP API
+from torch.amp import autocast, GradScaler
 
 
 # ----------------------------
 # Constants
 # ----------------------------
-WINDOW_MS = 10.0          # inference window on Daisy
+WINDOW_MS = 10.0  # 10ms at 48kHz = 480 samples
 
 
 # ----------------------------
 # Utilities
 # ----------------------------
 def set_seed(seed: int):
-    """Make training reproducible-ish (still nondeterministic on GPU sometimes)."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -65,13 +83,11 @@ def set_seed(seed: int):
 
 
 def load_json(path: str) -> Dict[str, Any]:
-    """Load a JSON file into a python dict."""
     with open(path, "r") as f:
         return json.load(f)
 
 
 def read_manifest(path: str) -> List[Dict[str, str]]:
-    """Read manifest.jsonl (one JSON object per line)."""
     items = []
     with open(path) as f:
         for line in f:
@@ -81,11 +97,27 @@ def read_manifest(path: str) -> List[Dict[str, str]]:
     return items
 
 
+def label_to_note_name_multi(label_vec: torch.Tensor, meta: Dict[str, Any]) -> str:
+    pitches = meta.get("index_to_pitch", None)
+    idxs = (label_vec >= 0.5).nonzero(as_tuple=False).flatten().tolist()
+    if not idxs:
+        return "(none)"
+    if pitches is None:
+        return ",".join(str(i) for i in idxs)
+    names = [pitches[i] if i < len(pitches) else str(i) for i in idxs]
+    return ",".join(names)
+
+
+def label_to_note_name_single(class_idx: int, meta: Dict[str, Any]) -> str:
+    pitches = meta.get("index_to_pitch", None)
+    if pitches is None:
+        return str(class_idx)
+    if 0 <= class_idx < len(pitches):
+        return pitches[class_idx]
+    return str(class_idx)
+
+
 def f1_scores_from_logits(logits: torch.Tensor, targets: torch.Tensor, thresh: float = 0.5):
-    """
-    Micro-averaged precision/recall/F1 over the whole batch (multi-label).
-    Uses sigmoid(logits) and compares to `thresh`.
-    """
     eps = 1e-9
     probs = torch.sigmoid(logits)
     preds = (probs >= thresh).float()
@@ -98,30 +130,26 @@ def f1_scores_from_logits(logits: torch.Tensor, targets: torch.Tensor, thresh: f
     return float(prec), float(rec), float(f1)
 
 
-def label_to_note_name_multi(label_vec: torch.Tensor, meta: Dict[str, Any]) -> str:
-    """Multi-hot label -> 'E2' or 'E2,G2' or '(none)'."""
-    pitches = meta.get("index_to_pitch", None)
-    idxs = (label_vec >= 0.5).nonzero(as_tuple=False).flatten().tolist()
-    if not idxs:
-        return "(none)"
-    if pitches is None:
-        return ",".join(str(i) for i in idxs)
-    names = [pitches[i] if i < len(pitches) else str(i) for i in idxs]
-    return ",".join(names)
+def best_f1_over_thresholds(logits: torch.Tensor, targets: torch.Tensor, thresholds: List[float]):
+    best = (-1.0, 0.5, 0.0, 0.0)  # (f1, thresh, p, r)
+    for th in thresholds:
+        p, r, f1 = f1_scores_from_logits(logits, targets, thresh=th)
+        if f1 > best[0]:
+            best = (f1, float(th), p, r)
+    return best  # f1, thresh, p, r
 
 
-def label_to_note_name_single(class_idx: int, meta: Dict[str, Any]) -> str:
-    """Single class idx -> 'E2'."""
-    pitches = meta.get("index_to_pitch", None)
-    if pitches is None:
-        return str(class_idx)
-    if 0 <= class_idx < len(pitches):
-        return pitches[class_idx]
-    return str(class_idx)
+def maybe_linear_warmup_lr(opt: torch.optim.Optimizer, base_lr: float, step_idx: int, warmup_steps: int):
+    if warmup_steps <= 0:
+        return
+    scale = min(1.0, (step_idx + 1) / float(warmup_steps))
+    lr_now = base_lr * scale
+    for pg in opt.param_groups:
+        pg["lr"] = lr_now
 
 
 # ----------------------------
-# Live Net Visualizer (Matplotlib) + Animated Path
+# Live Net Visualizer (optional)
 # ----------------------------
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
@@ -130,12 +158,8 @@ from matplotlib.lines import Line2D
 
 class LiveNetViz:
     """
-    Wiring-diagram style graph visualizer for OnsetNet:
-        Conv1D -> Conv1D -> Conv1D -> Linear
-
-    Works for both Stage 1 (CE) and Stage 2 (BCE) since it only needs logits.
+    Wiring-diagram style visualizer; works for both CE stage and BCE stage.
     """
-
     def __init__(
         self,
         model: nn.Module,
@@ -145,8 +169,8 @@ class LiveNetViz:
         thresh: float = 0.5,
         topk: int = 8,
         out_nodes_cap: int = 56,
-        weight_viz_every: int = 2,
-        pulse_speed: float = 0.35,
+        weight_viz_every: int = 3,
+        pulse_speed: float = 0.45,
     ):
         self.model = model
         self.meta = meta or {}
@@ -159,15 +183,12 @@ class LiveNetViz:
         self.weight_viz_every = max(1, int(weight_viz_every))
         self.pulse_speed = float(pulse_speed)
 
-        # Expect OnsetNet layout:
-        # conv = [Conv0, BN0, ReLU, Conv1, BN1, ReLU, Conv2, BN2, ReLU, AdaptiveAvgPool]
+        # OnsetNet layout:
         self.conv0 = model.conv[0]
         self.conv1 = model.conv[3]
         self.conv2 = model.conv[6]
-        self.pool  = model.conv[9]
         self.head  = model.head
 
-        # Node counts
         self.n_in = 8
         self.n_c0 = int(self.conv0.out_channels)
         self.n_c1 = int(self.conv1.out_channels)
@@ -175,18 +196,15 @@ class LiveNetViz:
         self.n_out_full = int(self.head.out_features)
         self.n_out = min(out_nodes_cap, self.n_out_full)
 
-        # Activations from hooks
         self.act_c0 = None
         self.act_c1 = None
         self.act_c2 = None
         self._install_hooks()
 
-        # Animation state
         self._viz_tick = 0
         self._pulse_pos = 0.0
         self._last_path: Optional[Dict[str, int]] = None
 
-        # Figure
         plt.ion()
         self.fig = plt.figure(figsize=(14, 6), facecolor="black")
         gs = self.fig.add_gridspec(2, 2, width_ratios=[2.2, 1.0], height_ratios=[1, 1])
@@ -199,7 +217,6 @@ class LiveNetViz:
             ax.set_facecolor("black")
         self.ax_net.set_axis_off()
 
-        # Layout
         self.pos = self._make_positions()
         self.node_artists: Dict[Tuple[str, int], Circle] = {}
         self.edge_artists: List[Tuple[str, str, Tuple[str, int], Tuple[str, int], Line2D]] = []
@@ -207,7 +224,6 @@ class LiveNetViz:
         self.edge_base_style: Dict[Line2D, Tuple[Tuple[float, float, float], float, float]] = {}
 
         self._build_static_artists()
-
         self.fig.tight_layout(pad=1.0)
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
@@ -287,7 +303,6 @@ class LiveNetViz:
 
     def _update_nodes_glow(self):
         a0, a1, a2 = self._get_act_vecs()
-
         def set_glow(layer, mags):
             if mags is None:
                 return
@@ -297,20 +312,16 @@ class LiveNetViz:
                 if key in self.node_artists:
                     g = float(mags[i].item())
                     self.node_artists[key].set_facecolor((0.10, 0.60, 0.10, 0.06 + 0.55 * g))
-
         set_glow("c0", a0)
         set_glow("c1", a1)
         set_glow("c2", a2)
 
     def _update_edges_weights(self):
         w0, w1, w2, wh = self._get_weight_mats()
-
         def norm_abs(x):
             x = x.abs()
             return x / (x.max().clamp(min=1e-6))
-
         w0n, w1n, w2n, whn = norm_abs(w0.cpu()), norm_abs(w1.cpu()), norm_abs(w2.cpu()), norm_abs(wh.cpu())
-
         for a, b, ka, kb, line in self.edge_artists:
             ia, ib = ka[1], kb[1]
             if a == "in" and b == "c0":
@@ -323,7 +334,6 @@ class LiveNetViz:
                 w, s = float(wh[ib, ia].cpu().item()), float(whn[ib, ia].item())
             else:
                 continue
-
             col = self._color_from_weight(w)
             lw = 0.12 + 2.2 * s
             al = 0.02 + 0.55 * s
@@ -342,13 +352,10 @@ class LiveNetViz:
     def _choose_path(self, x_1: torch.Tensor, logits_1: torch.Tensor) -> Dict[str, int]:
         x_np = x_1.detach().float().cpu().numpy().reshape(-1)
         in_idx = self._choose_input_bucket(x_np)
-
         a0, a1, a2 = self._get_act_vecs()
         c0 = int(torch.argmax(a0).item()) if a0 is not None else 0
         c1 = int(torch.argmax(a1).item()) if a1 is not None else 0
         c2 = int(torch.argmax(a2).item()) if a2 is not None else 0
-
-        # top output class by sigmoid prob (works fine for visualization in both stages)
         out_full = int(torch.argmax(torch.sigmoid(logits_1)).item())
         out = min(out_full, self.n_out - 1)
         return {"in": in_idx, "c0": c0, "c1": c1, "c2": c2, "out": out}
@@ -357,7 +364,8 @@ class LiveNetViz:
         if self._last_path is None:
             return
         p = self._last_path
-        segs = [("in","c0",p["in"],p["c0"]), ("c0","c1",p["c0"],p["c1"]), ("c1","c2",p["c1"],p["c2"]), ("c2","out",p["c2"],p["out"])]
+        segs = [("in","c0",p["in"],p["c0"]), ("c0","c1",p["c0"],p["c1"]),
+                ("c1","c2",p["c1"],p["c2"]), ("c2","out",p["c2"],p["out"])]
         for a,b,si,di in segs:
             line = self.edge_lookup.get((a,b,si,di))
             if line is None:
@@ -370,14 +378,11 @@ class LiveNetViz:
 
     def _apply_pulse(self, path: Dict[str, int]):
         self._revert_last_pulse()
-
         self._pulse_pos += self.pulse_speed
         if self._pulse_pos >= 4.0:
             self._pulse_pos = 0.0
-
         segs = [("in","c0",path["in"],path["c0"]), ("c0","c1",path["c0"],path["c1"]),
                 ("c1","c2",path["c1"],path["c2"]), ("c2","out",path["c2"],path["out"])]
-
         hot = int(np.floor(self._pulse_pos))
         frac = float(self._pulse_pos - hot)
         pulse = 0.5 + 0.5 * np.sin(2.0 * np.pi * frac)
@@ -388,19 +393,16 @@ class LiveNetViz:
                 continue
             base = self.edge_base_style.get(line, ((0.35,0.35,0.35), 0.5, 0.08))
             col, lw0, al0 = base
-
             if si < hot:
                 boost = 0.85
             elif si == hot:
                 boost = 0.35 + 0.65 * pulse
             else:
                 boost = 0.0
-
             line.set_color(col)
             line.set_linewidth(lw0 + 5.0 * boost)
             line.set_alpha(min(1.0, al0 + 0.85 * boost))
 
-        # brighten the selected nodes
         for layer in ("in","c0","c1","c2","out"):
             idx = path[layer]
             key = (layer, idx)
@@ -411,7 +413,6 @@ class LiveNetViz:
                     self.node_artists[key].set_facecolor((0.80, 0.75, 0.15, 0.85))
                 else:
                     self.node_artists[key].set_facecolor((0.15, 0.75, 0.20, 0.85))
-
         self._last_path = dict(path)
 
     def _update_wave_and_preds(self, x_1: torch.Tensor, logits_1: torch.Tensor, true_str: str):
@@ -435,14 +436,10 @@ class LiveNetViz:
         self.ax_pred.clear()
         self.ax_pred.set_facecolor("black")
         self.ax_pred.set_title("Top predictions (sigmoid view)", color="white")
-
         topk = min(self.topk, len(probs))
         idxs = np.argsort(-probs)[:topk]
         vals = probs[idxs]
-        labels = []
-        for k in idxs:
-            labels.append(self.pitches[k] if (self.pitches is not None and k < len(self.pitches)) else str(k))
-
+        labels = [(self.pitches[k] if (self.pitches is not None and k < len(self.pitches)) else str(k)) for k in idxs]
         self.ax_pred.barh(range(topk)[::-1], vals[::-1])
         self.ax_pred.set_yticks(range(topk)[::-1])
         self.ax_pred.set_yticklabels(labels[::-1], color="white")
@@ -454,16 +451,10 @@ class LiveNetViz:
 
     @torch.no_grad()
     def update(self, x_batch: torch.Tensor, y_info: Union[torch.Tensor, int], device: str, stage2: bool):
-        """
-        y_info:
-          - stage2=False (CE): y_info is class indices tensor shape (B,)
-          - stage2=True  (BCE): y_info is multi-hot tensor shape (B,V)
-        """
         self.model.eval()
         x = x_batch[:1].to(device, non_blocking=True)
-        logits = self.model(x)  # (1,V)
+        logits = self.model(x)
 
-        # truth label string
         if stage2:
             y = y_info[:1].detach().cpu()
             true_str = label_to_note_name_multi(y[0], self.meta)
@@ -506,17 +497,14 @@ def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, A
 
     manifest = read_manifest(os.path.join(dataset_root, "manifest.jsonl"))
     clips: List[ClipInfo] = []
-
     for it in manifest:
         audio_abs = os.path.join(dataset_root, it["audio"])
         lab = load_json(os.path.join(dataset_root, it["label"]))
-
         mh = lab["multi_hot"]
         onset = int(lab.get("onset_sample", 0))
         t_end = int(lab.get("transient_window_end", onset + int(0.005 * sr)))
         n = int(lab.get("num_samples", 0))
         clip_type = lab.get("type", "unknown")
-
         clips.append(ClipInfo(
             audio_abs=audio_abs,
             multi_hot=mh,
@@ -526,7 +514,6 @@ def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, A
             sr=sr,
             clip_type=clip_type,
         ))
-
     return clips, sr, vocab_size, meta
 
 
@@ -545,12 +532,12 @@ class OnsetDataset(Dataset):
     """
     Each sample is a W-sample window.
 
-    Two label modes:
-      - stage2=False (Stage 1): returns class_idx (int64) for positive samples, and a special "none" index for negatives.
-      - stage2=True  (Stage 2): returns multi-hot vector (float32) for positives, and zeros for negatives.
+    Label modes:
+      - stage2=False: returns class_idx (int64) for positive samples (single-note)
+      - stage2=True : returns multi-hot vector (float32) for positives
 
-    NOTE: Stage 1 training for classification should ideally be on positive windows only.
-          We'll do that by setting p_neg=0 for stage1 by default in args suggestion.
+    Curriculum:
+      - This dataset supports per-epoch changes via set_aug_profile(...)
     """
 
     def __init__(
@@ -564,12 +551,11 @@ class OnsetDataset(Dataset):
         virtual_len: int = 100000,
         audio_cache_max: int = 256,
         preemph_coef: float = 0.0,
-        noise_std: float = 0.001,
-        # Stage1 "none" class:
-        none_class_index: Optional[int] = None,
-        # Aug toggles for val:
+        noise_std: float = 0.0,
+        gain_db_min: float = -12.0,
+        gain_db_max: float = 3.0,
         enable_gain: bool = True,
-        enable_polarity: bool = True,
+        enable_polarity: bool = False,
     ):
         self.clips = clips
         self.W = int(window_samples)
@@ -577,9 +563,11 @@ class OnsetDataset(Dataset):
         self.stage2 = bool(stage2)
         self.virtual_len = int(virtual_len)
 
+        # Aug profile (mutable via set_aug_profile)
         self.preemph_coef = float(preemph_coef)
         self.noise_std = float(noise_std)
-
+        self.gain_db_min = float(gain_db_min)
+        self.gain_db_max = float(gain_db_max)
         self.enable_gain = bool(enable_gain)
         self.enable_polarity = bool(enable_polarity)
 
@@ -587,17 +575,26 @@ class OnsetDataset(Dataset):
         self.p_on  = p_on / s
         self.p_neg = p_neg / s
 
-        # candidates with transient window
         self.on_candidates = [i for i, c in enumerate(clips) if c.transient_end > c.onset_sample]
 
-        # cache
         self.audio_cache: Dict[str, np.ndarray] = {}
         self.cache_order: List[str] = []
         self.cache_max = int(audio_cache_max)
 
-        # For stage1 classification, if we include negatives, they need a class id.
-        # We implement an extra "none" class if none_class_index is provided.
-        self.none_class_index = none_class_index
+    def set_aug_profile(
+        self,
+        *,
+        noise_std: float,
+        gain_db_min: float,
+        gain_db_max: float,
+        enable_gain: bool,
+        enable_polarity: bool,
+    ):
+        self.noise_std = float(noise_std)
+        self.gain_db_min = float(gain_db_min)
+        self.gain_db_max = float(gain_db_max)
+        self.enable_gain = bool(enable_gain)
+        self.enable_polarity = bool(enable_polarity)
 
     def __len__(self):
         return self.virtual_len
@@ -618,7 +615,7 @@ class OnsetDataset(Dataset):
 
     def _augment(self, x: np.ndarray) -> np.ndarray:
         if self.enable_gain:
-            gain_db = random.uniform(-18.0, 6.0)
+            gain_db = random.uniform(self.gain_db_min, self.gain_db_max)
             x = x * (10.0 ** (gain_db / 20.0))
         x = np.clip(x, -1.0, 1.0)
 
@@ -635,7 +632,6 @@ class OnsetDataset(Dataset):
         return x / max(rms, 1e-4)
 
     def _multi_hot_to_single_index(self, mh: List[int]) -> int:
-        # expects exactly one "1" for stage1 positives
         arr = np.array(mh, dtype=np.float32)
         return int(arr.argmax())
 
@@ -655,12 +651,11 @@ class OnsetDataset(Dataset):
                 x = np.pad(x, (0, self.W - len(x)))
 
             if self.stage2:
-                label = np.array(ci.multi_hot, dtype=np.float32)  # (V,)
+                label = np.array(ci.multi_hot, dtype=np.float32)
             else:
-                label = self._multi_hot_to_single_index(ci.multi_hot)  # int
+                label = self._multi_hot_to_single_index(ci.multi_hot)
 
         else:
-            # Negative window
             ci = self.clips[random.randrange(len(self.clips))]
             y  = self._load(ci.audio_abs, ci.sr)
 
@@ -679,8 +674,9 @@ class OnsetDataset(Dataset):
             if self.stage2:
                 label = np.zeros(self.V, dtype=np.float32)
             else:
-                # For stage1 CE, negatives require a class. If not provided, we just reuse 0.
-                label = int(self.none_class_index) if self.none_class_index is not None else 0
+                # Stage1 should be p_neg=0. If you do include negatives anyway,
+                # this maps to class 0 (not ideal). Keep p_neg=0 for stage1.
+                label = 0
 
         x = x.astype(np.float32)
         x = self._augment(x)
@@ -689,11 +685,11 @@ class OnsetDataset(Dataset):
         if self.preemph_coef > 0:
             x[1:] = x[1:] - self.preemph_coef * x[:-1]
 
-        x_t = torch.from_numpy(x).unsqueeze(0)  # (1,W)
+        x_t = torch.from_numpy(x).unsqueeze(0)
         if self.stage2:
-            y_t = torch.from_numpy(label)        # (V,)
+            y_t = torch.from_numpy(label)
         else:
-            y_t = torch.tensor(label, dtype=torch.long)  # ()
+            y_t = torch.tensor(label, dtype=torch.long)
         return x_t, y_t
 
 
@@ -703,9 +699,9 @@ class OnsetDataset(Dataset):
 class OnsetNet(nn.Module):
     """
     Tiny 1D conv sized for 480 samples (10ms @ 48kHz).
+    Width is your main accuracy vs compute knob.
     """
-
-    def __init__(self, vocab_size: int, width: int = 32):
+    def __init__(self, vocab_size: int, width: int = 64):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(1, width // 2, kernel_size=9, stride=2, padding=4, bias=False),
@@ -738,7 +734,6 @@ class OnsetNet(nn.Module):
 # Export to C header
 # ----------------------------
 def export_c_header(model: nn.Module, sr: int, vocab_size: int, path: str, meta: Dict):
-    """Export model weights as a C header for Daisy inference."""
     model.eval()
 
     def ascii_pitch(p: str) -> str:
@@ -757,7 +752,6 @@ def export_c_header(model: nn.Module, sr: int, vocab_size: int, path: str, meta:
         f"#define ONSET_WINDOW       {int(round(WINDOW_MS/1000*sr))}",
         f"#define ONSET_WIDTH        {model.width}",
         "",
-        "// Pitch names for each vocab index",
         "static const char* onset_pitch_names[] = {",
     ]
     for p in meta.get("index_to_pitch", []):
@@ -839,6 +833,57 @@ def try_resume(
 # ----------------------------
 # Training
 # ----------------------------
+def build_scheduler(args, opt):
+    """
+    Better LR scheduling:
+      - 'step' default for stage1 stability
+      - 'cosine' optional
+      - 'none' optional
+    """
+    if args.scheduler == "none":
+        return None
+    if args.scheduler == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_frac)
+    if args.scheduler == "step":
+        return torch.optim.lr_scheduler.StepLR(opt, step_size=args.step_size, gamma=args.step_gamma)
+    raise ValueError(f"Unknown scheduler: {args.scheduler}")
+
+
+def apply_curriculum(ds: OnsetDataset, ep: int, args):
+    """
+    Epoch-based curriculum:
+      - ep <= curriculum_epochs -> calm aug
+      - else -> full aug
+    """
+    if args.curriculum_epochs <= 0:
+        # always full
+        ds.set_aug_profile(
+            noise_std=args.full_noise_std,
+            gain_db_min=args.full_gain_min,
+            gain_db_max=args.full_gain_max,
+            enable_gain=args.full_enable_gain,
+            enable_polarity=args.full_enable_polarity,
+        )
+        return
+
+    if ep <= args.curriculum_epochs:
+        ds.set_aug_profile(
+            noise_std=args.calm_noise_std,
+            gain_db_min=args.calm_gain_min,
+            gain_db_max=args.calm_gain_max,
+            enable_gain=args.calm_enable_gain,
+            enable_polarity=args.calm_enable_polarity,
+        )
+    else:
+        ds.set_aug_profile(
+            noise_std=args.full_noise_std,
+            gain_db_min=args.full_gain_min,
+            gain_db_max=args.full_gain_max,
+            enable_gain=args.full_enable_gain,
+            enable_polarity=args.full_enable_polarity,
+        )
+
+
 def train(args):
     set_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -847,44 +892,33 @@ def train(args):
     print(f"[INFO] device={device}")
 
     clips, sr, vocab_size, meta = load_clips(args.dataset)
-
     W = int(round(WINDOW_MS / 1000.0 * sr))
     print(f"[INFO] clips={len(clips)} sr={sr} vocab={vocab_size} window={W} samples ({WINDOW_MS}ms)")
 
-    # Stage selection:
-    # - stage2=False: single-note pretrain with CE (no chords)
-    # - stage2=True : multi-label fine-tune with BCE (include chords)
     stage2 = bool(args.stage2)
 
     if not args.include_chords:
         clips = [c for c in clips if c.clip_type != "chord"]
-        print(f"[INFO] Stage1 filter (no chords): {len(clips)} clips")
+        print(f"[INFO] Stage filter (no chords): {len(clips)} clips")
     else:
-        print(f"[INFO] include_chords enabled: {len(clips)} clips (singles + chords if present)")
+        print(f"[INFO] include_chords enabled: {len(clips)} clips")
 
     train_clips, val_clips = train_val_split(clips, args.val_ratio, args.seed)
     print(f"[INFO] train={len(train_clips)} val={len(val_clips)}")
 
-    # Model
     model = OnsetNet(vocab_size=vocab_size, width=args.width).to(device)
-    print(f"[INFO] params={model.count_params():,}")
+    print(f"[INFO] params={model.count_params():,} width={args.width}")
 
     # Loss selection
     if stage2:
-        # Multi-label BCE
         pw = torch.full((vocab_size,), float(args.pos_weight), device=device)
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
     else:
-        # Single-label CE
-        # (We DO NOT add a "none" class; we strongly recommend p_neg=0 for stage1.)
-        loss_fn = nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=(device == "cuda"))
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.epochs, eta_min=args.lr * 0.01
-    )
+    scheduler = build_scheduler(args, opt)
 
     best_path = os.path.join(args.out, "onset_best.pt")
     last_path = os.path.join(args.out, "onset_last.pt")
@@ -892,23 +926,18 @@ def train(args):
     start_epoch = 1
     best_score = -1.0
 
-    # Resume
     if args.resume:
         start_epoch, best_score, resumed_stage2 = try_resume(args.resume, model, opt, scaler, scheduler, device)
-        # If user didn't explicitly set --stage2, honor resumed stage2
         if not args.force_stage and resumed_stage2 != stage2:
             stage2 = resumed_stage2
             print(f"[INFO] stage2 overridden by checkpoint: stage2={stage2}")
-            # rebuild loss accordingly
             if stage2:
                 pw = torch.full((vocab_size,), float(args.pos_weight), device=device)
                 loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
             else:
-                loss_fn = nn.CrossEntropyLoss()
+                loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-    # Datasets:
-    # - stage1 should generally be p_neg=0 (pure classification on transients)
-    # - stage2 uses p_on/p_neg mix (onset vs silence)
+    # Datasets
     train_ds = OnsetDataset(
         train_clips, W,
         vocab_size=vocab_size,
@@ -917,11 +946,14 @@ def train(args):
         virtual_len=args.virtual_len,
         audio_cache_max=args.audio_cache_max,
         preemph_coef=args.preemph_coef,
-        noise_std=args.noise_std,
-        none_class_index=None,
-        enable_gain=True,
-        enable_polarity=True,
+        # start with calm profile (will be overwritten by apply_curriculum each epoch)
+        noise_std=args.calm_noise_std if args.curriculum_epochs > 0 else args.full_noise_std,
+        gain_db_min=args.calm_gain_min if args.curriculum_epochs > 0 else args.full_gain_min,
+        gain_db_max=args.calm_gain_max if args.curriculum_epochs > 0 else args.full_gain_max,
+        enable_gain=args.calm_enable_gain if args.curriculum_epochs > 0 else args.full_enable_gain,
+        enable_polarity=args.calm_enable_polarity if args.curriculum_epochs > 0 else args.full_enable_polarity,
     )
+
     val_ds = OnsetDataset(
         val_clips, W,
         vocab_size=vocab_size,
@@ -931,7 +963,8 @@ def train(args):
         audio_cache_max=64,
         preemph_coef=args.preemph_coef,
         noise_std=0.0,
-        none_class_index=None,
+        gain_db_min=0.0,
+        gain_db_max=0.0,
         enable_gain=False,
         enable_polarity=False,
     )
@@ -960,7 +993,7 @@ def train(args):
             weight_viz_every=args.viz_weight_every,
             pulse_speed=args.viz_pulse_speed,
         )
-        print("[INFO] LiveNetViz enabled (Matplotlib window should appear).")
+        print("[INFO] LiveNetViz enabled.")
 
     def infinite(loader):
         while True:
@@ -970,8 +1003,16 @@ def train(args):
     train_it = infinite(train_loader)
     val_it   = infinite(val_loader)
 
+    # Stage2 threshold sweep grid
+    th_grid = [round(x, 2) for x in np.linspace(args.th_sweep_min, args.th_sweep_max, args.th_sweep_steps)]
+
+    global_step = 0
+
     try:
         for ep in range(start_epoch, args.epochs + 1):
+            # Apply curriculum augmentation profile for this epoch
+            apply_curriculum(train_ds, ep, args)
+
             model.train()
             t0 = time.time()
             tr_loss = 0.0
@@ -986,27 +1027,33 @@ def train(args):
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
+                # optional warmup
+                if args.warmup_steps > 0:
+                    maybe_linear_warmup_lr(opt, args.lr, global_step, args.warmup_steps)
+
                 opt.zero_grad(set_to_none=True)
 
                 with autocast(device_type="cuda", enabled=(device == "cuda")):
                     logits = model(x)
                     if stage2:
-                        loss = loss_fn(logits, y)  # y: (B,V)
+                        loss = loss_fn(logits, y)           # y: (B,V)
                     else:
                         loss = loss_fn(logits, y.view(-1))  # y: (B,)
 
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 scaler.step(opt)
                 scaler.update()
 
                 tr_loss += float(loss.item())
+                global_step += 1
 
                 if viz is not None and (step % viz_every == 0):
                     viz.update(x_batch=x, y_info=y, device=device, stage2=stage2)
 
             tr_loss /= args.steps_per_epoch
-            scheduler.step()
+            if scheduler is not None and args.scheduler != "none":
+                scheduler.step()
 
             # ------------------------
             # Validation
@@ -1022,7 +1069,6 @@ def train(args):
                     y = y.to(device, non_blocking=True)
 
                     logits = model(x)
-
                     if stage2:
                         v_loss += float(loss_fn(logits, y).item())
                         all_logits.append(logits.cpu())
@@ -1039,27 +1085,39 @@ def train(args):
             lr_now = opt.param_groups[0]["lr"]
             dt = time.time() - t0
 
-            # Metrics
+            # ------------------------
+            # Metrics + checkpoint scoring
+            # ------------------------
             if stage2:
-                prec, rec, f1 = f1_scores_from_logits(all_logits, all_targets, thresh=args.thresh)
-                metric_str = f"F1={f1:.3f} P={prec:.3f} R={rec:.3f}"
-                score_for_best = f1
+                # threshold sweep
+                best_f1, best_th, best_p, best_r = best_f1_over_thresholds(all_logits, all_targets, th_grid)
+                p_fix, r_fix, f1_fix = f1_scores_from_logits(all_logits, all_targets, thresh=args.thresh)
+                metric_str = (
+                    f"bestF1={best_f1:.3f}@{best_th:.2f} (P={best_p:.3f} R={best_r:.3f}) "
+                    f"fixF1={f1_fix:.3f}@{args.thresh:.2f}"
+                )
+                score_for_best = best_f1
             else:
-                # Top-1/Top-3 accuracy (single-label)
                 probs = torch.softmax(all_logits, dim=1)
                 top1 = (probs.argmax(dim=1) == all_targets).float().mean().item()
                 top3 = (probs.topk(k=min(3, probs.shape[1]), dim=1).indices == all_targets.unsqueeze(1)).any(dim=1).float().mean().item()
                 mean_true_p = probs[torch.arange(probs.shape[0]), all_targets].mean().item()
                 metric_str = f"top1={top1:.3f} top3={top3:.3f} mean_true_p={mean_true_p:.3f}"
-                score_for_best = top1  # use top1 for "best" in stage1
+                score_for_best = top1
+
+            # Print augmentation profile too (so you can see calm->full)
+            aug_profile = (
+                f"aug(noise={train_ds.noise_std:g}, gain=[{train_ds.gain_db_min:g},{train_ds.gain_db_max:g}], "
+                f"pol={'on' if train_ds.enable_polarity else 'off'})"
+            )
 
             print(
-                f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} "
-                f"{metric_str} lr={lr_now:.2e} t={dt:.1f}s"
+                f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} {metric_str} "
+                f"lr={lr_now:.2e} {aug_profile} t={dt:.1f}s"
             )
 
             # ------------------------
-            # Checkpoints
+            # Save checkpoints
             # ------------------------
             ckpt = {
                 "epoch": ep,
@@ -1067,7 +1125,7 @@ def train(args):
                 "model_state": model.state_dict(),
                 "optimizer_state": opt.state_dict(),
                 "scaler_state": scaler.state_dict(),
-                "scheduler_state": scheduler.state_dict(),
+                "scheduler_state": (scheduler.state_dict() if scheduler is not None else None),
                 "best_score": best_score,
                 "sr": sr,
                 "vocab_size": vocab_size,
@@ -1084,7 +1142,6 @@ def train(args):
                 torch.save(ckpt, best_path)
                 print(f"[INFO] New best score={best_score:.3f} -> {best_path}")
 
-                # Export header on best improvements (for stage1, export is still useful)
                 c_header_path = os.path.join(args.out, "onset_weights.h")
                 export_c_header(model, sr, vocab_size, c_header_path, meta)
 
@@ -1103,59 +1160,99 @@ def train(args):
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--dataset",         type=str,   default="dataset")
-    ap.add_argument("--out",             type=str,   default="checkpoints")
-    ap.add_argument("--resume",          type=str,   default="", help="Path to .pt checkpoint to resume from")
+    ap.add_argument("--dataset", type=str, default="dataset")
+    ap.add_argument("--out", type=str, default="checkpoints")
+    ap.add_argument("--resume", type=str, default="", help="Path to .pt checkpoint to resume from")
 
     # Stage controls
-    ap.add_argument("--stage2",          action="store_true", help="Use Stage2 (multi-label BCE) training")
-    ap.add_argument("--include_chords",  action="store_true", help="Include chord clips (Stage2)")
-    ap.add_argument("--force_stage",     action="store_true", help="Do not override stage from checkpoint when resuming")
+    ap.add_argument("--stage2", action="store_true", help="Stage2: multi-label BCE")
+    ap.add_argument("--include_chords", action="store_true", help="Include chord clips")
+    ap.add_argument("--force_stage", action="store_true", help="Do not override stage from checkpoint when resuming")
 
     # Training loop
-    ap.add_argument("--seed",            type=int,   default=42)
-    ap.add_argument("--epochs",          type=int,   default=80)
-    ap.add_argument("--steps_per_epoch", type=int,   default=400)
-    ap.add_argument("--val_steps",       type=int,   default=120)
-    ap.add_argument("--val_ratio",       type=float, default=0.1)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--steps_per_epoch", type=int, default=400)
+    ap.add_argument("--val_steps", type=int, default=120)
+    ap.add_argument("--val_ratio", type=float, default=0.1)
 
     # Optimization
-    ap.add_argument("--batch",           type=int,   default=1024)
-    ap.add_argument("--lr",              type=float, default=1e-3)
-    ap.add_argument("--pos_weight",      type=float, default=2.0, help="Stage2 BCE pos_weight")
+    ap.add_argument("--batch", type=int, default=1024)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--clip_grad", type=float, default=1.0)
+    ap.add_argument("--warmup_steps", type=int, default=0, help="Linear warmup steps (0=off)")
+
+    # Scheduler (better defaults for Stage1 accuracy)
+    ap.add_argument("--scheduler", type=str, default="step", choices=["step", "cosine", "none"])
+    ap.add_argument("--step_size", type=int, default=25)
+    ap.add_argument("--step_gamma", type=float, default=0.5)
+    ap.add_argument("--cosine_min_frac", type=float, default=0.01)
 
     # Model
-    ap.add_argument("--width",           type=int,   default=32)
+    ap.add_argument("--width", type=int, default=64, help="Increase for higher Stage1 accuracy")
 
-    # Data loading + sampling
-    ap.add_argument("--workers",         type=int,   default=4)
-    ap.add_argument("--audio_cache_max", type=int,   default=256)
-    ap.add_argument("--virtual_len",     type=int,   default=100000)
+    # Data loading
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--audio_cache_max", type=int, default=256)
+    ap.add_argument("--virtual_len", type=int, default=100000)
 
     # Sampling ratios (train)
-    ap.add_argument("--p_on",            type=float, default=1.0, help="Stage1 recommended: 1.0")
-    ap.add_argument("--p_neg",           type=float, default=0.0, help="Stage1 recommended: 0.0")
+    # Stage1 recommended: p_on=1.0 p_neg=0.0
+    # Stage2 recommended: p_on~0.6 p_neg~0.4
+    ap.add_argument("--p_on", type=float, default=1.0)
+    ap.add_argument("--p_neg", type=float, default=0.0)
 
     # Sampling ratios (val)
-    ap.add_argument("--val_p_on",        type=float, default=1.0, help="Val positives fraction")
-    ap.add_argument("--val_p_neg",       type=float, default=0.0, help="Val negatives fraction")
+    ap.add_argument("--val_p_on", type=float, default=1.0)
+    ap.add_argument("--val_p_neg", type=float, default=0.0)
 
-    # Augmentations
-    ap.add_argument("--preemph_coef",    type=float, default=0.97)
-    ap.add_argument("--noise_std",       type=float, default=0.0005)
+    # Preprocess
+    ap.add_argument("--preemph_coef", type=float, default=0.97)
 
-    # Threshold (used for viz + stage2 metrics)
-    ap.add_argument("--thresh",          type=float, default=0.2)
+    # Stage2 BCE
+    ap.add_argument("--pos_weight", type=float, default=2.0)
 
-    # Live viz flags
-    ap.add_argument("--viz",             action="store_true")
-    ap.add_argument("--viz_every",       type=int, default=20)
-    ap.add_argument("--viz_topk",        type=int, default=8)
-    ap.add_argument("--viz_out_nodes",   type=int, default=56)
+    # Stage1 CE refinement
+    ap.add_argument("--label_smoothing", type=float, default=0.0, help="Try 0.05 if overfitting/noisy labels")
+
+    # Curriculum Augmentation (CALM then FULL)
+    ap.add_argument("--curriculum_epochs", type=int, default=10, help="Epochs of calm augmentation before full")
+    # Calm profile (early training)
+    ap.add_argument("--calm_noise_std", type=float, default=0.0)
+    ap.add_argument("--calm_gain_min", type=float, default=-6.0)
+    ap.add_argument("--calm_gain_max", type=float, default=2.0)
+    ap.add_argument("--calm_enable_gain", type=int, default=1)
+    ap.add_argument("--calm_enable_polarity", type=int, default=0)
+    # Full profile (later training)
+    ap.add_argument("--full_noise_std", type=float, default=0.0005)
+    ap.add_argument("--full_gain_min", type=float, default=-18.0)
+    ap.add_argument("--full_gain_max", type=float, default=6.0)
+    ap.add_argument("--full_enable_gain", type=int, default=1)
+    ap.add_argument("--full_enable_polarity", type=int, default=1)
+
+    # Thresholds
+    ap.add_argument("--thresh", type=float, default=0.2, help="fixed threshold (viz + stage2 fixed F1)")
+    ap.add_argument("--th_sweep_min", type=float, default=0.05)
+    ap.add_argument("--th_sweep_max", type=float, default=0.95)
+    ap.add_argument("--th_sweep_steps", type=int, default=19)
+
+    # Live viz
+    ap.add_argument("--viz", action="store_true")
+    ap.add_argument("--viz_every", type=int, default=20)
+    ap.add_argument("--viz_topk", type=int, default=8)
+    ap.add_argument("--viz_out_nodes", type=int, default=56)
     ap.add_argument("--viz_weight_every", type=int, default=3)
-    ap.add_argument("--viz_pulse_speed",  type=float, default=0.45)
+    ap.add_argument("--viz_pulse_speed", type=float, default=0.45)
 
     args = ap.parse_args()
+
+    # convert int flags to bools cleanly
+    args.calm_enable_gain = bool(args.calm_enable_gain)
+    args.calm_enable_polarity = bool(args.calm_enable_polarity)
+    args.full_enable_gain = bool(args.full_enable_gain)
+    args.full_enable_polarity = bool(args.full_enable_polarity)
+
     train(args)
 
 
