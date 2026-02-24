@@ -1,52 +1,35 @@
 """
-Two-stage training for <10ms guitar onset note detection (Daisy-friendly).
+train_twohead_guitar.py
 
-Stage 1 (default):
-  - Single-note only (no chords unless --include_chords)
-  - Loss: Softmax Cross-Entropy (nn.CrossEntropyLoss)
-  - Labels: single class index (0..V-1)
+Stage 1 (default): single-note transient classification
+  - Loss: Softmax Cross Entropy (nn.CrossEntropyLoss)
+  - Label: single class index (0..V-1) derived from multi_hot argmax
   - Metrics: top1 / top3 / mean_true_p
-  - Goal: VERY accurate pitch classification on transient windows
 
-Stage 2 (--stage2 --include_chords):
-  - Multi-label (chords + single notes)
-  - Loss: BCEWithLogitsLoss (nn.BCEWithLogitsLoss)
-  - Labels: multi-hot vector (V,)
+Stage 2 (--stage2): multi-label (single + chords)
+  - Loss: BCEWithLogitsLoss
+  - Label: multi-hot (V,)
   - Metrics: best-F1 over threshold sweep + fixed-thresh F1
 
-What I implemented for you (the “all those things”):
-  1) Curriculum Augmentation:
-     - For the first N epochs (default 10), use CALM augmentation:
-         * no polarity flip
-         * narrower gain range
-         * lower noise (or 0)
-     - After that, switch to FULL augmentation.
-     - Works for Stage 1 and Stage 2.
-  2) Model capacity knob:
-     - Wider model improves Stage 1 accuracy. Default width increased to 64.
-     - Still small enough to be realistic on embedded, but you can set it back.
-  3) Better LR scheduling for Stage 1:
-     - Default scheduler is STEP (not cosine), which avoids early “LR collapse”.
-     - Optional warmup, optional cosine, optional none.
-  4) Cleaner validation:
-     - Val augmentation disabled (gain/polarity off, noise off).
-     - Stage1 validation defaults to positives-only (p_on=1, p_neg=0).
-  5) Stage 2 threshold sweep:
-     - Computes best threshold on val each epoch (for a realistic F1).
-
 Visualizer:
-  - Animated wiring-diagram live view (optional):
-    * green/red edges by weight sign
-    * node glow from activations
-    * waveform + top-k predictions + TRUE label
-    * animated "signal path" pulse
+  - Wiring-style network diagram with animated pulse path (inputs -> conv layers -> outputs)
+  - Shows current input waveform (10–15ms) and top predictions
+  - NOW draws a vertical line showing the onset sample index inside the *returned* window
+  - Also prints the current true input note string
 
-Resume:
-  - --resume path/to/onset_last.pt
-  - Restores model/optimizer/scaler/scheduler and continues epochs
+Context windowing:
+  - base window length: --train_ms / --val_ms (e.g. 15ms = 720 samples @ 48k)
+  - optional cropping to inference window: --crop_ms / --val_crop_ms (e.g. 10ms = 480 samples)
+  - crop probability: --crop_prob / --val_crop_prob
+  - onset anchoring inside base window: --onset_pos_min / --onset_pos_max
+  - forcing crop to include onset: --crop_keep_onset_prob
 
-Export:
-  - Exports a C header on new best checkpoints (Stage1 uses best top1; Stage2 uses best F1).
+IMPORTANT:
+  - Dataset returns (x, y, onset_idx_in_returned_window)
+  - DataLoader uses a padding collate_fn so mixed 480/720 batches stack fine
+
+COMMAND: 
+    python train_twohead_guitar.py   --dataset labels   --out stage1_ce   --epochs 80   --width 64   --p_on 1.0 --p_neg 0.0   --val_p_on 1.0 --val_p_neg 0.0   --scheduler step --step_size 25 --step_gamma 0.5   --curriculum_epochs 15   --calm_noise_std 0.0 --calm_enable_polarity 0 --calm_gain_min -4 --calm_gain_max 2   --full_noise_std 0.0005 --full_enable_polarity 1 --full_gain_min -18 --full_gain_max 6   --train_ms 15 --crop_ms 10 --crop_prob 1.0   --val_ms 15 --val_crop_ms 10 --val_crop_prob 1.0   --crop_keep_onset_prob 1.0   --viz --viz_every 10 --viz_weight_every 10 --viz_pulse_speed 0.5 
 """
 
 import os
@@ -69,7 +52,7 @@ from torch.amp import autocast, GradScaler
 # ----------------------------
 # Constants
 # ----------------------------
-WINDOW_MS = 10.0  # 10ms at 48kHz = 480 samples
+DEFAULT_INFER_MS = 10.0  # Daisy target (10ms @ 48kHz = 480 samples)
 
 
 # ----------------------------
@@ -95,6 +78,10 @@ def read_manifest(path: str) -> List[Dict[str, str]]:
             if line:
                 items.append(json.loads(line))
     return items
+
+
+def ms_to_samples(ms: float, sr: int) -> int:
+    return int(round((ms / 1000.0) * float(sr)))
 
 
 def label_to_note_name_multi(label_vec: torch.Tensor, meta: Dict[str, Any]) -> str:
@@ -148,6 +135,37 @@ def maybe_linear_warmup_lr(opt: torch.optim.Optimizer, base_lr: float, step_idx:
         pg["lr"] = lr_now
 
 
+def pad_collate_1d_with_onset(batch):
+    """
+    Pads variable-length audio tensors in a batch to the max length.
+
+    Each item: (x, y, onset_idx)
+      x: (1, T) float tensor
+      y: stage1 -> scalar long tensor, stage2 -> (V,) float tensor
+      onset_idx: int (index in returned x), -1 if unknown/neg
+
+    Returns:
+      x_padded: (B, 1, Tmax)
+      y_stacked: (B,) or (B, V)
+      onset_idx: (B,) long tensor (still refers to *pre-pad* indices; padding is only appended)
+    """
+    xs, ys, ons = zip(*batch)
+    max_T = max(int(x.shape[-1]) for x in xs)
+
+    x_out = []
+    for x in xs:
+        T = int(x.shape[-1])
+        if T < max_T:
+            pad = torch.zeros((x.shape[0], max_T - T), dtype=x.dtype)
+            x = torch.cat([x, pad], dim=-1)
+        x_out.append(x)
+    x_out = torch.stack(x_out, dim=0)
+
+    y_out = torch.stack(ys, dim=0)
+    on_out = torch.tensor(ons, dtype=torch.long)
+    return x_out, y_out, on_out
+
+
 # ----------------------------
 # Live Net Visualizer (optional)
 # ----------------------------
@@ -159,13 +177,15 @@ from matplotlib.lines import Line2D
 class LiveNetViz:
     """
     Wiring-diagram style visualizer; works for both CE stage and BCE stage.
+
+    NEW:
+      - Draws a vertical onset line in the waveform plot using onset_idx provided by dataset.
     """
     def __init__(
         self,
         model: nn.Module,
         meta: Dict[str, Any],
         sr: int,
-        window_samples: int,
         thresh: float = 0.5,
         topk: int = 8,
         out_nodes_cap: int = 56,
@@ -175,7 +195,6 @@ class LiveNetViz:
         self.model = model
         self.meta = meta or {}
         self.sr = int(sr)
-        self.W = int(window_samples)
         self.thresh = float(thresh)
         self.topk = int(topk)
         self.pitches = self.meta.get("index_to_pitch", None)
@@ -183,7 +202,6 @@ class LiveNetViz:
         self.weight_viz_every = max(1, int(weight_viz_every))
         self.pulse_speed = float(pulse_speed)
 
-        # OnsetNet layout:
         self.conv0 = model.conv[0]
         self.conv1 = model.conv[3]
         self.conv2 = model.conv[6]
@@ -415,7 +433,7 @@ class LiveNetViz:
                     self.node_artists[key].set_facecolor((0.15, 0.75, 0.20, 0.85))
         self._last_path = dict(path)
 
-    def _update_wave_and_preds(self, x_1: torch.Tensor, logits_1: torch.Tensor, true_str: str):
+    def _update_wave_and_preds(self, x_1: torch.Tensor, logits_1: torch.Tensor, true_str: str, onset_idx: int):
         x_np = x_1.detach().float().cpu().numpy().reshape(-1)
         probs = torch.sigmoid(logits_1.detach()).cpu().numpy().reshape(-1)
 
@@ -425,9 +443,18 @@ class LiveNetViz:
 
         self.ax_wave.clear()
         self.ax_wave.set_facecolor("black")
-        self.ax_wave.set_title(f"Input (10ms) — TRUE: {true_str} | PRED: {pred_name} ({p:.2f})", color="white")
+        self.ax_wave.set_title(
+            f"Input ({len(x_np)/self.sr*1000.0:.1f}ms) — TRUE: {true_str} | PRED: {pred_name} ({p:.2f})",
+            color="white"
+        )
         t = np.arange(len(x_np)) / float(self.sr) * 1000.0
         self.ax_wave.plot(t, x_np, linewidth=1.0)
+
+        # Draw onset marker if known
+        if onset_idx is not None and int(onset_idx) >= 0 and int(onset_idx) < len(x_np):
+            onset_ms = (float(onset_idx) / float(self.sr)) * 1000.0
+            self.ax_wave.axvline(onset_ms, linewidth=2.0)
+
         self.ax_wave.set_xlim(0, t[-1] if len(t) else 1.0)
         self.ax_wave.tick_params(colors="white")
         for spine in self.ax_wave.spines.values():
@@ -450,16 +477,19 @@ class LiveNetViz:
             spine.set_color("white")
 
     @torch.no_grad()
-    def update(self, x_batch: torch.Tensor, y_info: Union[torch.Tensor, int], device: str, stage2: bool):
+    def update(self, x_batch: torch.Tensor, y_info: torch.Tensor, onset_idx: torch.Tensor, device: str, stage2: bool):
         self.model.eval()
         x = x_batch[:1].to(device, non_blocking=True)
         logits = self.model(x)
+
+        # onset index for this displayed sample (still valid after pad because padding is appended)
+        oi = int(onset_idx[:1].detach().cpu().item())
 
         if stage2:
             y = y_info[:1].detach().cpu()
             true_str = label_to_note_name_multi(y[0], self.meta)
         else:
-            y = int(y_info[0].detach().cpu().item())
+            y = int(y_info[:1].detach().cpu().item())
             true_str = label_to_note_name_single(y, self.meta)
 
         self._viz_tick += 1
@@ -469,7 +499,7 @@ class LiveNetViz:
 
         path = self._choose_path(x_1=x[0], logits_1=logits[0])
         self._apply_pulse(path)
-        self._update_wave_and_preds(x_1=x[0], logits_1=logits[0], true_str=true_str)
+        self._update_wave_and_preds(x_1=x[0], logits_1=logits[0], true_str=true_str, onset_idx=oi)
 
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
@@ -487,7 +517,7 @@ class ClipInfo:
     transient_end: int
     num_samples: int
     sr: int
-    clip_type: str  # "single", "scale_segment", "chord"
+    clip_type: str  # "single", "scale_segment", "chord", "note_repeat_segment"
 
 
 def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, Any]]:
@@ -504,7 +534,7 @@ def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, A
         onset = int(lab.get("onset_sample", 0))
         t_end = int(lab.get("transient_window_end", onset + int(0.005 * sr)))
         n = int(lab.get("num_samples", 0))
-        clip_type = lab.get("type", "unknown")
+        clip_type = lab.get("type", it.get("type", "unknown"))
         clips.append(ClipInfo(
             audio_abs=audio_abs,
             multi_hot=mh,
@@ -530,20 +560,25 @@ def train_val_split(clips: List[ClipInfo], val_ratio: float, seed: int):
 
 class OnsetDataset(Dataset):
     """
-    Each sample is a W-sample window.
+    Each sample loads base_W samples, then optionally crops to crop_W before returning.
 
-    Label modes:
-      - stage2=False: returns class_idx (int64) for positive samples (single-note)
-      - stage2=True : returns multi-hot vector (float32) for positives
+    NEW:
+      - Returns onset_idx_in_returned_window so the viz can draw the onset marker.
+      - Uses onset anchoring so the base window isn't "tail end".
+      - Can force the crop to include the onset.
 
-    Curriculum:
-      - This dataset supports per-epoch changes via set_aug_profile(...)
+    Returns: (x, y, onset_idx)
+      x: (1, T)
+      y: stage1 -> scalar class index (Long), stage2 -> multi-hot (Float)
+      onset_idx: int in [0,T), or -1 if unknown/negative
     """
 
     def __init__(
         self,
         clips: List[ClipInfo],
-        window_samples: int,
+        base_W: int,
+        crop_W: int,
+        crop_prob: float,
         vocab_size: int,
         stage2: bool,
         p_on: float,
@@ -551,25 +586,38 @@ class OnsetDataset(Dataset):
         virtual_len: int = 100000,
         audio_cache_max: int = 256,
         preemph_coef: float = 0.0,
+        # Aug
         noise_std: float = 0.0,
         gain_db_min: float = -12.0,
         gain_db_max: float = 3.0,
         enable_gain: bool = True,
         enable_polarity: bool = False,
+        # Onset anchoring / onset-aware crop (positives only)
+        onset_pos_min: float = 0.20,
+        onset_pos_max: float = 0.65,
+        crop_keep_onset_prob: float = 0.80,
     ):
         self.clips = clips
-        self.W = int(window_samples)
+        self.base_W = int(base_W)
+        self.crop_W = int(crop_W)
+        self.crop_prob = float(crop_prob)
         self.V = int(vocab_size)
         self.stage2 = bool(stage2)
         self.virtual_len = int(virtual_len)
 
-        # Aug profile (mutable via set_aug_profile)
         self.preemph_coef = float(preemph_coef)
+
+        # Aug profile (mutable via set_aug_profile)
         self.noise_std = float(noise_std)
         self.gain_db_min = float(gain_db_min)
         self.gain_db_max = float(gain_db_max)
         self.enable_gain = bool(enable_gain)
         self.enable_polarity = bool(enable_polarity)
+
+        # Onset anchor config
+        self.onset_pos_min = float(onset_pos_min)
+        self.onset_pos_max = float(onset_pos_max)
+        self.crop_keep_onset_prob = float(np.clip(crop_keep_onset_prob, 0.0, 1.0))
 
         s = p_on + p_neg
         self.p_on  = p_on / s
@@ -580,6 +628,13 @@ class OnsetDataset(Dataset):
         self.audio_cache: Dict[str, np.ndarray] = {}
         self.cache_order: List[str] = []
         self.cache_max = int(audio_cache_max)
+
+        # Sanity for crop sizes
+        if self.crop_W <= 0:
+            self.crop_W = self.base_W
+        if self.crop_W > self.base_W:
+            self.crop_W = self.base_W
+        self.crop_prob = float(np.clip(self.crop_prob, 0.0, 1.0))
 
     def set_aug_profile(
         self,
@@ -635,6 +690,34 @@ class OnsetDataset(Dataset):
         arr = np.array(mh, dtype=np.float32)
         return int(arr.argmax())
 
+    def _maybe_crop(self, x: np.ndarray, onset_offset_in_base: Optional[int], is_pos: bool) -> Tuple[np.ndarray, int]:
+        """
+        Crop base window to crop_W.
+
+        Returns:
+          x_out, crop_start
+        crop_start = 0 when not cropped.
+
+        If is_pos and onset_offset_in_base is provided, we can force the crop to contain onset
+        with probability crop_keep_onset_prob.
+        """
+        if self.crop_W >= self.base_W:
+            return x, 0
+
+        if random.random() > self.crop_prob:
+            return x, 0
+
+        max_start = self.base_W - self.crop_W
+
+        if is_pos and (onset_offset_in_base is not None) and (random.random() < self.crop_keep_onset_prob):
+            lo = max(0, onset_offset_in_base - (self.crop_W - 1))
+            hi = min(max_start, onset_offset_in_base)
+            st = random.randint(lo, hi) if hi >= lo else random.randint(0, max_start)
+        else:
+            st = random.randint(0, max_start)
+
+        return x[st: st + self.crop_W], st
+
     def __getitem__(self, _):
         mode = "on" if (random.random() < self.p_on and self.on_candidates) else "neg"
 
@@ -642,44 +725,71 @@ class OnsetDataset(Dataset):
             ci = self.clips[random.choice(self.on_candidates)]
             y  = self._load(ci.audio_abs, ci.sr)
 
-            max_start = max(0, ci.num_samples - self.W)
-            pre = int(random.uniform(0, self.W * 0.7))
-            start = max(0, min(ci.onset_sample - pre, max_start))
+            # POSITIVE: anchor base window around onset
+            min_pos = int(self.onset_pos_min * self.base_W)
+            max_pos = int(self.onset_pos_max * self.base_W)
+            min_pos = int(np.clip(min_pos, 0, self.base_W - 1))
+            max_pos = int(np.clip(max_pos, min_pos, self.base_W - 1))
 
-            x = y[start: start + self.W]
-            if len(x) < self.W:
-                x = np.pad(x, (0, self.W - len(x)))
+            onset_offset = random.randint(min_pos, max_pos)
+
+            max_start = max(0, ci.num_samples - self.base_W)
+            start = ci.onset_sample - onset_offset
+            start = int(np.clip(start, 0, max_start))
+
+            x = y[start: start + self.base_W]
+            if len(x) < self.base_W:
+                x = np.pad(x, (0, self.base_W - len(x)))
+
+            onset_offset_in_base = int(ci.onset_sample - start)
 
             if self.stage2:
                 label = np.array(ci.multi_hot, dtype=np.float32)
             else:
                 label = self._multi_hot_to_single_index(ci.multi_hot)
 
+            is_pos = True
+
         else:
+            # NEGATIVE: silence before transient or after tail
             ci = self.clips[random.randrange(len(self.clips))]
             y  = self._load(ci.audio_abs, ci.sr)
 
-            max_start = max(0, ci.num_samples - self.W)
-            pre_end = max(0, ci.onset_sample - self.W)
+            max_start = max(0, ci.num_samples - self.base_W)
+            pre_end = max(0, ci.onset_sample - self.base_W)
+
             if pre_end > 0:
                 start = random.randint(0, pre_end)
             else:
                 start = max(0, max_start - random.randint(0, min(max_start, int(0.1 * ci.sr))))
 
             start = int(np.clip(start, 0, max_start))
-            x = y[start: start + self.W]
-            if len(x) < self.W:
-                x = np.pad(x, (0, self.W - len(x)))
+            x = y[start: start + self.base_W]
+            if len(x) < self.base_W:
+                x = np.pad(x, (0, self.base_W - len(x)))
+
+            onset_offset_in_base = None
+            is_pos = False
 
             if self.stage2:
                 label = np.zeros(self.V, dtype=np.float32)
             else:
-                # Stage1 should be p_neg=0. If you do include negatives anyway,
-                # this maps to class 0 (not ideal). Keep p_neg=0 for stage1.
+                # Stage1 should generally use p_neg=0; if you include negatives anyway, this is a placeholder
                 label = 0
 
+        # Augment base window -> crop (onset-aware) -> normalize what net sees
         x = x.astype(np.float32)
         x = self._augment(x)
+
+        x, crop_start = self._maybe_crop(x, onset_offset_in_base=onset_offset_in_base, is_pos=is_pos)
+
+        # Compute onset index inside the RETURNED window (after crop), for visualization
+        onset_in_return = -1
+        if is_pos and onset_offset_in_base is not None:
+            onset_in_return = int(onset_offset_in_base - crop_start)
+            if onset_in_return < 0 or onset_in_return >= len(x):
+                onset_in_return = -1
+
         x = self._rms_norm(x)
 
         if self.preemph_coef > 0:
@@ -690,7 +800,8 @@ class OnsetDataset(Dataset):
             y_t = torch.from_numpy(label)
         else:
             y_t = torch.tensor(label, dtype=torch.long)
-        return x_t, y_t
+
+        return x_t, y_t, int(onset_in_return)
 
 
 # ----------------------------
@@ -698,8 +809,7 @@ class OnsetDataset(Dataset):
 # ----------------------------
 class OnsetNet(nn.Module):
     """
-    Tiny 1D conv sized for 480 samples (10ms @ 48kHz).
-    Width is your main accuracy vs compute knob.
+    Tiny 1D conv. Accepts variable input length due to AdaptiveAvgPool1d(1).
     """
     def __init__(self, vocab_size: int, width: int = 64):
         super().__init__()
@@ -733,7 +843,7 @@ class OnsetNet(nn.Module):
 # ----------------------------
 # Export to C header
 # ----------------------------
-def export_c_header(model: nn.Module, sr: int, vocab_size: int, path: str, meta: Dict):
+def export_c_header(model: nn.Module, sr: int, vocab_size: int, export_window_samples: int, path: str, meta: Dict):
     model.eval()
 
     def ascii_pitch(p: str) -> str:
@@ -742,14 +852,14 @@ def export_c_header(model: nn.Module, sr: int, vocab_size: int, path: str, meta:
     lines = [
         "// Auto-generated - DO NOT EDIT",
         "// OnsetNet weights for Daisy Seed bare metal inference",
-        f"// sr={sr} vocab_size={vocab_size} window_samples={int(round(WINDOW_MS/1000*sr))}",
+        f"// sr={sr} vocab_size={vocab_size} window_samples={export_window_samples}",
         "",
         "#pragma once",
         "#include <stdint.h>",
         "",
         f"#define ONSET_SR           {sr}",
         f"#define ONSET_VOCAB_SIZE   {vocab_size}",
-        f"#define ONSET_WINDOW       {int(round(WINDOW_MS/1000*sr))}",
+        f"#define ONSET_WINDOW       {export_window_samples}",
         f"#define ONSET_WIDTH        {model.width}",
         "",
         "static const char* onset_pitch_names[] = {",
@@ -817,7 +927,7 @@ def try_resume(
             scaler.load_state_dict(ckpt["scaler_state"])
         except Exception:
             print("[WARN] Could not load scaler_state (ok if switching devices).")
-    if scheduler is not None and "scheduler_state" in ckpt:
+    if scheduler is not None and "scheduler_state" in ckpt and ckpt["scheduler_state"] is not None:
         try:
             scheduler.load_state_dict(ckpt["scheduler_state"])
         except Exception:
@@ -831,15 +941,9 @@ def try_resume(
 
 
 # ----------------------------
-# Training
+# Training helpers
 # ----------------------------
 def build_scheduler(args, opt):
-    """
-    Better LR scheduling:
-      - 'step' default for stage1 stability
-      - 'cosine' optional
-      - 'none' optional
-    """
     if args.scheduler == "none":
         return None
     if args.scheduler == "cosine":
@@ -850,13 +954,7 @@ def build_scheduler(args, opt):
 
 
 def apply_curriculum(ds: OnsetDataset, ep: int, args):
-    """
-    Epoch-based curriculum:
-      - ep <= curriculum_epochs -> calm aug
-      - else -> full aug
-    """
     if args.curriculum_epochs <= 0:
-        # always full
         ds.set_aug_profile(
             noise_std=args.full_noise_std,
             gain_db_min=args.full_gain_min,
@@ -884,6 +982,9 @@ def apply_curriculum(ds: OnsetDataset, ep: int, args):
         )
 
 
+# ----------------------------
+# Training
+# ----------------------------
 def train(args):
     set_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -892,8 +993,20 @@ def train(args):
     print(f"[INFO] device={device}")
 
     clips, sr, vocab_size, meta = load_clips(args.dataset)
-    W = int(round(WINDOW_MS / 1000.0 * sr))
-    print(f"[INFO] clips={len(clips)} sr={sr} vocab={vocab_size} window={W} samples ({WINDOW_MS}ms)")
+
+    # Windowing
+    train_base_W = ms_to_samples(args.train_ms, sr)
+    train_crop_W = ms_to_samples(args.crop_ms, sr)
+    val_base_W   = ms_to_samples(args.val_ms, sr)
+    val_crop_W   = ms_to_samples(args.val_crop_ms, sr)
+    export_W     = ms_to_samples(args.export_ms, sr)
+
+    print(
+        f"[INFO] clips={len(clips)} sr={sr} vocab={vocab_size} "
+        f"train_ms={args.train_ms:g} (base={train_base_W}) crop_ms={args.crop_ms:g} (crop={train_crop_W}) crop_prob={args.crop_prob:g} "
+        f"val_ms={args.val_ms:g} (base={val_base_W}) val_crop_ms={args.val_crop_ms:g} (crop={val_crop_W}) val_crop_prob={args.val_crop_prob:g} "
+        f"export_ms={args.export_ms:g} (exportW={export_W})"
+    )
 
     stage2 = bool(args.stage2)
 
@@ -909,7 +1022,7 @@ def train(args):
     model = OnsetNet(vocab_size=vocab_size, width=args.width).to(device)
     print(f"[INFO] params={model.count_params():,} width={args.width}")
 
-    # Loss selection
+    # Loss
     if stage2:
         pw = torch.full((vocab_size,), float(args.pos_weight), device=device)
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
@@ -939,23 +1052,31 @@ def train(args):
 
     # Datasets
     train_ds = OnsetDataset(
-        train_clips, W,
+        train_clips,
+        base_W=train_base_W,
+        crop_W=train_crop_W,
+        crop_prob=args.crop_prob,
         vocab_size=vocab_size,
         stage2=stage2,
         p_on=args.p_on, p_neg=args.p_neg,
         virtual_len=args.virtual_len,
         audio_cache_max=args.audio_cache_max,
         preemph_coef=args.preemph_coef,
-        # start with calm profile (will be overwritten by apply_curriculum each epoch)
         noise_std=args.calm_noise_std if args.curriculum_epochs > 0 else args.full_noise_std,
         gain_db_min=args.calm_gain_min if args.curriculum_epochs > 0 else args.full_gain_min,
         gain_db_max=args.calm_gain_max if args.curriculum_epochs > 0 else args.full_gain_max,
         enable_gain=args.calm_enable_gain if args.curriculum_epochs > 0 else args.full_enable_gain,
         enable_polarity=args.calm_enable_polarity if args.curriculum_epochs > 0 else args.full_enable_polarity,
+        onset_pos_min=args.onset_pos_min,
+        onset_pos_max=args.onset_pos_max,
+        crop_keep_onset_prob=args.crop_keep_onset_prob,
     )
 
     val_ds = OnsetDataset(
-        val_clips, W,
+        val_clips,
+        base_W=val_base_W,
+        crop_W=val_crop_W,
+        crop_prob=args.val_crop_prob,
         vocab_size=vocab_size,
         stage2=stage2,
         p_on=args.val_p_on, p_neg=args.val_p_neg,
@@ -967,17 +1088,22 @@ def train(args):
         gain_db_max=0.0,
         enable_gain=False,
         enable_polarity=False,
+        onset_pos_min=args.onset_pos_min,
+        onset_pos_max=args.onset_pos_max,
+        crop_keep_onset_prob=args.crop_keep_onset_prob,
     )
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=False,
         num_workers=args.workers, pin_memory=True,
         persistent_workers=(args.workers > 0),
+        collate_fn=pad_collate_1d_with_onset,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch, shuffle=False,
         num_workers=max(1, args.workers // 2), pin_memory=True,
         persistent_workers=(args.workers > 0),
+        collate_fn=pad_collate_1d_with_onset,
     )
 
     viz = None
@@ -986,7 +1112,6 @@ def train(args):
             model=model,
             meta=meta,
             sr=sr,
-            window_samples=W,
             thresh=args.thresh,
             topk=args.viz_topk,
             out_nodes_cap=args.viz_out_nodes,
@@ -1003,14 +1128,11 @@ def train(args):
     train_it = infinite(train_loader)
     val_it   = infinite(val_loader)
 
-    # Stage2 threshold sweep grid
     th_grid = [round(x, 2) for x in np.linspace(args.th_sweep_min, args.th_sweep_max, args.th_sweep_steps)]
-
     global_step = 0
 
     try:
         for ep in range(start_epoch, args.epochs + 1):
-            # Apply curriculum augmentation profile for this epoch
             apply_curriculum(train_ds, ep, args)
 
             model.train()
@@ -1023,11 +1145,10 @@ def train(args):
             # Train
             # ------------------------
             for step in range(args.steps_per_epoch):
-                x, y = next(train_it)
+                x, y, onset_idx = next(train_it)
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
-                # optional warmup
                 if args.warmup_steps > 0:
                     maybe_linear_warmup_lr(opt, args.lr, global_step, args.warmup_steps)
 
@@ -1036,9 +1157,9 @@ def train(args):
                 with autocast(device_type="cuda", enabled=(device == "cuda")):
                     logits = model(x)
                     if stage2:
-                        loss = loss_fn(logits, y)           # y: (B,V)
+                        loss = loss_fn(logits, y)
                     else:
-                        loss = loss_fn(logits, y.view(-1))  # y: (B,)
+                        loss = loss_fn(logits, y.view(-1))
 
                 scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
@@ -1049,7 +1170,7 @@ def train(args):
                 global_step += 1
 
                 if viz is not None and (step % viz_every == 0):
-                    viz.update(x_batch=x, y_info=y, device=device, stage2=stage2)
+                    viz.update(x_batch=x, y_info=y, onset_idx=onset_idx, device=device, stage2=stage2)
 
             tr_loss /= args.steps_per_epoch
             if scheduler is not None and args.scheduler != "none":
@@ -1064,7 +1185,7 @@ def train(args):
 
             with torch.no_grad():
                 for _ in range(args.val_steps):
-                    x, y = next(val_it)
+                    x, y, onset_idx = next(val_it)
                     x = x.to(device, non_blocking=True)
                     y = y.to(device, non_blocking=True)
 
@@ -1085,11 +1206,7 @@ def train(args):
             lr_now = opt.param_groups[0]["lr"]
             dt = time.time() - t0
 
-            # ------------------------
-            # Metrics + checkpoint scoring
-            # ------------------------
             if stage2:
-                # threshold sweep
                 best_f1, best_th, best_p, best_r = best_f1_over_thresholds(all_logits, all_targets, th_grid)
                 p_fix, r_fix, f1_fix = f1_scores_from_logits(all_logits, all_targets, thresh=args.thresh)
                 metric_str = (
@@ -1105,20 +1222,22 @@ def train(args):
                 metric_str = f"top1={top1:.3f} top3={top3:.3f} mean_true_p={mean_true_p:.3f}"
                 score_for_best = top1
 
-            # Print augmentation profile too (so you can see calm->full)
             aug_profile = (
                 f"aug(noise={train_ds.noise_std:g}, gain=[{train_ds.gain_db_min:g},{train_ds.gain_db_max:g}], "
                 f"pol={'on' if train_ds.enable_polarity else 'off'})"
             )
+            win_profile = (
+                f"win(train {args.train_ms:g}ms->crop {args.crop_ms:g}ms p={args.crop_prob:g}; "
+                f"val {args.val_ms:g}ms->crop {args.val_crop_ms:g}ms p={args.val_crop_prob:g}) "
+                f"anchor([{args.onset_pos_min:g},{args.onset_pos_max:g}] keep_crop_onset={args.crop_keep_onset_prob:g})"
+            )
 
             print(
                 f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} {metric_str} "
-                f"lr={lr_now:.2e} {aug_profile} t={dt:.1f}s"
+                f"lr={lr_now:.2e} {aug_profile} {win_profile} t={dt:.1f}s"
             )
 
-            # ------------------------
             # Save checkpoints
-            # ------------------------
             ckpt = {
                 "epoch": ep,
                 "stage2": stage2,
@@ -1129,7 +1248,7 @@ def train(args):
                 "best_score": best_score,
                 "sr": sr,
                 "vocab_size": vocab_size,
-                "window_samples": W,
+                "export_window_samples": export_W,
                 "width": args.width,
                 "thresh": args.thresh,
                 "args": vars(args),
@@ -1143,7 +1262,7 @@ def train(args):
                 print(f"[INFO] New best score={best_score:.3f} -> {best_path}")
 
                 c_header_path = os.path.join(args.out, "onset_weights.h")
-                export_c_header(model, sr, vocab_size, c_header_path, meta)
+                export_c_header(model, sr, vocab_size, export_W, c_header_path, meta)
 
         print(f"\nDone. Best score={best_score:.3f}")
         print(f"Weights: {best_path}")
@@ -1181,29 +1300,26 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--clip_grad", type=float, default=1.0)
-    ap.add_argument("--warmup_steps", type=int, default=0, help="Linear warmup steps (0=off)")
+    ap.add_argument("--warmup_steps", type=int, default=0)
+    ap.add_argument("--label_smoothing", type=float, default=0.0)
 
-    # Scheduler (better defaults for Stage1 accuracy)
+    # Scheduler
     ap.add_argument("--scheduler", type=str, default="step", choices=["step", "cosine", "none"])
     ap.add_argument("--step_size", type=int, default=25)
     ap.add_argument("--step_gamma", type=float, default=0.5)
     ap.add_argument("--cosine_min_frac", type=float, default=0.01)
 
     # Model
-    ap.add_argument("--width", type=int, default=64, help="Increase for higher Stage1 accuracy")
+    ap.add_argument("--width", type=int, default=64)
 
     # Data loading
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--audio_cache_max", type=int, default=256)
     ap.add_argument("--virtual_len", type=int, default=100000)
 
-    # Sampling ratios (train)
-    # Stage1 recommended: p_on=1.0 p_neg=0.0
-    # Stage2 recommended: p_on~0.6 p_neg~0.4
+    # Sampling ratios
     ap.add_argument("--p_on", type=float, default=1.0)
     ap.add_argument("--p_neg", type=float, default=0.0)
-
-    # Sampling ratios (val)
     ap.add_argument("--val_p_on", type=float, default=1.0)
     ap.add_argument("--val_p_neg", type=float, default=0.0)
 
@@ -1213,41 +1329,53 @@ def main():
     # Stage2 BCE
     ap.add_argument("--pos_weight", type=float, default=2.0)
 
-    # Stage1 CE refinement
-    ap.add_argument("--label_smoothing", type=float, default=0.0, help="Try 0.05 if overfitting/noisy labels")
-
-    # Curriculum Augmentation (CALM then FULL)
-    ap.add_argument("--curriculum_epochs", type=int, default=10, help="Epochs of calm augmentation before full")
-    # Calm profile (early training)
+    # Curriculum aug
+    ap.add_argument("--curriculum_epochs", type=int, default=15)
     ap.add_argument("--calm_noise_std", type=float, default=0.0)
-    ap.add_argument("--calm_gain_min", type=float, default=-6.0)
+    ap.add_argument("--calm_gain_min", type=float, default=-4.0)
     ap.add_argument("--calm_gain_max", type=float, default=2.0)
     ap.add_argument("--calm_enable_gain", type=int, default=1)
     ap.add_argument("--calm_enable_polarity", type=int, default=0)
-    # Full profile (later training)
+
     ap.add_argument("--full_noise_std", type=float, default=0.0005)
     ap.add_argument("--full_gain_min", type=float, default=-18.0)
     ap.add_argument("--full_gain_max", type=float, default=6.0)
     ap.add_argument("--full_enable_gain", type=int, default=1)
     ap.add_argument("--full_enable_polarity", type=int, default=1)
 
-    # Thresholds
-    ap.add_argument("--thresh", type=float, default=0.2, help="fixed threshold (viz + stage2 fixed F1)")
+    # Context + crop (defaults preserve old 10ms->10ms behavior)
+    ap.add_argument("--train_ms", type=float, default=DEFAULT_INFER_MS)
+    ap.add_argument("--crop_ms", type=float, default=DEFAULT_INFER_MS)
+    ap.add_argument("--crop_prob", type=float, default=1.0)
+
+    ap.add_argument("--val_ms", type=float, default=DEFAULT_INFER_MS)
+    ap.add_argument("--val_crop_ms", type=float, default=DEFAULT_INFER_MS)
+    ap.add_argument("--val_crop_prob", type=float, default=1.0)
+
+    ap.add_argument("--export_ms", type=float, default=DEFAULT_INFER_MS)
+
+    # Onset anchoring (positives)
+    ap.add_argument("--onset_pos_min", type=float, default=0.20)
+    ap.add_argument("--onset_pos_max", type=float, default=0.65)
+    ap.add_argument("--crop_keep_onset_prob", type=float, default=0.90)
+
+    # Thresholds (viz + stage2)
+    ap.add_argument("--thresh", type=float, default=0.2)
     ap.add_argument("--th_sweep_min", type=float, default=0.05)
     ap.add_argument("--th_sweep_max", type=float, default=0.95)
     ap.add_argument("--th_sweep_steps", type=int, default=19)
 
     # Live viz
     ap.add_argument("--viz", action="store_true")
-    ap.add_argument("--viz_every", type=int, default=20)
+    ap.add_argument("--viz_every", type=int, default=10)
     ap.add_argument("--viz_topk", type=int, default=8)
     ap.add_argument("--viz_out_nodes", type=int, default=56)
-    ap.add_argument("--viz_weight_every", type=int, default=3)
-    ap.add_argument("--viz_pulse_speed", type=float, default=0.45)
+    ap.add_argument("--viz_weight_every", type=int, default=10)
+    ap.add_argument("--viz_pulse_speed", type=float, default=0.5)
 
     args = ap.parse_args()
 
-    # convert int flags to bools cleanly
+    # Convert int flags to bools
     args.calm_enable_gain = bool(args.calm_enable_gain)
     args.calm_enable_polarity = bool(args.calm_enable_polarity)
     args.full_enable_gain = bool(args.full_enable_gain)
