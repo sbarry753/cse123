@@ -3,39 +3,13 @@ build_guitar_dataset.py
 
 Creates a transient-triggered + sustain-labeled dataset for low-latency polyphonic guitar note detection.
 
-Supports Windows paths + your CURRENT filename patterns:
+Key improvement (THIS VERSION):
+- For scale/note-repeat (60 BPM grid with human drift), we now detect the PICK
+  as the *earliest strong positive-going transient*, not the max-energy transient.
+  This prevents selecting the "mute" transient near the end of the 1-second slot.
 
-SINGLE (pitch-only OR pitch_string):
-  single/A#3.wav
-  single/F4_5.wav
-  single/E2_0.wav   <-- you said you will use this notation
-
-CHORDS (comma-separated tokens, sometimes '.' typo, and '$' accidental typo):
-  chord/E2_0,A3_1,D3_2,G3_3.B4_4,E4_5.wav
-  chord/G#2_0,C#3_1,F#3_2,B4_3,D$4_4,G#4_5.wav   (# $ -> #)
-Also supports the original dash-separated chord pattern.
-
-SCALES (timed chromatic @ 60 BPM; 1 note per second; first second silence):
-  string/A2-A4.wav   -> INCLUSIVE range => 25 notes (A2..A4)
-  string/E2-E4.wav   -> INCLUSIVE range => 25 notes (E2..E4)
-
-NOTE REPEAT (single note repeated @ 60 BPM; 1 note per second; first second silence):
-  note/E2_0.wav
-  note_1/E4_5.wav
-  note2/A3_1.wav
-Each file produces ~30 1-second clips (or fewer if file is shorter), all labeled with the same pitch.
-Each 1-second slot searches around the expected beat to locate the pick transient (human timing drift).
-Clips are shifted so the transient is near the front (pre-roll) and guarded against next pick transient.
-
-CRITICAL: Scale note-count is derived from filename range:
-  n_notes = midi(end) - midi(start) + 1
-
-Outputs:
-dataset/
-  audio/sample_000000.wav
-  labels/sample_000000.json
-  metadata.json
-  manifest.jsonl
+Command:
+    python build_guitar_dataset.py --raw_root /path/to/raw_recordings --out_root /path/to/output_dataset
 """
 
 import os
@@ -55,7 +29,7 @@ import soundfile as sf
 DEFAULT_SR = 48000
 
 TRANSIENT_MS = 5.0
-PRE_ROLL_MS = 10.0
+PRE_ROLL_MS = 2.0
 ONSET_SEARCH_MAX_MS = 80.0  # (used for some cases; not required for scale/note with drift search)
 
 # Sustain end detection tuning
@@ -81,6 +55,19 @@ NOTE_SEARCH_HALF_SEC = 0.30
 NOTE_GUARD_MS = 50
 NOTE_PAD_MODE = "zeros"
 NOTE_N_REPS_DEFAULT = 30
+
+# ----------------------------
+# NEW: Pick detection tuning (for scale/note-repeat drift compensation)
+# ----------------------------
+# If you sometimes play earlier than the grid, keep this symmetric window.
+# If you mostly play late, you can bias it by changing the windowing logic.
+PICK_FRAME = 128          # ~2.67ms
+PICK_HOP = 16             # ~0.33ms resolution
+PICK_REFINE = 96          # samples to refine around detected frame
+PICK_MIN_SEARCH_MS = 20   # ignore the very start of the search window (avoid boundary artifacts)
+PICK_MAX_SEARCH_MS = 280  # ignore very end of the search window (avoid selecting mute near edge)
+PICK_PEAK_FRAC = 0.55     # earliest frame where energy >= peak * frac
+PICK_NOISE_MULT = 8.0     # also require energy above median*mult (local noise floor)
 
 
 # ----------------------------
@@ -342,11 +329,24 @@ def estimate_sustain_end(y: np.ndarray, sr: int, transient_end: int) -> Tuple[in
 
 
 # ----------------------------
-# Scale/note drift-compensated pick detection (labels stay on 1s slots)
+# NEW: Drift-compensated pick detection for scale/note repeat
 # ----------------------------
 def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_samp: int) -> int:
     """
-    Robust pick detector inside a window: maximize short-time energy on a pre-emphasized signal.
+    Find the pick transient near an expected time.
+
+    Old behavior (common failure):
+      - pick frame = argmax(short_time_energy)
+      - can select hard MUTE transient near end of the second
+
+    New behavior:
+      - pre-emphasis (diff)
+      - keep ONLY positive-going changes (attack-like)
+      - compute short-time energy on that
+      - choose EARLIEST frame that crosses a dynamic threshold:
+          energy >= max(peak*PICK_PEAK_FRAC, median*PICK_NOISE_MULT)
+      - refine to exact sample via local peak search
+
     Returns absolute sample index in y.
     """
     start = max(0, center_samp - half_window_samp)
@@ -355,29 +355,59 @@ def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_sa
         return int(np.clip(center_samp, 0, len(y) - 1))
 
     w = y[start:end]
-    d = np.diff(w, prepend=w[:1])  # pre-emphasis
 
-    frame = 128  # ~2.7ms
-    hop = 16     # ~0.33ms resolution
-    n = 1 + max(0, (len(d) - frame) // hop)
+    # Pre-emphasis / high-pass
+    d = np.diff(w, prepend=w[:1]).astype(np.float32)
+
+    # Focus on attack: positive-going changes
+    dpos = np.maximum(d, 0.0)
+
+    frame = PICK_FRAME
+    hop = PICK_HOP
+    n = 1 + max(0, (len(dpos) - frame) // hop)
     if n <= 1:
-        return start
+        return int(np.clip(center_samp, 0, len(y) - 1))
 
     e = np.zeros(n, dtype=np.float32)
     for i in range(n):
         s = i * hop
-        seg = d[s:s + frame]
+        seg = dpos[s:s + frame]
         e[i] = float(np.sum(seg * seg))
 
-    idx = int(np.argmax(e))
+    peak = float(np.max(e))
+    med = float(np.median(e))
+    if peak <= 1e-12:
+        return int(np.clip(center_samp, 0, len(y) - 1))
+
+    thr = max(peak * PICK_PEAK_FRAC, med * PICK_NOISE_MULT)
+
+    # Ignore boundary parts of the search window (helps avoid selecting end mute)
+    min_i = int((PICK_MIN_SEARCH_MS / 1000.0) * sr / hop)
+    max_i = int((PICK_MAX_SEARCH_MS / 1000.0) * sr / hop)
+    min_i = int(np.clip(min_i, 0, n - 1))
+    max_i = int(np.clip(max_i, 0, n - 1))
+    if max_i <= min_i:
+        min_i = 0
+        max_i = n - 1
+
+    idx = None
+    for i in range(min_i, max_i + 1):
+        if e[i] >= thr:
+            idx = i
+            break
+    if idx is None:
+        # fallback: within the allowed region, pick the peak
+        idx = int(np.argmax(e[min_i:max_i + 1]) + min_i)
+
     pick_local = idx * hop
 
-    refine = 64
+    # Refine to a more exact sample near that frame: use the raw diff (not rectified)
+    refine = PICK_REFINE
     r0 = max(0, pick_local - refine)
     r1 = min(len(d), pick_local + refine)
     fine = int(np.argmax(np.abs(d[r0:r1]))) + r0
 
-    return start + fine
+    return int(start + fine)
 
 
 def pad_to_length(x: np.ndarray, length: int, mode: str = "zeros") -> np.ndarray:
@@ -396,7 +426,7 @@ def parse_single_filename(stem: str) -> Tuple[str, int]:
     """
     Accept:
       - F4_5 -> (F4, 5)
-      - E2_0 -> (E2, 0)   (your preferred notation)
+      - E2_0 -> (E2, 0)
       - A#3  -> (A#3, -1) (string unknown)
     """
     if "_" in stem:
@@ -442,10 +472,9 @@ def normalize_chord_stem(stem: str) -> str:
 def parse_chord_filename(stem: str) -> Dict[int, Optional[str]]:
     """
     Accepts tokens separated by comma/dash/dot.
-
-    Each token is one of:
+    Token formats:
       - Pitch_StringNumber, e.g. A3_1
-      - 0_StringNumber (no note on that string), e.g. 0_3
+      - 0_StringNumber, e.g. 0_3
       - Pitch (no underscore) => assume string 0
       - 0 (no underscore) => no note on string 0
     """
@@ -511,6 +540,15 @@ def build_vocab(collected_midis: List[int]) -> Dict[str, Any]:
             "guard_ms": NOTE_GUARD_MS,
             "pad_mode": NOTE_PAD_MODE,
             "n_reps_default": NOTE_N_REPS_DEFAULT,
+        },
+        "pick_detection": {
+            "frame": PICK_FRAME,
+            "hop": PICK_HOP,
+            "refine": PICK_REFINE,
+            "min_search_ms": PICK_MIN_SEARCH_MS,
+            "max_search_ms": PICK_MAX_SEARCH_MS,
+            "peak_frac": PICK_PEAK_FRAC,
+            "noise_mult": PICK_NOISE_MULT,
         },
     }
 
@@ -651,7 +689,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
 
                 onset = detect_onset_sample(y, sr)
                 y_out, onset_out, t_start, t_end = align_and_label_transient(y, sr, onset)
-
                 sus_end, sus_dbg = estimate_sustain_end(y_out, sr, t_end)
 
                 out_name = f"sample_{sample_idx:06d}.wav"
@@ -664,18 +701,14 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     "source_path": os.path.relpath(wav_path, raw_root),
                     "take_id": take_id,
                     "sr": sr,
-
                     "active_notes_midi": notes_midi,
                     "active_notes_pitch": [midi_to_pitch(midi_note)],
                     "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
-
                     "string_map_midi": {str(k): int(v) for k, v in string_map.items()},
-
                     "transient_window_start": int(t_start),
                     "transient_window_end": int(t_end),
                     "sustain_region": [int(t_end), int(min(sus_end, len(y_out)))],
                     "sustain_end_debug": sus_dbg,
-
                     "onset_sample": int(onset_out),
                     "num_samples": int(len(y_out)),
                 }
@@ -690,7 +723,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     "label": os.path.relpath(out_json, out_root),
                     "type": "single",
                 }) + "\n")
-
                 sample_idx += 1
 
             elif rel_type == "chord":
@@ -704,7 +736,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
 
                 onset = detect_onset_sample(y, sr)
                 y_out, onset_out, t_start, t_end = align_and_label_transient(y, sr, onset)
-
                 sus_end, sus_dbg = estimate_sustain_end(y_out, sr, t_end)
 
                 out_name = f"sample_{sample_idx:06d}.wav"
@@ -717,18 +748,14 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     "source_path": os.path.relpath(wav_path, raw_root),
                     "take_id": take_id,
                     "sr": sr,
-
                     "active_notes_midi": notes_midi,
                     "active_notes_pitch": [midi_to_pitch(m) for m in notes_midi],
                     "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
-
                     "string_map_midi": {str(k): int(v) for k, v in string_map.items()},
-
                     "transient_window_start": int(t_start),
                     "transient_window_end": int(t_end),
                     "sustain_region": [int(t_end), int(min(sus_end, len(y_out)))],
                     "sustain_end_debug": sus_dbg,
-
                     "onset_sample": int(onset_out),
                     "num_samples": int(len(y_out)),
                 }
@@ -743,7 +770,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     "label": os.path.relpath(out_json, out_root),
                     "type": "chord",
                 }) + "\n")
-
                 sample_idx += 1
 
             elif rel_type == "scale":
@@ -758,10 +784,7 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 guard = int((SCALE_GUARD_MS / 1000.0) * sr)
                 pre = int((PRE_ROLL_MS / 1000.0) * sr)
 
-                expected_centers = []
-                for i in range(n_notes):
-                    t_sec = SCALE_FIRST_SILENCE_SEC + i * SCALE_STEP_SEC
-                    expected_centers.append(int(t_sec * sr))
+                expected_centers = [int((SCALE_FIRST_SILENCE_SEC + i * SCALE_STEP_SEC) * sr) for i in range(n_notes)]
 
                 picks: List[int] = []
                 for c in expected_centers:
@@ -773,6 +796,7 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 if len(picks) < n_notes:
                     print(f"[WARN] Scale file ended early or missing notes; found {len(picks)}/{n_notes}: {wav_path}")
 
+                # Enforce monotonic increasing picks (avoid weird regressions)
                 for i in range(1, len(picks)):
                     if picks[i] <= picks[i - 1] + int(0.05 * sr):
                         picks[i] = min(len(y) - 1, picks[i - 1] + int(0.05 * sr))
@@ -784,6 +808,7 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     clip_start = pick - pre
                     clip_end = clip_start + one_sec
 
+                    # guard against next pick leakage
                     if i + 1 < len(picks):
                         latest_end = picks[i + 1] - guard
                         if clip_end > latest_end:
@@ -797,7 +822,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     seg = pad_to_length(seg, one_sec, mode=SCALE_PAD_MODE)
 
                     onset_local = int(np.clip(pick - clip_start, 0, one_sec - 1))
-
                     seg_out, onset_out, t_start, t_end = align_and_label_transient(seg, sr, onset_local)
 
                     sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
@@ -807,29 +831,22 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     out_wav = os.path.join(audio_out, out_name)
                     write_wav(out_wav, seg_out, sr)
 
-                    multi_hot = encode_multi_hot(notes_midi, midi_to_index, vocab_size)
-
                     label = {
                         "id": f"{sample_idx:06d}",
                         "type": "scale_segment",
                         "source_path": os.path.relpath(wav_path, raw_root),
                         "take_id": take_id,
                         "sr": sr,
-
                         "scale_segment_index": i,
                         "expected_time_sec": float(SCALE_FIRST_SILENCE_SEC + i * SCALE_STEP_SEC),
-
                         "active_notes_midi": notes_midi,
                         "active_notes_pitch": [midi_to_pitch(midi_note)],
-                        "multi_hot": multi_hot,
-
+                        "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
                         "string_map_midi": {str(k): -1 for k in range(6)},
-
                         "transient_window_start": int(t_start),
                         "transient_window_end": int(t_end),
                         "sustain_region": [int(t_end), int(sus_end)],
                         "sustain_end_debug": sus_dbg,
-
                         "onset_sample": int(onset_out),
                         "num_samples": int(len(seg_out)),
                     }
@@ -844,13 +861,11 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                         "label": os.path.relpath(out_json, out_root),
                         "type": "scale_segment",
                     }) + "\n")
-
                     sample_idx += 1
 
             elif rel_type == "note":
                 # --- Repeated single note @ 60 BPM: 1 second intro silence, then 1 note per second ---
                 y, _sr = read_audio_mono(wav_path, sr)
-
                 pitch, sidx = parse_single_filename(stem)
                 midi_note = int(pitch_to_midi(pitch))
 
@@ -859,18 +874,13 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 guard = int((NOTE_GUARD_MS / 1000.0) * sr)
                 pre = int((PRE_ROLL_MS / 1000.0) * sr)
 
-                # Estimate how many reps fit; then clamp to default 30
                 max_possible = int((len(y) / sr) - NOTE_FIRST_SILENCE_SEC)
                 n_reps = min(NOTE_N_REPS_DEFAULT, max(0, max_possible))
-
                 if n_reps <= 0:
                     print(f"[WARN] Note-repeat file too short (no reps found), skipping: {wav_path}")
                     continue
 
-                expected_centers = []
-                for i in range(n_reps):
-                    t_sec = NOTE_FIRST_SILENCE_SEC + i * NOTE_STEP_SEC
-                    expected_centers.append(int(t_sec * sr))
+                expected_centers = [int((NOTE_FIRST_SILENCE_SEC + i * NOTE_STEP_SEC) * sr) for i in range(n_reps)]
 
                 picks: List[int] = []
                 for c in expected_centers:
@@ -908,7 +918,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     seg = pad_to_length(seg, one_sec, mode=NOTE_PAD_MODE)
 
                     onset_local = int(np.clip(pick - clip_start, 0, one_sec - 1))
-
                     seg_out, onset_out, t_start, t_end = align_and_label_transient(seg, sr, onset_local)
 
                     sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
@@ -918,29 +927,22 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     out_wav = os.path.join(audio_out, out_name)
                     write_wav(out_wav, seg_out, sr)
 
-                    multi_hot = encode_multi_hot(notes_midi, midi_to_index, vocab_size)
-
                     label = {
                         "id": f"{sample_idx:06d}",
                         "type": "note_repeat_segment",
                         "source_path": os.path.relpath(wav_path, raw_root),
                         "take_id": take_id,
                         "sr": sr,
-
                         "note_repeat_index": i,
                         "expected_time_sec": float(NOTE_FIRST_SILENCE_SEC + i * NOTE_STEP_SEC),
-
                         "active_notes_midi": notes_midi,
                         "active_notes_pitch": [midi_to_pitch(midi_note)],
-                        "multi_hot": multi_hot,
-
+                        "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
                         "string_map_midi": {str(k): int(v) for k, v in string_map.items()},
-
                         "transient_window_start": int(t_start),
                         "transient_window_end": int(t_end),
                         "sustain_region": [int(t_end), int(sus_end)],
                         "sustain_end_debug": sus_dbg,
-
                         "onset_sample": int(onset_out),
                         "num_samples": int(len(seg_out)),
                     }
@@ -955,7 +957,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                         "label": os.path.relpath(out_json, out_root),
                         "type": "note_repeat_segment",
                     }) + "\n")
-
                     sample_idx += 1
 
             else:
