@@ -8,3 +8,4 @@
 .vscode/
 *.log
 build/
+special_effects/product/output.wav
