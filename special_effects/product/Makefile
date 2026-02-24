@@ -8,7 +8,7 @@ CXXFLAGS = -std=c++17 -Wall
 TARGET = effect_processor
 
 # All source files to compile
-SRCS = main.cpp fuzz_effect.cpp
+SRCS = main.cpp fuzz_effect.cpp distortion_effect.cpp wavefolding_effect.cpp
 
 # Default target
 all: $(TARGET)

@@ -3,7 +3,7 @@ from scipy.io import wavfile
 import numpy as np
 
 # 1. Load the audio files
-fs_dry, data_dry = wavfile.read('/app/special_effects/test_files/DryGuitar.wav')
+fs_dry, data_dry = wavfile.read('/app/special_effects/test_files/PerfectTone.wav')
 fs_fuzz, data_fuzz = wavfile.read('/app/special_effects/product/output.wav')
 
 # 2. Convert to mono if the files are stereo
@@ -25,12 +25,12 @@ plt.figure(figsize=(12, 6))
 
 plt.subplot(2, 1, 1)
 plt.plot(y_dry, color='blue')
-plt.title('Dry Guitar (Original)')
+plt.title('Waveform Before Effects')
 plt.ylabel('Amplitude')
 
 plt.subplot(2, 1, 2)
 plt.plot(y_fuzz, color='red')
-plt.title('Fuzzed Guitar (Hard Clipped)')
+plt.title('Waveform After Effects')
 plt.xlabel('Samples')
 plt.ylabel('Amplitude')
 

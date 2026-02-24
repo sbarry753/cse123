@@ -3,42 +3,64 @@
 #include <string>
 #include "AudioFile.h"
 #include "fuzz_effect.h"
+#include "distortion_effect.h"
+#include "wavefolding_effect.h" // Include your properly named wavefolder
 
 int main(int argc, char* argv[]) {
-    // Check if the user provided an input file argument
-    if (argc < 2) {
-        std::cerr << "Usage: ./effect_processor <path_to_input_file.wav>\n";
+    if (argc < 3) {
+        std::cerr << "Usage: ./effect_processor <effect_name> <path_to_input_file.wav>\n";
+        std::cerr << "Available effects: fuzz_effect, distortion_effect, wavefolding_effect\n";
         return 1;
     }
 
-    // Grab the file path from the command line
-    std::string inputFile = argv[1];
+    std::string effectName = argv[1];
+    std::string inputFile = argv[2];
     std::string outputFile = "output.wav";
 
     AudioFile<float> audioFile;
 
-    // 1. Load the dynamically provided test track
     if (!audioFile.load(inputFile)) {
         std::cerr << "Error: Could not load " << inputFile << "\n";
         return 1;
     }
 
-    float gain = 50000.0f; // High gain to force clipping
-
-    // 2. Process the audio frame by frame
     int numChannels = audioFile.getNumChannels();
     int numSamples = audioFile.getNumSamplesPerChannel();
 
-    for (int channel = 0; channel < numChannels; channel++) {
-        for (int i = 0; i < numSamples; i++) {
-            float currentSample = audioFile.samples[channel][i];
-
-            // Apply the algorithm from fuzz_effect.cpp
-            audioFile.samples[channel][i] = processFuzz(currentSample, gain);
+    // Route the audio to the correct effect
+    if (effectName == "fuzz_effect") {
+        std::cout << "Applying Fuzz Effect (Hard Clipping)...\n";
+        float fuzzGain = 10.0f; 
+        for (int channel = 0; channel < numChannels; channel++) {
+            for (int i = 0; i < numSamples; i++) {
+                audioFile.samples[channel][i] = processFuzz(audioFile.samples[channel][i], fuzzGain);
+            }
+        }
+    } 
+    else if (effectName == "distortion_effect") {
+        std::cout << "Applying Distortion Effect (Soft Clipping)...\n";
+        float distGain = 2.5f; 
+        for (int channel = 0; channel < numChannels; channel++) {
+            for (int i = 0; i < numSamples; i++) {
+                audioFile.samples[channel][i] = processDistortion(audioFile.samples[channel][i], distGain);
+            }
         }
     }
+    else if (effectName == "wavefolding_effect") {
+        std::cout << "Applying Wavefolding Effect...\n";
+        // A gain of 3.0 to 5.0 will create clearly visible multiple folds
+        float waveGain = 3.0f; 
+        for (int channel = 0; channel < numChannels; channel++) {
+            for (int i = 0; i < numSamples; i++) {
+                audioFile.samples[channel][i] = processWavefolding(audioFile.samples[channel][i], waveGain);
+            }
+        }
+    }
+    else {
+        std::cerr << "Error: Unknown effect '" << effectName << "'\n";
+        return 1;
+    }
 
-    // 3. Save the manipulated audio to a new file
     audioFile.save(outputFile);
     std::cout << "Success! Effect applied and saved to " << outputFile << "\n";
 
