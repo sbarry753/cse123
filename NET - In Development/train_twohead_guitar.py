@@ -443,6 +443,7 @@ def main():
             y_on = y_on.to(device, non_blocking=True)
             y_hold = y_hold.to(device, non_blocking=True)
 
+            x[:, :, 1:] = x[:, :, 1:] - 0.97 * x[:, :, :-1]
             opt.zero_grad(set_to_none=True)
             with autocast(enabled=(device == "cuda")):
                 on_logits, hold_logits = model(x)
@@ -473,6 +474,8 @@ def main():
                 y_on = y_on.to(device, non_blocking=True)
                 y_hold = y_hold.to(device, non_blocking=True)
 
+                x[:, :, 1:] = x[:, :, 1:] - 0.97 * x[:, :, :-1]
+                
                 on_logits, hold_logits = model(x)
                 loss = 1.2 * bce(on_logits, y_on) + 1.0 * bce(hold_logits, y_hold)
                 v_loss += float(loss.item())
