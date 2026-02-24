@@ -1205,6 +1205,23 @@ def train(args):
             lr_now = opt.param_groups[0]["lr"]
             dt = time.time() - t0
 
+            # ---- extra val diagnostics (stage1 single-note friendly) ----
+            with torch.no_grad():
+                probs = torch.sigmoid(all_logits)
+                max_prob, pred_idx = probs.max(dim=1)
+                true_idx = all_targets.argmax(dim=1)
+
+                # consider only "positive" examples (has any label)
+                pos_mask = (all_targets.sum(dim=1) > 0.5)
+
+                if pos_mask.any():
+                    top1 = (pred_idx[pos_mask] == true_idx[pos_mask]).float().mean().item()
+                    mean_true_prob = probs[pos_mask, true_idx[pos_mask]].mean().item()
+                    mean_max_prob  = max_prob[pos_mask].mean().item()
+                    print(f"[VAL dbg] pos_top1={top1:.3f} mean_true_p={mean_true_prob:.3f} mean_max_p={mean_max_prob:.3f}")
+                else:
+                    print("[VAL dbg] no positive samples in this val batch set")
+
             print(
                 f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} "
                 f"F1={f1:.3f} P={prec:.3f} R={rec:.3f} "
