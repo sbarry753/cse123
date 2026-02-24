@@ -8,6 +8,7 @@ Supports Windows paths + your CURRENT filename patterns:
 SINGLE (pitch-only OR pitch_string):
   single/A#3.wav
   single/F4_5.wav
+  single/E2_0.wav   <-- you said you will use this notation
 
 CHORDS (comma-separated tokens, sometimes '.' typo, and '$' accidental typo):
   chord/E2_0,A3_1,D3_2,G3_3.B4_4,E4_5.wav
@@ -18,14 +19,16 @@ SCALES (timed chromatic @ 60 BPM; 1 note per second; first second silence):
   string/A2-A4.wav   -> INCLUSIVE range => 25 notes (A2..A4)
   string/E2-E4.wav   -> INCLUSIVE range => 25 notes (E2..E4)
 
+NOTE REPEAT (single note repeated @ 60 BPM; 1 note per second; first second silence):
+  note/E2_0.wav
+  note_1/E4_5.wav
+  note2/A3_1.wav
+Each file produces ~30 1-second clips (or fewer if file is shorter), all labeled with the same pitch.
+Each 1-second slot searches around the expected beat to locate the pick transient (human timing drift).
+Clips are shifted so the transient is near the front (pre-roll) and guarded against next pick transient.
+
 CRITICAL: Scale note-count is derived from filename range:
   n_notes = midi(end) - midi(start) + 1
-
-Segmentation for scale recordings:
-  - still produces 1-second clips PER NOTE SLOT (label stays aligned to chromatic step)
-  - but each slot searches near the expected beat to locate the pick transient (human timing drift)
-  - clips are shifted so the transient is near the front (pre-roll)
-  - clips are shifted earlier if needed to avoid including the next pick transient
 
 Outputs:
 dataset/
@@ -53,7 +56,7 @@ DEFAULT_SR = 48000
 
 TRANSIENT_MS = 5.0
 PRE_ROLL_MS = 10.0
-ONSET_SEARCH_MAX_MS = 80.0  # (used for some cases; not required for scale with drift search)
+ONSET_SEARCH_MAX_MS = 80.0  # (used for some cases; not required for scale/note with drift search)
 
 # Sustain end detection tuning
 SUS_HOP = 128                    # RMS hop (~2.67ms @ 48k)
@@ -70,6 +73,14 @@ SCALE_STEP_SEC = 1.0              # 60 BPM => 1 note/sec
 SCALE_SEARCH_HALF_SEC = 0.30      # search +/- 300ms around expected pick time
 SCALE_GUARD_MS = 50               # keep this much time before next pick to avoid leakage
 SCALE_PAD_MODE = "zeros"          # "zeros" or "edge"
+
+# Note repeat recordings (single note repeated at 60 BPM; 1s intro silence)
+NOTE_FIRST_SILENCE_SEC = 1.0
+NOTE_STEP_SEC = 1.0
+NOTE_SEARCH_HALF_SEC = 0.30
+NOTE_GUARD_MS = 50
+NOTE_PAD_MODE = "zeros"
+NOTE_N_REPS_DEFAULT = 30
 
 
 # ----------------------------
@@ -138,12 +149,17 @@ def write_wav(path: str, y: np.ndarray, sr: int):
 
 def infer_take_id(path: str) -> str:
     """
-    Take id from folder suffixes like single_1, string_2, etc.
+    Take id from folder suffixes like single_1, string_2, note3, etc.
     """
     parts = os.path.normpath(path).split(os.sep)
     for p in parts:
+        # match ..._12
         m = re.match(r'.*_(\d+)$', p)
         if m:
+            return m.group(1)
+        # match ...12 (note12, string2, single3)
+        m = re.match(r'.*?(\d+)$', p)
+        if m and not re.match(r'^\d+$', p):
             return m.group(1)
     return "0"
 
@@ -151,15 +167,30 @@ def infer_take_id(path: str) -> str:
 def relative_type_from_path(path: str) -> str:
     """
     Determine sample type from folder names.
-    Supports: single, single_#, chords/chord, string, string#, string_#
+
+    Supports multiple takes like:
+      single, single_1, single2
+      string, string_1, string2
+      note, note_1, note2
+      chord, chords
     """
     norm = os.path.normpath(path).split(os.sep)
-    if "single" in norm or any(x.startswith("single") for x in norm):
+    folders = [p.lower() for p in norm]
+
+    def has_folder_like(base: str) -> bool:
+        # Matches: base, base_#, base#
+        pat = re.compile(rf"^{re.escape(base)}(?:_\d+|\d+)?$")
+        return any(pat.match(f) for f in folders)
+
+    if has_folder_like("single"):
         return "single"
-    if "string" in norm or any(x.startswith("string") for x in norm):
+    if has_folder_like("note"):
+        return "note"
+    if has_folder_like("string"):
         return "scale"
-    if "chords" in norm or "chord" in norm:
+    if has_folder_like("chord") or "chords" in folders:
         return "chord"
+
     return "unknown"
 
 
@@ -311,7 +342,7 @@ def estimate_sustain_end(y: np.ndarray, sr: int, transient_end: int) -> Tuple[in
 
 
 # ----------------------------
-# Scale drift-compensated pick detection (but labels stay on 1s slots)
+# Scale/note drift-compensated pick detection (labels stay on 1s slots)
 # ----------------------------
 def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_samp: int) -> int:
     """
@@ -365,7 +396,8 @@ def parse_single_filename(stem: str) -> Tuple[str, int]:
     """
     Accept:
       - F4_5 -> (F4, 5)
-      - A#3  -> (A#3, -1)  (string unknown)
+      - E2_0 -> (E2, 0)   (your preferred notation)
+      - A#3  -> (A#3, -1) (string unknown)
     """
     if "_" in stem:
         m = re.match(r'^(.+?)_(\d+)$', stem)
@@ -472,6 +504,14 @@ def build_vocab(collected_midis: List[int]) -> Dict[str, Any]:
             "guard_ms": SCALE_GUARD_MS,
             "pad_mode": SCALE_PAD_MODE,
         },
+        "note_repeat": {
+            "slot_sec": NOTE_STEP_SEC,
+            "first_silence_sec": NOTE_FIRST_SILENCE_SEC,
+            "search_half_sec": NOTE_SEARCH_HALF_SEC,
+            "guard_ms": NOTE_GUARD_MS,
+            "pad_mode": NOTE_PAD_MODE,
+            "n_reps_default": NOTE_N_REPS_DEFAULT,
+        },
     }
 
 
@@ -534,6 +574,11 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 pitch, _sidx = parse_single_filename(stem)
                 all_midis.append(pitch_to_midi(pitch))
                 discovered.append((wav_path, "single"))
+
+            elif rel_type == "note":
+                pitch, _sidx = parse_single_filename(stem)
+                all_midis.append(pitch_to_midi(pitch))
+                discovered.append((wav_path, "note"))
 
             elif rel_type == "scale":
                 start_pitch, end_pitch = parse_scale_filename(stem)
@@ -713,13 +758,11 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 guard = int((SCALE_GUARD_MS / 1000.0) * sr)
                 pre = int((PRE_ROLL_MS / 1000.0) * sr)
 
-                # Expected beat centers for each note slot
                 expected_centers = []
                 for i in range(n_notes):
                     t_sec = SCALE_FIRST_SILENCE_SEC + i * SCALE_STEP_SEC
                     expected_centers.append(int(t_sec * sr))
 
-                # Detect a pick per slot (near expected time)
                 picks: List[int] = []
                 for c in expected_centers:
                     if c >= len(y):
@@ -730,12 +773,10 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 if len(picks) < n_notes:
                     print(f"[WARN] Scale file ended early or missing notes; found {len(picks)}/{n_notes}: {wav_path}")
 
-                # Enforce monotonic increasing picks to avoid weirdness
                 for i in range(1, len(picks)):
                     if picks[i] <= picks[i - 1] + int(0.05 * sr):
                         picks[i] = min(len(y) - 1, picks[i - 1] + int(0.05 * sr))
 
-                # Build 1-second clips per slot, shifting earlier if needed to avoid next transient
                 for i, pick in enumerate(picks):
                     midi_note = int(start_midi + i)
                     notes_midi = [midi_note]
@@ -802,6 +843,117 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                         "audio": os.path.relpath(out_wav, out_root),
                         "label": os.path.relpath(out_json, out_root),
                         "type": "scale_segment",
+                    }) + "\n")
+
+                    sample_idx += 1
+
+            elif rel_type == "note":
+                # --- Repeated single note @ 60 BPM: 1 second intro silence, then 1 note per second ---
+                y, _sr = read_audio_mono(wav_path, sr)
+
+                pitch, sidx = parse_single_filename(stem)
+                midi_note = int(pitch_to_midi(pitch))
+
+                one_sec = sr
+                half = int(NOTE_SEARCH_HALF_SEC * sr)
+                guard = int((NOTE_GUARD_MS / 1000.0) * sr)
+                pre = int((PRE_ROLL_MS / 1000.0) * sr)
+
+                # Estimate how many reps fit; then clamp to default 30
+                max_possible = int((len(y) / sr) - NOTE_FIRST_SILENCE_SEC)
+                n_reps = min(NOTE_N_REPS_DEFAULT, max(0, max_possible))
+
+                if n_reps <= 0:
+                    print(f"[WARN] Note-repeat file too short (no reps found), skipping: {wav_path}")
+                    continue
+
+                expected_centers = []
+                for i in range(n_reps):
+                    t_sec = NOTE_FIRST_SILENCE_SEC + i * NOTE_STEP_SEC
+                    expected_centers.append(int(t_sec * sr))
+
+                picks: List[int] = []
+                for c in expected_centers:
+                    if c >= len(y):
+                        break
+                    p = find_pick_near_time(y, sr, c, half)
+                    picks.append(p)
+
+                if len(picks) < n_reps:
+                    print(f"[WARN] Note-repeat file ended early; found {len(picks)}/{n_reps}: {wav_path}")
+                    n_reps = len(picks)
+
+                for i in range(1, len(picks)):
+                    if picks[i] <= picks[i - 1] + int(0.05 * sr):
+                        picks[i] = min(len(y) - 1, picks[i - 1] + int(0.05 * sr))
+
+                string_map = safe_string_map_from_single(sidx, midi_note)
+
+                for i, pick in enumerate(picks[:n_reps]):
+                    notes_midi = [midi_note]
+
+                    clip_start = pick - pre
+                    clip_end = clip_start + one_sec
+
+                    if i + 1 < len(picks):
+                        latest_end = picks[i + 1] - guard
+                        if clip_end > latest_end:
+                            clip_end = latest_end
+                            clip_start = clip_end - one_sec
+
+                    clip_start = int(np.clip(clip_start, 0, max(0, len(y) - 1)))
+                    clip_end = int(clip_start + one_sec)
+
+                    seg = y[clip_start:min(len(y), clip_end)].copy()
+                    seg = pad_to_length(seg, one_sec, mode=NOTE_PAD_MODE)
+
+                    onset_local = int(np.clip(pick - clip_start, 0, one_sec - 1))
+
+                    seg_out, onset_out, t_start, t_end = align_and_label_transient(seg, sr, onset_local)
+
+                    sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
+                    sus_end = min(sus_end, len(seg_out))
+
+                    out_name = f"sample_{sample_idx:06d}.wav"
+                    out_wav = os.path.join(audio_out, out_name)
+                    write_wav(out_wav, seg_out, sr)
+
+                    multi_hot = encode_multi_hot(notes_midi, midi_to_index, vocab_size)
+
+                    label = {
+                        "id": f"{sample_idx:06d}",
+                        "type": "note_repeat_segment",
+                        "source_path": os.path.relpath(wav_path, raw_root),
+                        "take_id": take_id,
+                        "sr": sr,
+
+                        "note_repeat_index": i,
+                        "expected_time_sec": float(NOTE_FIRST_SILENCE_SEC + i * NOTE_STEP_SEC),
+
+                        "active_notes_midi": notes_midi,
+                        "active_notes_pitch": [midi_to_pitch(midi_note)],
+                        "multi_hot": multi_hot,
+
+                        "string_map_midi": {str(k): int(v) for k, v in string_map.items()},
+
+                        "transient_window_start": int(t_start),
+                        "transient_window_end": int(t_end),
+                        "sustain_region": [int(t_end), int(sus_end)],
+                        "sustain_end_debug": sus_dbg,
+
+                        "onset_sample": int(onset_out),
+                        "num_samples": int(len(seg_out)),
+                    }
+
+                    out_json = os.path.join(labels_out, f"sample_{sample_idx:06d}.json")
+                    with open(out_json, "w") as f:
+                        json.dump(label, f, indent=2)
+
+                    mf.write(json.dumps({
+                        "id": label["id"],
+                        "audio": os.path.relpath(out_wav, out_root),
+                        "label": os.path.relpath(out_json, out_root),
+                        "type": "note_repeat_segment",
                     }) + "\n")
 
                     sample_idx += 1
