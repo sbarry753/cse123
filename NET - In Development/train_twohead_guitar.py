@@ -187,7 +187,7 @@ class TwoHeadWindowDataset(Dataset):
 
             x = y[start:start + self.W]
             y_on = np.array(ci.multi_hot, dtype=np.float32)
-            y_hold = np.zeros_like(y_on)
+            y_hold = np.array(ci.multi_hot, dtype=np.float32)
 
         elif mode == "hold" and self.hold_candidates:
             ci = self.clips[random.choice(self.hold_candidates)]
