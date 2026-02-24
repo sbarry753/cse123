@@ -1,11 +1,21 @@
-# Default target: compile the program
-fuzz_tester: main.cpp
-	g++ main.cpp -o fuzz_tester -std=c++17
+# The compiler
+CXX = g++
 
-# Type 'make run' to compile (if needed) and then execute
-run: fuzz_tester
-	./fuzz_tester
+# Compiler flags
+CXXFLAGS = -std=c++17 -Wall
 
-# Type 'make clean' to delete the compiled executable
+# Target executable name
+TARGET = effect_processor
+
+# All source files to compile
+SRCS = main.cpp fuzz_effect.cpp
+
+# Default target
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CXX) $(CXXFLAGS) $(SRCS) -o $(TARGET)
+
+# Clean up compiled files
 clean:
-	rm -f fuzz_tester
+	rm -f $(TARGET) output.wav

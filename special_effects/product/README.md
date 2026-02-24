@@ -8,5 +8,5 @@ Files we will be using:
 
 Makefile for main.cpp, which takes in the cpp effects and header
 
-TODO:
-Clone the libDaisy library locally
+#Get Started!
+./effect_processor /app/special_effects/test_files/DryGuitar.wav
