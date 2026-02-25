@@ -123,13 +123,52 @@ def normalize_pitch_str(p: str) -> str:
     return f"{letter}{accidental}{octave}"
 
 
-def pitch_to_midi(pitch: str) -> int:
-    pitch = normalize_pitch_str(pitch)
-    return int(librosa.note_to_midi(pitch))
+def _parse_note_oct(p: str):
+    p = p.strip()
 
+    # normalize all sharp/flat variants
+    p = (p.replace("$", "#")
+           .replace("♯", "#")
+           .replace("𝄪", "#")   # just in case (double-sharp glyph)
+           .replace("＃", "#")  # fullwidth #
+           .replace("♭", "b")
+           .replace("𝄫", "b"))  # just in case (double-flat glyph)
+
+    m = NOTE_RE.match(p)
+    if not m:
+        raise ValueError(f"Bad pitch token: {p}")
+    note = m.group(1).upper() + m.group(2)   # e.g. "F#"
+    octv = int(m.group(3))
+    return note, octv
+
+def pitch_to_midi(pitch: str) -> int:
+    """
+    Convert YOUR A-based octave label -> standard MIDI pitch.
+    Rule:
+      A/A#/B: standard_oct = a_oct - 1
+      C..G#:  standard_oct = a_oct
+    """
+    note, a_oct = _parse_note_oct(pitch)
+    if note[0] in ("A", "B"):
+        std_oct = a_oct - 1
+    else:
+        std_oct = a_oct
+    return int(librosa.note_to_midi(f"{note}{std_oct}"))
 
 def midi_to_pitch(midi: int) -> str:
-    return librosa.midi_to_note(midi, octave=True)
+    """
+    Convert standard MIDI -> YOUR A-based octave label.
+    Inverse rule:
+      A/A#/B: a_oct = std_oct + 1
+      C..G#:  a_oct = std_oct
+    """
+    s = librosa.midi_to_note(int(midi), octave=True)  # e.g. "A4"
+    note, std_oct = _parse_note_oct(s)
+    if note[0] in ("A", "B"):
+        a_oct = std_oct + 1
+    else:
+        a_oct = std_oct
+    return f"{note}{a_oct}"
 
 
 def scale_note_count(start_pitch: str, end_pitch: str) -> int:

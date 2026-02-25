@@ -596,6 +596,8 @@ class OnsetDataset(Dataset):
         onset_pos_min: float = 0.20,
         onset_pos_max: float = 0.65,
         crop_keep_onset_prob: float = 0.80,
+        crop_onset_target_ms: float = 1.0,
+        crop_onset_jitter_ms: float = 0.25,
     ):
         self.clips = clips
         self.base_W = int(base_W)
@@ -618,6 +620,8 @@ class OnsetDataset(Dataset):
         self.onset_pos_min = float(onset_pos_min)
         self.onset_pos_max = float(onset_pos_max)
         self.crop_keep_onset_prob = float(np.clip(crop_keep_onset_prob, 0.0, 1.0))
+        self.crop_onset_target_ms = float(crop_onset_target_ms)
+        self.crop_onset_jitter_ms = float(crop_onset_jitter_ms)
 
         s = p_on + p_neg
         self.p_on  = p_on / s
@@ -703,16 +707,21 @@ class OnsetDataset(Dataset):
         """
         if self.crop_W >= self.base_W:
             return x, 0
-
         if random.random() > self.crop_prob:
             return x, 0
 
         max_start = self.base_W - self.crop_W
 
         if is_pos and (onset_offset_in_base is not None) and (random.random() < self.crop_keep_onset_prob):
-            lo = max(0, onset_offset_in_base - (self.crop_W - 1))
-            hi = min(max_start, onset_offset_in_base)
-            st = random.randint(lo, hi) if hi >= lo else random.randint(0, max_start)
+            sr = int(self.clips[0].sr) if self.clips else 48000
+
+            target = int(round(0.001 * sr))      # 1.0 ms into the crop
+            jitter = int(round(0.00025 * sr))    # +/- 0.25 ms jitter
+
+            j = random.randint(-jitter, jitter) if jitter > 0 else 0
+            target = int(np.clip(target + j, 0, self.crop_W - 1))
+
+            st = int(np.clip(onset_offset_in_base - target, 0, max_start))
         else:
             st = random.randint(0, max_start)
 
@@ -1070,6 +1079,8 @@ def train(args):
         onset_pos_min=args.onset_pos_min,
         onset_pos_max=args.onset_pos_max,
         crop_keep_onset_prob=args.crop_keep_onset_prob,
+        crop_onset_target_ms=args.crop_onset_target_ms,
+        crop_onset_jitter_ms=args.crop_onset_jitter_ms,
     )
 
     val_ds = OnsetDataset(
@@ -1358,6 +1369,10 @@ def main():
     ap.add_argument("--onset_pos_min", type=float, default=0.20)
     ap.add_argument("--onset_pos_max", type=float, default=0.65)
     ap.add_argument("--crop_keep_onset_prob", type=float, default=0.90)
+    ap.add_argument("--crop_onset_target_ms", type=float, default=1.0,
+                    help="When keeping onset in crop, place onset at this offset inside returned crop (ms).")
+    ap.add_argument("--crop_onset_jitter_ms", type=float, default=0.25,
+                    help="Random jitter (+/-) around crop_onset_target_ms (ms).")
 
     # Thresholds (viz + stage2)
     ap.add_argument("--thresh", type=float, default=0.2)
