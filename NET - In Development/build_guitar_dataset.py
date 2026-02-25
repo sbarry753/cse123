@@ -8,40 +8,19 @@ Key improvement (THIS VERSION):
   as the *earliest strong positive-going transient*, not the max-energy transient.
   This prevents selecting the "mute" transient near the end of the 1-second slot.
 
-Command:
-    python build_guitar_dataset.py --raw_root /path/to/raw_recordings --out_root /path/to/output_dataset
+NEW (negatives):
+- Optionally generates NEGATIVE samples ("no sound being played") from the quiet tail
+  *after the estimated sustain end* inside each 1-second scale/note-repeat segment.
+- Supports a GLOBAL CAP on total negatives to avoid dataset imbalance.
 
-Better command for early training:
-python train_twohead_guitar.py \
-  --dataset labels \
-  --out stage1_pick_focused \
-  --epochs 80 \
-  --width 96 \
-  \
-  --p_on 1.0 --p_neg 0.0 \
-  --val_p_on 1.0 --val_p_neg 0.0 \
-  \
-  --scheduler step --step_size 25 --step_gamma 0.5 \
-  --curriculum_epochs 15 \
-  \
-  --calm_noise_std 0.0 \
-  --calm_enable_polarity 0 \
-  --calm_gain_min -4 --calm_gain_max 2 \
-  \
-  --full_noise_std 0.0005 \
-  --full_enable_polarity 0 \
-  --full_gain_min -12 --full_gain_max 3 \
-  \
-  --preemph_coef 0.0 \
-  \
-  --train_ms 15 --crop_ms 10 --crop_prob 1.0 \
-  --val_ms 15 --val_crop_ms 10 --val_crop_prob 1.0 \
-  \
-  --onset_pos_min 0.15 \
-  --onset_pos_max 0.30 \
-  --crop_keep_onset_prob 1.0 \
-  \
-  --viz --viz_every 10 --viz_weight_every 10 --viz_pulse_speed 0.5
+Examples:
+    python build_guitar_dataset.py --raw raw --out dataset
+
+With negatives (cap at 100 total):
+    python build_guitar_dataset.py --raw raw --out dataset --add_negatives --neg_max_total 100
+
+More negatives per positive (still capped globally):
+    python build_guitar_dataset.py --raw raw --out dataset --add_negatives --neg_per_pos 2 --neg_max_total 100
 """
 
 import os
@@ -62,25 +41,25 @@ DEFAULT_SR = 48000
 
 TRANSIENT_MS = 5.0
 PRE_ROLL_MS = 2.0
-ONSET_SEARCH_MAX_MS = 80.0  # (used for some cases; not required for scale/note with drift search)
+ONSET_SEARCH_MAX_MS = 80.0
 
 # Sustain end detection tuning
-SUS_HOP = 128                    # RMS hop (~2.67ms @ 48k)
-SUS_FRAME = 512                  # RMS window (~10.7ms @ 48k)
-SUS_MIN_AFTER_TRANSIENT_MS = 40  # don't end sustain too early
-SUS_MIN_SUSTAIN_MS = 120         # enforce minimum sustain length after transient end
-SUS_HANGOVER_MS = 60             # must stay quiet for this long
-SUS_NOISE_PAD_DB = 6.0           # threshold above noise floor
-SUS_REL_DROP_DB = 35.0           # or threshold relative to peak drop
+SUS_HOP = 128
+SUS_FRAME = 512
+SUS_MIN_AFTER_TRANSIENT_MS = 40
+SUS_MIN_SUSTAIN_MS = 120
+SUS_HANGOVER_MS = 60
+SUS_NOISE_PAD_DB = 6.0
+SUS_REL_DROP_DB = 35.0
 
 # Scale fixed-1s segmentation with drift compensation
-SCALE_FIRST_SILENCE_SEC = 1.0     # first second is silence
-SCALE_STEP_SEC = 1.0              # 60 BPM => 1 note/sec
-SCALE_SEARCH_HALF_SEC = 0.30      # search +/- 300ms around expected pick time
-SCALE_GUARD_MS = 50               # keep this much time before next pick to avoid leakage
-SCALE_PAD_MODE = "zeros"          # "zeros" or "edge"
+SCALE_FIRST_SILENCE_SEC = 1.0
+SCALE_STEP_SEC = 1.0
+SCALE_SEARCH_HALF_SEC = 0.30
+SCALE_GUARD_MS = 50
+SCALE_PAD_MODE = "zeros"  # "zeros" or "edge"
 
-# Note repeat recordings (single note repeated at 60 BPM; 1s intro silence)
+# Note repeat recordings
 NOTE_FIRST_SILENCE_SEC = 1.0
 NOTE_STEP_SEC = 1.0
 NOTE_SEARCH_HALF_SEC = 0.30
@@ -88,18 +67,14 @@ NOTE_GUARD_MS = 50
 NOTE_PAD_MODE = "zeros"
 NOTE_N_REPS_DEFAULT = 30
 
-# ----------------------------
-# NEW: Pick detection tuning (for scale/note-repeat drift compensation)
-# ----------------------------
-# If you sometimes play earlier than the grid, keep this symmetric window.
-# If you mostly play late, you can bias it by changing the windowing logic.
-PICK_FRAME = 128          # ~2.67ms
-PICK_HOP = 16             # ~0.33ms resolution
-PICK_REFINE = 96          # samples to refine around detected frame
-PICK_MIN_SEARCH_MS = 20   # ignore the very start of the search window (avoid boundary artifacts)
-PICK_MAX_SEARCH_MS = 280  # ignore very end of the search window (avoid selecting mute near edge)
-PICK_PEAK_FRAC = 0.55     # earliest frame where energy >= peak * frac
-PICK_NOISE_MULT = 8.0     # also require energy above median*mult (local noise floor)
+# Pick detection tuning
+PICK_FRAME = 128
+PICK_HOP = 16
+PICK_REFINE = 96
+PICK_MIN_SEARCH_MS = 20
+PICK_MAX_SEARCH_MS = 280
+PICK_PEAK_FRAC = 0.55
+PICK_NOISE_MULT = 8.0
 
 
 # ----------------------------
@@ -109,10 +84,6 @@ NOTE_RE = re.compile(r'^([A-Ga-g])([#b]?)(-?\d+)$')
 
 
 def normalize_pitch_str(p: str) -> str:
-    """
-    Normalize pitch tokens to librosa-friendly note names: e.g., 'f#4' -> 'F#4'
-    Also fixes '$' -> '#'.
-    """
     p = p.strip().replace("$", "#")
     if p == "0":
         return p
@@ -125,29 +96,21 @@ def normalize_pitch_str(p: str) -> str:
 
 def _parse_note_oct(p: str):
     p = p.strip()
-
-    # normalize all sharp/flat variants
     p = (p.replace("$", "#")
            .replace("♯", "#")
-           .replace("𝄪", "#")   # just in case (double-sharp glyph)
-           .replace("＃", "#")  # fullwidth #
+           .replace("𝄪", "#")
+           .replace("＃", "#")
            .replace("♭", "b")
-           .replace("𝄫", "b"))  # just in case (double-flat glyph)
-
+           .replace("𝄫", "b"))
     m = NOTE_RE.match(p)
     if not m:
         raise ValueError(f"Bad pitch token: {p}")
-    note = m.group(1).upper() + m.group(2)   # e.g. "F#"
+    note = m.group(1).upper() + m.group(2)
     octv = int(m.group(3))
     return note, octv
 
+
 def pitch_to_midi(pitch: str) -> int:
-    """
-    Convert YOUR A-based octave label -> standard MIDI pitch.
-    Rule:
-      A/A#/B: standard_oct = a_oct - 1
-      C..G#:  standard_oct = a_oct
-    """
     note, a_oct = _parse_note_oct(pitch)
     if note[0] in ("A", "B"):
         std_oct = a_oct - 1
@@ -155,14 +118,9 @@ def pitch_to_midi(pitch: str) -> int:
         std_oct = a_oct
     return int(librosa.note_to_midi(f"{note}{std_oct}"))
 
+
 def midi_to_pitch(midi: int) -> str:
-    """
-    Convert standard MIDI -> YOUR A-based octave label.
-    Inverse rule:
-      A/A#/B: a_oct = std_oct + 1
-      C..G#:  a_oct = std_oct
-    """
-    s = librosa.midi_to_note(int(midi), octave=True)  # e.g. "A4"
+    s = librosa.midi_to_note(int(midi), octave=True)
     note, std_oct = _parse_note_oct(s)
     if note[0] in ("A", "B"):
         a_oct = std_oct + 1
@@ -176,7 +134,7 @@ def scale_note_count(start_pitch: str, end_pitch: str) -> int:
     e = pitch_to_midi(end_pitch)
     if e < s:
         raise ValueError(f"Scale end pitch {end_pitch} is below start {start_pitch}")
-    return (e - s) + 1  # inclusive
+    return (e - s) + 1
 
 
 # ----------------------------
@@ -206,16 +164,11 @@ def write_wav(path: str, y: np.ndarray, sr: int):
 
 
 def infer_take_id(path: str) -> str:
-    """
-    Take id from folder suffixes like single_1, string_2, note3, etc.
-    """
     parts = os.path.normpath(path).split(os.sep)
     for p in parts:
-        # match ..._12
         m = re.match(r'.*_(\d+)$', p)
         if m:
             return m.group(1)
-        # match ...12 (note12, string2, single3)
         m = re.match(r'.*?(\d+)$', p)
         if m and not re.match(r'^\d+$', p):
             return m.group(1)
@@ -223,20 +176,10 @@ def infer_take_id(path: str) -> str:
 
 
 def relative_type_from_path(path: str) -> str:
-    """
-    Determine sample type from folder names.
-
-    Supports multiple takes like:
-      single, single_1, single2
-      string, string_1, string2
-      note, note_1, note2
-      chord, chords
-    """
     norm = os.path.normpath(path).split(os.sep)
     folders = [p.lower() for p in norm]
 
     def has_folder_like(base: str) -> bool:
-        # Matches: base, base_#, base#
         pat = re.compile(rf"^{re.escape(base)}(?:_\d+|\d+)?$")
         return any(pat.match(f) for f in folders)
 
@@ -248,18 +191,13 @@ def relative_type_from_path(path: str) -> str:
         return "scale"
     if has_folder_like("chord") or "chords" in folders:
         return "chord"
-
     return "unknown"
 
 
 # ----------------------------
-# Robust onset detection (prevents librosa crash) for single/chord
+# Robust onset detection (single/chord)
 # ----------------------------
 def detect_onset_sample(y: np.ndarray, sr: int, search_limit_ms: Optional[float] = None) -> int:
-    """
-    Detect onset sample. Tries librosa onset_detect with backtrack; if it errors,
-    retries without backtrack; if it still fails, uses a simple amplitude threshold.
-    """
     if len(y) < int(0.01 * sr):
         return 0
 
@@ -293,7 +231,6 @@ def detect_onset_sample(y: np.ndarray, sr: int, search_limit_ms: Optional[float]
         except Exception:
             pass
 
-    # Fallback: amplitude threshold crossing
     a = np.abs(y_search)
     thr = np.median(a) * 8.0
     idx = int(np.argmax(a > thr))
@@ -306,11 +243,6 @@ def detect_onset_sample(y: np.ndarray, sr: int, search_limit_ms: Optional[float]
 # Transient alignment
 # ----------------------------
 def align_and_label_transient(y: np.ndarray, sr: int, onset_sample: int) -> Tuple[np.ndarray, int, int, int]:
-    """
-    Trim so onset is ~PRE_ROLL_MS into the audio.
-    Returns:
-      y_out, onset_out, transient_start, transient_end (all in samples relative to y_out)
-    """
     pre = int((PRE_ROLL_MS / 1000.0) * sr)
     tlen = int((TRANSIENT_MS / 1000.0) * sr)
 
@@ -343,14 +275,6 @@ def _to_db(x: np.ndarray) -> np.ndarray:
 
 
 def estimate_sustain_end(y: np.ndarray, sr: int, transient_end: int) -> Tuple[int, Dict[str, float]]:
-    """
-    Estimate sustain end in samples, clamped to [transient_end+1, len(y)].
-
-    Uses:
-      - Noise floor from tail median
-      - Relative drop from peak
-      - Hangover: must stay below threshold continuously
-    """
     env = _rms_env(y)
     env_db = _to_db(env)
 
@@ -381,11 +305,7 @@ def estimate_sustain_end(y: np.ndarray, sr: int, transient_end: int) -> Tuple[in
             end_frame = f
             break
 
-    if end_frame is None:
-        end_samp = len(y)
-    else:
-        end_samp = int(end_frame * SUS_HOP)
-
+    end_samp = len(y) if end_frame is None else int(end_frame * SUS_HOP)
     end_samp = int(np.clip(end_samp, transient_end + 1, len(y)))
 
     dbg = {
@@ -400,37 +320,16 @@ def estimate_sustain_end(y: np.ndarray, sr: int, transient_end: int) -> Tuple[in
 
 
 # ----------------------------
-# NEW: Drift-compensated pick detection for scale/note repeat
+# Drift-compensated pick detection for scale/note repeat
 # ----------------------------
 def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_samp: int) -> int:
-    """
-    Find the pick transient near an expected time.
-
-    Old behavior (common failure):
-      - pick frame = argmax(short_time_energy)
-      - can select hard MUTE transient near end of the second
-
-    New behavior:
-      - pre-emphasis (diff)
-      - keep ONLY positive-going changes (attack-like)
-      - compute short-time energy on that
-      - choose EARLIEST frame that crosses a dynamic threshold:
-          energy >= max(peak*PICK_PEAK_FRAC, median*PICK_NOISE_MULT)
-      - refine to exact sample via local peak search
-
-    Returns absolute sample index in y.
-    """
     start = max(0, center_samp - half_window_samp)
     end = min(len(y), center_samp + half_window_samp)
     if end <= start + 64:
         return int(np.clip(center_samp, 0, len(y) - 1))
 
     w = y[start:end]
-
-    # Pre-emphasis / high-pass
     d = np.diff(w, prepend=w[:1]).astype(np.float32)
-
-    # Focus on attack: positive-going changes
     dpos = np.maximum(d, 0.0)
 
     frame = PICK_FRAME
@@ -452,7 +351,6 @@ def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_sa
 
     thr = max(peak * PICK_PEAK_FRAC, med * PICK_NOISE_MULT)
 
-    # Ignore boundary parts of the search window (helps avoid selecting end mute)
     min_i = int((PICK_MIN_SEARCH_MS / 1000.0) * sr / hop)
     max_i = int((PICK_MAX_SEARCH_MS / 1000.0) * sr / hop)
     min_i = int(np.clip(min_i, 0, n - 1))
@@ -467,12 +365,10 @@ def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_sa
             idx = i
             break
     if idx is None:
-        # fallback: within the allowed region, pick the peak
         idx = int(np.argmax(e[min_i:max_i + 1]) + min_i)
 
     pick_local = idx * hop
 
-    # Refine to a more exact sample near that frame: use the raw diff (not rectified)
     refine = PICK_REFINE
     r0 = max(0, pick_local - refine)
     r1 = min(len(d), pick_local + refine)
@@ -494,12 +390,6 @@ def pad_to_length(x: np.ndarray, length: int, mode: str = "zeros") -> np.ndarray
 # Filename parsers
 # ----------------------------
 def parse_single_filename(stem: str) -> Tuple[str, int]:
-    """
-    Accept:
-      - F4_5 -> (F4, 5)
-      - E2_0 -> (E2, 0)
-      - A#3  -> (A#3, -1) (string unknown)
-    """
     if "_" in stem:
         m = re.match(r'^(.+?)_(\d+)$', stem)
         if not m:
@@ -507,15 +397,11 @@ def parse_single_filename(stem: str) -> Tuple[str, int]:
         pitch = normalize_pitch_str(m.group(1))
         string_idx = int(m.group(2))
         return pitch, string_idx
-
     pitch = normalize_pitch_str(stem)
     return pitch, -1
 
 
 def parse_scale_filename(stem: str) -> Tuple[str, str]:
-    """
-    Example: A2-A4.wav (inclusive chromatic range)
-    """
     m = re.match(r'^(.+?)-(.+?)$', stem)
     if not m:
         raise ValueError(f"Scale filename must be like A2-A4.wav, got: {stem}")
@@ -525,11 +411,6 @@ def parse_scale_filename(stem: str) -> Tuple[str, str]:
 
 
 def normalize_chord_stem(stem: str) -> str:
-    """
-    Your chord filenames use comma separators and sometimes '.' instead of ','.
-    Also supports '-' as separator.
-    Fixes '$' -> '#'.
-    """
     s = stem.strip()
     s = s.replace("$", "#")
     s = s.replace('-', ',')
@@ -541,14 +422,6 @@ def normalize_chord_stem(stem: str) -> str:
 
 
 def parse_chord_filename(stem: str) -> Dict[int, Optional[str]]:
-    """
-    Accepts tokens separated by comma/dash/dot.
-    Token formats:
-      - Pitch_StringNumber, e.g. A3_1
-      - 0_StringNumber, e.g. 0_3
-      - Pitch (no underscore) => assume string 0
-      - 0 (no underscore) => no note on string 0
-    """
     stem = normalize_chord_stem(stem)
     tokens = [t.strip() for t in stem.split(',') if t.strip()]
 
@@ -556,11 +429,7 @@ def parse_chord_filename(stem: str) -> Dict[int, Optional[str]]:
     for t in tokens:
         if "_" in t:
             left, right = t.split("_", 1)
-            try:
-                sidx = int(right)
-            except:
-                raise ValueError(f"Bad chord token (string idx): {t}")
-
+            sidx = int(right)
             if left == "0":
                 string_map[sidx] = None
             else:
@@ -570,7 +439,6 @@ def parse_chord_filename(stem: str) -> Dict[int, Optional[str]]:
                 string_map[0] = None
             else:
                 string_map[0] = normalize_pitch_str(t)
-
     return string_map
 
 
@@ -621,6 +489,13 @@ def build_vocab(collected_midis: List[int]) -> Dict[str, Any]:
             "peak_frac": PICK_PEAK_FRAC,
             "noise_mult": PICK_NOISE_MULT,
         },
+        "negatives": {
+            "enabled": False,
+            "neg_per_pos": 0,
+            "neg_min_silence_ms": 0.0,
+            "neg_pad_mode": "zeros",
+            "neg_max_total": 0,
+        },
     }
 
 
@@ -640,11 +515,6 @@ def safe_string_map_from_single(sidx: int, midi_note: int) -> Dict[int, int]:
 
 
 def safe_string_map_from_chord(parsed: Dict[int, Optional[str]]) -> Tuple[Dict[int, int], List[int]]:
-    """
-    Returns (string_map_midi, notes_midi_list).
-    Missing strings => -1 (unknown)
-    Explicit None => -1
-    """
     string_map = {i: -1 for i in range(6)}
     notes_midi: List[int] = []
     for sidx in range(6):
@@ -661,10 +531,93 @@ def safe_string_map_from_chord(parsed: Dict[int, Optional[str]]) -> Tuple[Dict[i
     return string_map, notes_midi
 
 
+def maybe_emit_negative(
+    *,
+    mf,
+    audio_out: str,
+    labels_out: str,
+    out_root: str,
+    raw_root: str,
+    sample_idx: int,
+    source_wav_path: str,
+    take_id: str,
+    sr: int,
+    vocab_size: int,
+    sus_end: int,
+    seg_out: np.ndarray,
+    neg_min_silence_ms: float,
+    neg_pad_mode: str,
+    clip_subtype: str,
+    ref_pos_id: str,
+) -> Tuple[int, bool]:
+    """
+    Build one negative clip from the quiet tail after sustain end.
+
+    Returns:
+      (new_sample_idx, wrote)
+    """
+    one_sec = sr
+    min_sil = int((neg_min_silence_ms / 1000.0) * sr)
+
+    sus_end = int(np.clip(sus_end, 0, len(seg_out)))
+    if (len(seg_out) - sus_end) < min_sil:
+        return sample_idx, False
+
+    neg = seg_out[sus_end:sus_end + one_sec].copy()
+    neg = pad_to_length(neg, one_sec, mode=neg_pad_mode)
+
+    out_name = f"sample_{sample_idx:06d}.wav"
+    out_wav = os.path.join(audio_out, out_name)
+    write_wav(out_wav, neg, sr)
+
+    label = {
+        "id": f"{sample_idx:06d}",
+        "type": "neg_segment",
+        "neg_subtype": clip_subtype,
+        "ref_positive_id": ref_pos_id,
+        "source_path": os.path.relpath(source_wav_path, raw_root),
+        "take_id": take_id,
+        "sr": sr,
+        "active_notes_midi": [],
+        "active_notes_pitch": [],
+        "multi_hot": [0] * int(vocab_size),
+        "string_map_midi": {str(k): -1 for k in range(6)},
+        "transient_window_start": 0,
+        "transient_window_end": 0,
+        "sustain_region": [0, 0],
+        "sustain_end_debug": {},
+        "onset_sample": 0,
+        "num_samples": int(one_sec),
+    }
+
+    out_json = os.path.join(labels_out, f"sample_{sample_idx:06d}.json")
+    with open(out_json, "w") as f:
+        json.dump(label, f, indent=2)
+
+    mf.write(json.dumps({
+        "id": label["id"],
+        "audio": os.path.relpath(out_wav, out_root),
+        "label": os.path.relpath(out_json, out_root),
+        "type": "neg_segment",
+    }) + "\n")
+
+    return sample_idx + 1, True
+
+
 # ----------------------------
 # Main build
 # ----------------------------
-def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
+def build_dataset(
+    raw_root: str,
+    out_root: str,
+    sr: int = DEFAULT_SR,
+    *,
+    add_negatives: bool = False,
+    neg_per_pos: int = 1,
+    neg_min_silence_ms: float = 150.0,
+    neg_pad_mode: str = "zeros",
+    neg_max_total: int = 100,
+):
     audio_out = os.path.join(out_root, "audio")
     labels_out = os.path.join(out_root, "labels")
     ensure_dir(audio_out)
@@ -705,7 +658,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 discovered.append((wav_path, "chord"))
 
             else:
-                # best-effort fallback classification
                 if NOTE_RE.match(stem) or re.search(r'_[0-5]$', stem):
                     pitch, _ = parse_single_filename(stem)
                     all_midis.append(pitch_to_midi(pitch))
@@ -732,18 +684,25 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
     if not all_midis:
         raise RuntimeError("No parsable notes found. Check folder structure/filenames.")
 
-    # Write metadata/vocab
     meta = build_vocab(all_midis)
     midi_to_index = {int(k): int(v) for k, v in meta["midi_to_index"].items()}
     vocab_size = len(meta["midi_vocab"])
+
+    meta["negatives"]["enabled"] = bool(add_negatives)
+    meta["negatives"]["neg_per_pos"] = int(neg_per_pos)
+    meta["negatives"]["neg_min_silence_ms"] = float(neg_min_silence_ms)
+    meta["negatives"]["neg_pad_mode"] = str(neg_pad_mode)
+    meta["negatives"]["neg_max_total"] = int(neg_max_total)
 
     ensure_dir(out_root)
     with open(os.path.join(out_root, "metadata.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    # Pass 2: generate samples
     manifest_path = os.path.join(out_root, "manifest.jsonl")
     sample_idx = 0
+
+    neg_written = 0
+    neg_max_total = int(max(0, neg_max_total))
 
     with open(manifest_path, "w") as mf:
         for wav_path, rel_type in discovered:
@@ -844,7 +803,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 sample_idx += 1
 
             elif rel_type == "scale":
-                # --- Fixed 1-second segmentation, but each segment is shifted using detected pick near expected beat ---
                 y, _sr = read_audio_mono(wav_path, sr)
                 start_pitch, end_pitch = parse_scale_filename(stem)
                 start_midi = pitch_to_midi(start_pitch)
@@ -867,7 +825,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                 if len(picks) < n_notes:
                     print(f"[WARN] Scale file ended early or missing notes; found {len(picks)}/{n_notes}: {wav_path}")
 
-                # Enforce monotonic increasing picks (avoid weird regressions)
                 for i in range(1, len(picks)):
                     if picks[i] <= picks[i - 1] + int(0.05 * sr):
                         picks[i] = min(len(y) - 1, picks[i - 1] + int(0.05 * sr))
@@ -879,7 +836,6 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     clip_start = pick - pre
                     clip_end = clip_start + one_sec
 
-                    # guard against next pick leakage
                     if i + 1 < len(picks):
                         latest_end = picks[i + 1] - guard
                         if clip_end > latest_end:
@@ -898,12 +854,14 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
                     sus_end = min(sus_end, len(seg_out))
 
+                    # POS
+                    pos_id = f"{sample_idx:06d}"
                     out_name = f"sample_{sample_idx:06d}.wav"
                     out_wav = os.path.join(audio_out, out_name)
                     write_wav(out_wav, seg_out, sr)
 
                     label = {
-                        "id": f"{sample_idx:06d}",
+                        "id": pos_id,
                         "type": "scale_segment",
                         "source_path": os.path.relpath(wav_path, raw_root),
                         "take_id": take_id,
@@ -934,8 +892,33 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     }) + "\n")
                     sample_idx += 1
 
+                    # NEG(s) with global cap
+                    if add_negatives and (neg_written < neg_max_total):
+                        for _ in range(max(1, int(neg_per_pos))):
+                            if neg_written >= neg_max_total:
+                                break
+                            sample_idx, wrote = maybe_emit_negative(
+                                mf=mf,
+                                audio_out=audio_out,
+                                labels_out=labels_out,
+                                out_root=out_root,
+                                raw_root=raw_root,
+                                sample_idx=sample_idx,
+                                source_wav_path=wav_path,
+                                take_id=take_id,
+                                sr=sr,
+                                vocab_size=vocab_size,
+                                sus_end=sus_end,
+                                seg_out=seg_out,
+                                neg_min_silence_ms=neg_min_silence_ms,
+                                neg_pad_mode=neg_pad_mode,
+                                clip_subtype="scale_segment",
+                                ref_pos_id=pos_id,
+                            )
+                            if wrote:
+                                neg_written += 1
+
             elif rel_type == "note":
-                # --- Repeated single note @ 60 BPM: 1 second intro silence, then 1 note per second ---
                 y, _sr = read_audio_mono(wav_path, sr)
                 pitch, sidx = parse_single_filename(stem)
                 midi_note = int(pitch_to_midi(pitch))
@@ -994,12 +977,14 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
                     sus_end = min(sus_end, len(seg_out))
 
+                    # POS
+                    pos_id = f"{sample_idx:06d}"
                     out_name = f"sample_{sample_idx:06d}.wav"
                     out_wav = os.path.join(audio_out, out_name)
                     write_wav(out_wav, seg_out, sr)
 
                     label = {
-                        "id": f"{sample_idx:06d}",
+                        "id": pos_id,
                         "type": "note_repeat_segment",
                         "source_path": os.path.relpath(wav_path, raw_root),
                         "take_id": take_id,
@@ -1030,12 +1015,42 @@ def build_dataset(raw_root: str, out_root: str, sr: int = DEFAULT_SR):
                     }) + "\n")
                     sample_idx += 1
 
+                    # NEG(s) with global cap
+                    if add_negatives and (neg_written < neg_max_total):
+                        for _ in range(max(1, int(neg_per_pos))):
+                            if neg_written >= neg_max_total:
+                                break
+                            sample_idx, wrote = maybe_emit_negative(
+                                mf=mf,
+                                audio_out=audio_out,
+                                labels_out=labels_out,
+                                out_root=out_root,
+                                raw_root=raw_root,
+                                sample_idx=sample_idx,
+                                source_wav_path=wav_path,
+                                take_id=take_id,
+                                sr=sr,
+                                vocab_size=vocab_size,
+                                sus_end=sus_end,
+                                seg_out=seg_out,
+                                neg_min_silence_ms=neg_min_silence_ms,
+                                neg_pad_mode=neg_pad_mode,
+                                clip_subtype="note_repeat_segment",
+                                ref_pos_id=pos_id,
+                            )
+                            if wrote:
+                                neg_written += 1
+
             else:
                 continue
 
     print(f"Done. Wrote {sample_idx} samples to: {out_root}")
     print(f"- metadata: {os.path.join(out_root, 'metadata.json')}")
     print(f"- manifest: {manifest_path}")
+    if add_negatives:
+        print(f"- negatives_written: {neg_written}/{neg_max_total}")
+    else:
+        print(f"- negatives_written: 0")
 
 
 def main():
@@ -1043,8 +1058,30 @@ def main():
     ap.add_argument("--raw", type=str, default="raw", help="Path to raw/ directory")
     ap.add_argument("--out", type=str, default="dataset", help="Output dataset directory")
     ap.add_argument("--sr", type=int, default=DEFAULT_SR, help="Target sample rate (Daisy Seed = 48000)")
+
+    # Negatives
+    ap.add_argument("--add_negatives", action="store_true",
+                    help="Generate negative (no-sound) samples from quiet tails after sustain end.")
+    ap.add_argument("--neg_per_pos", type=int, default=1,
+                    help="How many negatives to try per positive segment (scale/note).")
+    ap.add_argument("--neg_min_silence_ms", type=float, default=150.0,
+                    help="Require at least this much silence after sustain_end to generate a negative.")
+    ap.add_argument("--neg_pad_mode", type=str, default="zeros", choices=["zeros", "edge"],
+                    help="Padding mode for negative clips.")
+    ap.add_argument("--neg_max_total", type=int, default=100,
+                    help="Global cap on total negatives to generate (prevents imbalance).")
+
     args = ap.parse_args()
-    build_dataset(args.raw, args.out, sr=args.sr)
+    build_dataset(
+        args.raw,
+        args.out,
+        sr=args.sr,
+        add_negatives=args.add_negatives,
+        neg_per_pos=args.neg_per_pos,
+        neg_min_silence_ms=args.neg_min_silence_ms,
+        neg_pad_mode=args.neg_pad_mode,
+        neg_max_total=args.neg_max_total,
+    )
 
 
 if __name__ == "__main__":
