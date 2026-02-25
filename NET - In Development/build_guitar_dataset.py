@@ -10,6 +10,38 @@ Key improvement (THIS VERSION):
 
 Command:
     python build_guitar_dataset.py --raw_root /path/to/raw_recordings --out_root /path/to/output_dataset
+
+Better command for early training:
+python train_twohead_guitar.py \
+  --dataset labels \
+  --out stage1_pick_focused \
+  --epochs 80 \
+  --width 96 \
+  \
+  --p_on 1.0 --p_neg 0.0 \
+  --val_p_on 1.0 --val_p_neg 0.0 \
+  \
+  --scheduler step --step_size 25 --step_gamma 0.5 \
+  --curriculum_epochs 15 \
+  \
+  --calm_noise_std 0.0 \
+  --calm_enable_polarity 0 \
+  --calm_gain_min -4 --calm_gain_max 2 \
+  \
+  --full_noise_std 0.0005 \
+  --full_enable_polarity 0 \
+  --full_gain_min -12 --full_gain_max 3 \
+  \
+  --preemph_coef 0.0 \
+  \
+  --train_ms 15 --crop_ms 10 --crop_prob 1.0 \
+  --val_ms 15 --val_crop_ms 10 --val_crop_prob 1.0 \
+  \
+  --onset_pos_min 0.15 \
+  --onset_pos_max 0.30 \
+  --crop_keep_onset_prob 1.0 \
+  \
+  --viz --viz_every 10 --viz_weight_every 10 --viz_pulse_speed 0.5
 """
 
 import os
