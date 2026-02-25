@@ -6,21 +6,12 @@ Creates a transient-triggered + sustain-labeled dataset for low-latency polyphon
 Key improvement (THIS VERSION):
 - For scale/note-repeat (60 BPM grid with human drift), we now detect the PICK
   as the *earliest strong positive-going transient*, not the max-energy transient.
-  This prevents selecting the "mute" transient near the end of the 1-second slot.
 
 NEW (negatives):
-- Optionally generates NEGATIVE samples ("no sound being played") from the quiet tail
-  *after the estimated sustain end* inside each 1-second scale/note-repeat segment.
-- Supports a GLOBAL CAP on total negatives to avoid dataset imbalance.
-
-Examples:
-    python build_guitar_dataset.py --raw raw --out dataset
-
-With negatives (cap at 100 total):
-    python build_guitar_dataset.py --raw raw --out dataset --add_negatives --neg_max_total 100
-
-More negatives per positive (still capped globally):
-    python build_guitar_dataset.py --raw raw --out dataset --add_negatives --neg_per_pos 2 --neg_max_total 100
+- Generates NEGATIVE samples ("no sound being played") from the quiet tail
+  AFTER sustain end, but (IMPORTANT) we now SEARCH for a truly quiet region
+  instead of blindly slicing at sus_end (sus_end can be early on guitar decay).
+- Global cap on negatives to prevent imbalance (e.g. 100).
 """
 
 import os
@@ -51,6 +42,13 @@ SUS_MIN_SUSTAIN_MS = 120
 SUS_HANGOVER_MS = 60
 SUS_NOISE_PAD_DB = 6.0
 SUS_REL_DROP_DB = 35.0
+
+# ----------------------------
+# NEW: stricter silence detection for NEGATIVE slicing
+# ----------------------------
+NEG_SILENCE_NOISE_PAD_DB = 2.0     # closer to noise floor = stricter
+NEG_SILENCE_REL_DROP_DB = 45.0     # require larger drop from peak = stricter
+NEG_SILENCE_HANGOVER_MS = 120.0    # must stay quiet longer for negatives
 
 # Scale fixed-1s segmentation with drift compensation
 SCALE_FIRST_SILENCE_SEC = 1.0
@@ -320,6 +318,74 @@ def estimate_sustain_end(y: np.ndarray, sr: int, transient_end: int) -> Tuple[in
 
 
 # ----------------------------
+# NEW: Find truly quiet start for negatives
+# ----------------------------
+def find_quiet_start_for_negative(
+    y: np.ndarray,
+    sr: int,
+    search_from_samp: int,
+    min_quiet_ms: float,
+    *,
+    hop: int = SUS_HOP,
+    frame: int = SUS_FRAME,
+    noise_pad_db: float = NEG_SILENCE_NOISE_PAD_DB,
+    rel_drop_db: float = NEG_SILENCE_REL_DROP_DB,
+    hangover_ms: float = NEG_SILENCE_HANGOVER_MS,
+) -> Optional[int]:
+    """
+    Returns the first sample index >= search_from_samp where the RMS stays below a
+    STRICT silence threshold for at least min_quiet_ms (and with hangover).
+    If no such region exists, returns None.
+    """
+    if len(y) < frame + hop:
+        return None
+
+    env = _rms_env(y, frame=frame, hop=hop)
+    env_db = _to_db(env)
+
+    start_frame = int(np.clip(search_from_samp // hop, 0, len(env_db) - 1))
+
+    hang_frames = max(1, int((hangover_ms / 1000.0) * sr / hop))
+    quiet_frames = max(1, int((min_quiet_ms / 1000.0) * sr / hop))
+
+    # Peak after start_frame (local peak)
+    peak_db = float(np.max(env_db[start_frame:])) if start_frame < len(env_db) else float(env_db[-1])
+
+    # Noise floor from tail median
+    tail_len_s = 0.4
+    tail_frames = int((tail_len_s * sr) / hop)
+    tail_frames = min(tail_frames, max(10, int(0.15 * len(env_db))))
+    tail_start = max(0, len(env_db) - tail_frames)
+    noise_db = float(np.median(env_db[tail_start:])) if len(env_db) else -120.0
+
+    # STRICT threshold: take the LOWER of the two (harder to be "below")
+    thr_abs_db = noise_db + float(noise_pad_db)
+    thr_rel_db = peak_db - float(rel_drop_db)
+    thr_db = min(thr_abs_db, thr_rel_db)
+
+    below = env_db < thr_db
+
+    # We want a contiguous run of "below" that lasts at least quiet_frames,
+    # and also satisfies hangover (basically a second guard).
+    need = max(quiet_frames, hang_frames)
+
+    for f in range(start_frame, len(env_db) - need):
+        if np.all(below[f:f + need]):
+            return int(f * hop)
+
+    return None
+
+
+def pad_to_length(x: np.ndarray, length: int, mode: str = "zeros") -> np.ndarray:
+    if len(x) >= length:
+        return x[:length]
+    pad = length - len(x)
+    if mode == "edge" and len(x) > 0:
+        return np.pad(x, (0, pad), mode="edge")
+    return np.pad(x, (0, pad), mode="constant", constant_values=0.0)
+
+
+# ----------------------------
 # Drift-compensated pick detection for scale/note repeat
 # ----------------------------
 def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_samp: int) -> int:
@@ -375,15 +441,6 @@ def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_sa
     fine = int(np.argmax(np.abs(d[r0:r1]))) + r0
 
     return int(start + fine)
-
-
-def pad_to_length(x: np.ndarray, length: int, mode: str = "zeros") -> np.ndarray:
-    if len(x) >= length:
-        return x[:length]
-    pad = length - len(x)
-    if mode == "edge" and len(x) > 0:
-        return np.pad(x, (0, pad), mode="edge")
-    return np.pad(x, (0, pad), mode="constant", constant_values=0.0)
 
 
 # ----------------------------
@@ -465,21 +522,6 @@ def build_vocab(collected_midis: List[int]) -> Dict[str, Any]:
             "noise_pad_db": SUS_NOISE_PAD_DB,
             "rel_drop_db": SUS_REL_DROP_DB,
         },
-        "scale_segmentation": {
-            "slot_sec": SCALE_STEP_SEC,
-            "first_silence_sec": SCALE_FIRST_SILENCE_SEC,
-            "search_half_sec": SCALE_SEARCH_HALF_SEC,
-            "guard_ms": SCALE_GUARD_MS,
-            "pad_mode": SCALE_PAD_MODE,
-        },
-        "note_repeat": {
-            "slot_sec": NOTE_STEP_SEC,
-            "first_silence_sec": NOTE_FIRST_SILENCE_SEC,
-            "search_half_sec": NOTE_SEARCH_HALF_SEC,
-            "guard_ms": NOTE_GUARD_MS,
-            "pad_mode": NOTE_PAD_MODE,
-            "n_reps_default": NOTE_N_REPS_DEFAULT,
-        },
         "pick_detection": {
             "frame": PICK_FRAME,
             "hop": PICK_HOP,
@@ -495,6 +537,9 @@ def build_vocab(collected_midis: List[int]) -> Dict[str, Any]:
             "neg_min_silence_ms": 0.0,
             "neg_pad_mode": "zeros",
             "neg_max_total": 0,
+            "neg_silence_noise_pad_db": NEG_SILENCE_NOISE_PAD_DB,
+            "neg_silence_rel_drop_db": NEG_SILENCE_REL_DROP_DB,
+            "neg_silence_hangover_ms": NEG_SILENCE_HANGOVER_MS,
         },
     }
 
@@ -551,19 +596,44 @@ def maybe_emit_negative(
     ref_pos_id: str,
 ) -> Tuple[int, bool]:
     """
-    Build one negative clip from the quiet tail after sustain end.
+    Build one negative clip from a truly quiet region AFTER sustain end.
 
-    Returns:
-      (new_sample_idx, wrote)
+    IMPORTANT FIX:
+      - We do NOT assume sus_end is silent.
+      - We search forward from sus_end for a contiguous region of quiet lasting
+        neg_min_silence_ms (with stricter thresholds).
     """
-    one_sec = sr
+    one_sec = int(sr)
     min_sil = int((neg_min_silence_ms / 1000.0) * sr)
 
     sus_end = int(np.clip(sus_end, 0, len(seg_out)))
-    if (len(seg_out) - sus_end) < min_sil:
+
+    # If there isn't even enough room to be quiet, bail early
+    if (len(seg_out) - sus_end) < max(1, min_sil):
         return sample_idx, False
 
-    neg = seg_out[sus_end:sus_end + one_sec].copy()
+    quiet_start = find_quiet_start_for_negative(
+        seg_out, sr, search_from_samp=sus_end, min_quiet_ms=neg_min_silence_ms
+    )
+    if quiet_start is None:
+        return sample_idx, False
+
+    quiet_start = int(np.clip(quiet_start, 0, len(seg_out)))
+
+    # extra safety: ensure the first min_sil samples from quiet_start are actually low-energy
+    if min_sil > 0:
+        probe = seg_out[quiet_start:min(len(seg_out), quiet_start + min_sil)]
+        if probe.size < min_sil:
+            return sample_idx, False
+        # quick RMS gate vs tail RMS
+        probe_rms = float(np.sqrt(np.mean(probe * probe) + 1e-12))
+        tail = seg_out[max(0, len(seg_out) - min_sil):]
+        tail_rms = float(np.sqrt(np.mean(tail * tail) + 1e-12)) if tail.size else probe_rms
+        # probe should be close to tail noise; allow small slack
+        if probe_rms > max(1e-6, tail_rms * 1.8):
+            return sample_idx, False
+
+    neg = seg_out[quiet_start:quiet_start + one_sec].copy()
     neg = pad_to_length(neg, one_sec, mode=neg_pad_mode)
 
     out_name = f"sample_{sample_idx:06d}.wav"
@@ -585,7 +655,14 @@ def maybe_emit_negative(
         "transient_window_start": 0,
         "transient_window_end": 0,
         "sustain_region": [0, 0],
-        "sustain_end_debug": {},
+        "sustain_end_debug": {
+            "quiet_start": int(quiet_start),
+            "sus_end_used_as_search_from": int(sus_end),
+            "neg_min_silence_ms": float(neg_min_silence_ms),
+            "neg_silence_noise_pad_db": float(NEG_SILENCE_NOISE_PAD_DB),
+            "neg_silence_rel_drop_db": float(NEG_SILENCE_REL_DROP_DB),
+            "neg_silence_hangover_ms": float(NEG_SILENCE_HANGOVER_MS),
+        },
         "onset_sample": 0,
         "num_samples": int(one_sec),
     }
@@ -1065,7 +1142,7 @@ def main():
     ap.add_argument("--neg_per_pos", type=int, default=1,
                     help="How many negatives to try per positive segment (scale/note).")
     ap.add_argument("--neg_min_silence_ms", type=float, default=150.0,
-                    help="Require at least this much silence after sustain_end to generate a negative.")
+                    help="Require at least this much silence (contiguous) to generate a negative.")
     ap.add_argument("--neg_pad_mode", type=str, default="zeros", choices=["zeros", "edge"],
                     help="Padding mode for negative clips.")
     ap.add_argument("--neg_max_total", type=int, default=100,

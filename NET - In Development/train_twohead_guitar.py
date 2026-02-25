@@ -94,8 +94,11 @@ def label_to_note_name_multi(label_vec: torch.Tensor, meta: Dict[str, Any]) -> s
     names = [pitches[i] if i < len(pitches) else str(i) for i in idxs]
     return ",".join(names)
 
-
 def label_to_note_name_single(class_idx: int, meta: Dict[str, Any]) -> str:
+    neg_idx = int(meta.get("stage1_neg_class_idx", -1))
+    if neg_idx >= 0 and int(class_idx) == neg_idx:
+        return "(none)"
+
     pitches = meta.get("index_to_pitch", None)
     if pitches is None:
         return str(class_idx)
@@ -490,7 +493,9 @@ class LiveNetViz:
             true_str = label_to_note_name_multi(y[0], self.meta)
         else:
             y = int(y_info[:1].detach().cpu().item())
-            true_str = label_to_note_name_single(y, self.meta)
+            # if metadata carries neg idx, use it; otherwise infer V (safe)
+            neg_idx = self.meta.get("stage1_neg_class_idx", None)
+            true_str = label_to_note_name_single(y, self.meta, neg_class_idx=neg_idx)
 
         self._viz_tick += 1
         if (self._viz_tick % self.weight_viz_every) == 0 or not self.edge_base_style:
@@ -530,11 +535,13 @@ def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, A
     for it in manifest:
         audio_abs = os.path.join(dataset_root, it["audio"])
         lab = load_json(os.path.join(dataset_root, it["label"]))
-        mh = lab["multi_hot"]
+
+        mh = lab.get("multi_hot", [0] * vocab_size)
         onset = int(lab.get("onset_sample", 0))
         t_end = int(lab.get("transient_window_end", onset + int(0.005 * sr)))
         n = int(lab.get("num_samples", 0))
         clip_type = lab.get("type", it.get("type", "unknown"))
+
         clips.append(ClipInfo(
             audio_abs=audio_abs,
             multi_hot=mh,
@@ -561,11 +568,6 @@ def train_val_split(clips: List[ClipInfo], val_ratio: float, seed: int):
 class OnsetDataset(Dataset):
     """
     Each sample loads base_W samples, then optionally crops to crop_W before returning.
-
-    NEW:
-      - Returns onset_idx_in_returned_window so the viz can draw the onset marker.
-      - Uses onset anchoring so the base window isn't "tail end".
-      - Can force the crop to include the onset.
 
     Returns: (x, y, onset_idx)
       x: (1, T)
@@ -627,7 +629,20 @@ class OnsetDataset(Dataset):
         self.p_on  = p_on / s
         self.p_neg = p_neg / s
 
-        self.on_candidates = [i for i, c in enumerate(clips) if c.transient_end > c.onset_sample]
+        # Positives: anything that isn't an explicit neg segment and has a transient
+        self.on_candidates = [
+            i for i, c in enumerate(clips)
+            if (c.clip_type != "neg_segment") and (c.transient_end > c.onset_sample)
+        ]
+
+        # Negatives: explicit neg segments from dataset builder
+        self.neg_candidates = [
+            i for i, c in enumerate(clips)
+            if (c.clip_type == "neg_segment")
+        ]
+
+        # For Stage1-with-neg-class, we expect vocab_size == base_vocab+1 and NEG is the last idx
+        self.stage1_neg_class_idx = (self.V - 1) if (not self.stage2) else None
 
         self.audio_cache: Dict[str, np.ndarray] = {}
         self.cache_order: List[str] = []
@@ -695,16 +710,6 @@ class OnsetDataset(Dataset):
         return int(arr.argmax())
 
     def _maybe_crop(self, x: np.ndarray, onset_offset_in_base: Optional[int], is_pos: bool) -> Tuple[np.ndarray, int]:
-        """
-        Crop base window to crop_W.
-
-        Returns:
-          x_out, crop_start
-        crop_start = 0 when not cropped.
-
-        If is_pos and onset_offset_in_base is provided, we can force the crop to contain onset
-        with probability crop_keep_onset_prob.
-        """
         if self.crop_W >= self.base_W:
             return x, 0
         if random.random() > self.crop_prob:
@@ -715,8 +720,8 @@ class OnsetDataset(Dataset):
         if is_pos and (onset_offset_in_base is not None) and (random.random() < self.crop_keep_onset_prob):
             sr = int(self.clips[0].sr) if self.clips else 48000
 
-            target = int(round(0.001 * sr))      # 1.0 ms into the crop
-            jitter = int(round(0.00025 * sr))    # +/- 0.25 ms jitter
+            target = int(round((self.crop_onset_target_ms / 1000.0) * sr))
+            jitter = int(round((self.crop_onset_jitter_ms / 1000.0) * sr))
 
             j = random.randint(-jitter, jitter) if jitter > 0 else 0
             target = int(np.clip(target + j, 0, self.crop_W - 1))
@@ -760,22 +765,34 @@ class OnsetDataset(Dataset):
             is_pos = True
 
         else:
-            # NEGATIVE: silence before transient or after tail
-            ci = self.clips[random.randrange(len(self.clips))]
-            y  = self._load(ci.audio_abs, ci.sr)
+            # NEGATIVE: prefer explicit neg_segment clips if they exist
+            if self.neg_candidates:
+                ci = self.clips[random.choice(self.neg_candidates)]
+                y  = self._load(ci.audio_abs, ci.sr)
 
-            max_start = max(0, ci.num_samples - self.base_W)
-            pre_end = max(0, ci.onset_sample - self.base_W)
+                max_start = max(0, ci.num_samples - self.base_W)
+                start = random.randint(0, max_start) if max_start > 0 else 0
 
-            if pre_end > 0:
-                start = random.randint(0, pre_end)
+                x = y[start: start + self.base_W]
+                if len(x) < self.base_W:
+                    x = np.pad(x, (0, self.base_W - len(x)))
             else:
-                start = max(0, max_start - random.randint(0, min(max_start, int(0.1 * ci.sr))))
+                # Fallback: old behavior (pre-onset region from random clip)
+                ci = self.clips[random.randrange(len(self.clips))]
+                y  = self._load(ci.audio_abs, ci.sr)
 
-            start = int(np.clip(start, 0, max_start))
-            x = y[start: start + self.base_W]
-            if len(x) < self.base_W:
-                x = np.pad(x, (0, self.base_W - len(x)))
+                max_start = max(0, ci.num_samples - self.base_W)
+                pre_end = max(0, ci.onset_sample - self.base_W)
+
+                if pre_end > 0:
+                    start = random.randint(0, pre_end)
+                else:
+                    start = max(0, max_start - random.randint(0, min(max_start, int(0.1 * ci.sr))))
+
+                start = int(np.clip(start, 0, max_start))
+                x = y[start: start + self.base_W]
+                if len(x) < self.base_W:
+                    x = np.pad(x, (0, self.base_W - len(x)))
 
             onset_offset_in_base = None
             is_pos = False
@@ -783,8 +800,8 @@ class OnsetDataset(Dataset):
             if self.stage2:
                 label = np.zeros(self.V, dtype=np.float32)
             else:
-                # Stage1 should generally use p_neg=0; if you include negatives anyway, this is a placeholder
-                label = 0
+                # Stage1: NEG is a real class (last index) *if your model/dataset vocab includes it*
+                label = int(self.stage1_neg_class_idx) if self.stage1_neg_class_idx is not None else 0
 
         # Augment base window -> crop (onset-aware) -> normalize what net sees
         x = x.astype(np.float32)
@@ -792,7 +809,7 @@ class OnsetDataset(Dataset):
 
         x, crop_start = self._maybe_crop(x, onset_offset_in_base=onset_offset_in_base, is_pos=is_pos)
 
-        # Compute onset index inside the RETURNED window (after crop), for visualization
+        # Compute onset index inside the RETURNED window (after crop)
         onset_in_return = -1
         if is_pos and onset_offset_in_base is not None:
             onset_in_return = int(onset_offset_in_base - crop_start)
@@ -811,8 +828,6 @@ class OnsetDataset(Dataset):
             y_t = torch.tensor(label, dtype=torch.long)
 
         return x_t, y_t, int(onset_in_return)
-
-
 # ----------------------------
 # Model
 # ----------------------------
@@ -1016,7 +1031,8 @@ def train(args):
         f"val_ms={args.val_ms:g} (base={val_base_W}) val_crop_ms={args.val_crop_ms:g} (crop={val_crop_W}) val_crop_prob={args.val_crop_prob:g} "
         f"export_ms={args.export_ms:g} (exportW={export_W})"
     )
-
+    
+    base_vocab_size = vocab_size
     stage2 = bool(args.stage2)
 
     if not args.include_chords:
@@ -1028,12 +1044,23 @@ def train(args):
     train_clips, val_clips = train_val_split(clips, args.val_ratio, args.seed)
     print(f"[INFO] train={len(train_clips)} val={len(val_clips)}")
 
-    model = OnsetNet(vocab_size=vocab_size, width=args.width).to(device)
-    print(f"[INFO] params={model.count_params():,} width={args.width}")
+    # Stage1 can optionally add an extra class for negatives
+    stage1_vocab_size = base_vocab_size + (1 if (not stage2 and args.stage1_neg_class) else 0)
+    neg_class_idx = (base_vocab_size if stage1_vocab_size != base_vocab_size else None)
+
+    # stash into meta so viz can print "(none)"
+    meta = dict(meta)
+    meta["stage1_vocab_size"] = int(stage1_vocab_size)
+    meta["stage1_neg_class_idx"] = int(neg_class_idx) if neg_class_idx is not None else -1
+
+    # Model output size
+    model_vocab = (stage1_vocab_size if not stage2 else base_vocab_size)
+    model = OnsetNet(vocab_size=model_vocab, width=args.width).to(device)
+    print(f"[INFO] params={model.count_params():,} width={args.width} model_vocab={model_vocab} neg_class_idx={neg_class_idx}")
 
     # Loss
     if stage2:
-        pw = torch.full((vocab_size,), float(args.pos_weight), device=device)
+        pw = torch.full((base_vocab_size,), float(args.pos_weight), device=device)
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
     else:
         loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -1060,12 +1087,14 @@ def train(args):
                 loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     # Datasets
+    ds_vocab = (stage1_vocab_size if (not stage2) else base_vocab_size)
+
     train_ds = OnsetDataset(
         train_clips,
         base_W=train_base_W,
         crop_W=train_crop_W,
         crop_prob=args.crop_prob,
-        vocab_size=vocab_size,
+        vocab_size=ds_vocab,
         stage2=stage2,
         p_on=args.p_on, p_neg=args.p_neg,
         virtual_len=args.virtual_len,
@@ -1088,7 +1117,7 @@ def train(args):
         base_W=val_base_W,
         crop_W=val_crop_W,
         crop_prob=args.val_crop_prob,
-        vocab_size=vocab_size,
+        vocab_size=ds_vocab,
         stage2=stage2,
         p_on=args.val_p_on, p_neg=args.val_p_neg,
         virtual_len=max(10000, args.virtual_len // 10),
@@ -1387,6 +1416,9 @@ def main():
     ap.add_argument("--viz_out_nodes", type=int, default=56)
     ap.add_argument("--viz_weight_every", type=int, default=10)
     ap.add_argument("--viz_pulse_speed", type=float, default=0.5)
+
+    ap.add_argument("--stage1_neg_class", action="store_true",
+                help="Stage1 only: add an extra softmax class for negatives (no-note).")
 
     args = ap.parse_args()
 
