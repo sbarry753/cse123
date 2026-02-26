@@ -1,35 +1,33 @@
 """
 train_twohead_guitar.py
 
-Stage 1 (default): single-note transient classification
-  - Loss: Softmax Cross Entropy (nn.CrossEntropyLoss)
-  - Label: single class index (0..V-1) derived from multi_hot argmax
-  - Metrics: top1 / top3 / mean_true_p
+Stage 1 (default): single-note transient classification (+ optional neg class)
+  - Note head loss: Softmax Cross Entropy (nn.CrossEntropyLoss)
+  - Note label: single class index (0..V-1) derived from multi_hot argmax
+  - Optional neg class: --stage1_neg_class adds 1 extra class at end
+
+NEW (Stage 1): string classification head (6-way)
+  - String head loss: Softmax Cross Entropy, IGNORE_INDEX = -1
+  - String label: 0..5 for known single/note_repeat clips, -1 otherwise
+  - Total loss: note_loss + --string_loss_w * string_loss
 
 Stage 2 (--stage2): multi-label (single + chords)
-  - Loss: BCEWithLogitsLoss
-  - Label: multi-hot (V,)
-  - Metrics: best-F1 over threshold sweep + fixed-thresh F1
+  - Note head loss: BCEWithLogitsLoss on note head
+  - String head is still computed but not trained (string loss = 0)
 
 Visualizer:
   - Wiring-style network diagram with animated pulse path (inputs -> conv layers -> outputs)
-  - Shows current input waveform (10–15ms) and top predictions
-  - NOW draws a vertical line showing the onset sample index inside the *returned* window
-  - Also prints the current true input note string
+  - Shows current input waveform and top note predictions
+  - Draws onset line if known
 
 Context windowing:
-  - base window length: --train_ms / --val_ms (e.g. 15ms = 720 samples @ 48k)
-  - optional cropping to inference window: --crop_ms / --val_crop_ms (e.g. 10ms = 480 samples)
-  - crop probability: --crop_prob / --val_crop_prob
-  - onset anchoring inside base window: --onset_pos_min / --onset_pos_max
-  - forcing crop to include onset: --crop_keep_onset_prob
+  - base window length: --train_ms / --val_ms
+  - optional cropping: --crop_ms / --val_crop_ms
+  - onset anchoring for positives and onset-aware crop
 
 IMPORTANT:
-  - Dataset returns (x, y, onset_idx_in_returned_window)
-  - DataLoader uses a padding collate_fn so mixed 480/720 batches stack fine
-
-COMMAND: 
-    python train_twohead_guitar.py   --dataset labels   --out stage1_ce   --epochs 80   --width 64   --p_on 1.0 --p_neg 0.0   --val_p_on 1.0 --val_p_neg 0.0   --scheduler step --step_size 25 --step_gamma 0.5   --curriculum_epochs 15   --calm_noise_std 0.0 --calm_enable_polarity 0 --calm_gain_min -4 --calm_gain_max 2   --full_noise_std 0.0005 --full_enable_polarity 1 --full_gain_min -18 --full_gain_max 6   --train_ms 15 --crop_ms 10 --crop_prob 1.0   --val_ms 15 --val_crop_ms 10 --val_crop_prob 1.0   --crop_keep_onset_prob 1.0   --viz --viz_every 10 --viz_weight_every 10 --viz_pulse_speed 0.5 
+  - Dataset returns (x, y_note, y_string, onset_idx_in_returned_window)
+  - DataLoader uses a padding collate_fn so mixed lengths stack fine
 """
 
 import os
@@ -38,7 +36,7 @@ import time
 import random
 import argparse
 from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple, Optional, Union
+from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
 import soundfile as sf
@@ -48,11 +46,12 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
 
-
 # ----------------------------
 # Constants
 # ----------------------------
 DEFAULT_INFER_MS = 10.0  # Daisy target (10ms @ 48kHz = 480 samples)
+STRING_IGNORE_INDEX = -1
+N_STRINGS = 6
 
 
 # ----------------------------
@@ -94,11 +93,12 @@ def label_to_note_name_multi(label_vec: torch.Tensor, meta: Dict[str, Any]) -> s
     names = [pitches[i] if i < len(pitches) else str(i) for i in idxs]
     return ",".join(names)
 
-def label_to_note_name_single(class_idx: int, meta: Dict[str, Any]) -> str:
-    neg_idx = int(meta.get("stage1_neg_class_idx", -1))
-    if neg_idx >= 0 and int(class_idx) == neg_idx:
-        return "(none)"
 
+def label_to_note_name_single(class_idx: int, meta: Dict[str, Any], neg_class_idx: Optional[int] = None) -> str:
+    if neg_class_idx is None:
+        neg_class_idx = int(meta.get("stage1_neg_class_idx", -1))
+    if neg_class_idx is not None and int(neg_class_idx) >= 0 and int(class_idx) == int(neg_class_idx):
+        return "(none)"
     pitches = meta.get("index_to_pitch", None)
     if pitches is None:
         return str(class_idx)
@@ -115,8 +115,8 @@ def f1_scores_from_logits(logits: torch.Tensor, targets: torch.Tensor, thresh: f
     fp = (preds * (1.0 - targets)).sum().item()
     fn = ((1.0 - preds) * targets).sum().item()
     prec = tp / (tp + fp + eps)
-    rec  = tp / (tp + fn + eps)
-    f1   = 2.0 * prec * rec / (prec + rec + eps)
+    rec = tp / (tp + fn + eps)
+    f1 = 2.0 * prec * rec / (prec + rec + eps)
     return float(prec), float(rec), float(f1)
 
 
@@ -142,17 +142,19 @@ def pad_collate_1d_with_onset(batch):
     """
     Pads variable-length audio tensors in a batch to the max length.
 
-    Each item: (x, y, onset_idx)
+    Each item: (x, y_note, y_string, onset_idx)
       x: (1, T) float tensor
-      y: stage1 -> scalar long tensor, stage2 -> (V,) float tensor
-      onset_idx: int (index in returned x), -1 if unknown/neg
+      y_note: stage1 -> scalar long tensor, stage2 -> (V,) float tensor
+      y_string: (B,) long tensor with 0..5 or -1 ignore
+      onset_idx: int, -1 if unknown/neg
 
     Returns:
       x_padded: (B, 1, Tmax)
-      y_stacked: (B,) or (B, V)
-      onset_idx: (B,) long tensor (still refers to *pre-pad* indices; padding is only appended)
+      y_note:   (B,) or (B, V)
+      y_string: (B,)
+      onset_idx:(B,)
     """
-    xs, ys, ons = zip(*batch)
+    xs, y_notes, y_strings, ons = zip(*batch)
     max_T = max(int(x.shape[-1]) for x in xs)
 
     x_out = []
@@ -164,9 +166,10 @@ def pad_collate_1d_with_onset(batch):
         x_out.append(x)
     x_out = torch.stack(x_out, dim=0)
 
-    y_out = torch.stack(ys, dim=0)
+    y_note_out = torch.stack(y_notes, dim=0)
+    y_string_out = torch.stack(y_strings, dim=0)
     on_out = torch.tensor(ons, dtype=torch.long)
-    return x_out, y_out, on_out
+    return x_out, y_note_out, y_string_out, on_out
 
 
 # ----------------------------
@@ -179,10 +182,8 @@ from matplotlib.lines import Line2D
 
 class LiveNetViz:
     """
-    Wiring-diagram style visualizer; works for both CE stage and BCE stage.
-
-    NEW:
-      - Draws a vertical onset line in the waveform plot using onset_idx provided by dataset.
+    Wiring-diagram style visualizer; shows NOTE head predictions.
+    Draws onset line in waveform if onset_idx is known.
     """
     def __init__(
         self,
@@ -208,13 +209,13 @@ class LiveNetViz:
         self.conv0 = model.conv[0]
         self.conv1 = model.conv[3]
         self.conv2 = model.conv[6]
-        self.head  = model.head
+        self.note_head = model.note_head
 
         self.n_in = 8
         self.n_c0 = int(self.conv0.out_channels)
         self.n_c1 = int(self.conv1.out_channels)
         self.n_c2 = int(self.conv2.out_channels)
-        self.n_out_full = int(self.head.out_features)
+        self.n_out_full = int(self.note_head.out_features)
         self.n_out = min(out_nodes_cap, self.n_out_full)
 
         self.act_c0 = None
@@ -230,7 +231,7 @@ class LiveNetViz:
         self.fig = plt.figure(figsize=(14, 6), facecolor="black")
         gs = self.fig.add_gridspec(2, 2, width_ratios=[2.2, 1.0], height_ratios=[1, 1])
 
-        self.ax_net  = self.fig.add_subplot(gs[:, 0])
+        self.ax_net = self.fig.add_subplot(gs[:, 0])
         self.ax_wave = self.fig.add_subplot(gs[0, 1])
         self.ax_pred = self.fig.add_subplot(gs[1, 1])
 
@@ -269,7 +270,7 @@ class LiveNetViz:
         cols = [("in", self.n_in), ("c0", self.n_c0), ("c1", self.n_c1), ("c2", self.n_c2), ("out", self.n_out)]
         xs = [0.05, 0.30, 0.52, 0.74, 0.95]
         for (name, n), x in zip(cols, xs):
-            ys = [0.5] if n <= 1 else list(reversed([0.1 + 0.8 * (i/(n-1)) for i in range(n)]))
+            ys = [0.5] if n <= 1 else list(reversed([0.1 + 0.8 * (i / (n - 1)) for i in range(n)]))
             for i, y in enumerate(ys):
                 pos[(name, i)] = (x, y)
         return pos
@@ -312,7 +313,7 @@ class LiveNetViz:
         w0 = self.conv0.weight.detach().float().mean(dim=2).squeeze(1)  # (C0,)
         w1 = self.conv1.weight.detach().float().mean(dim=2)             # (C1,C0)
         w2 = self.conv2.weight.detach().float().mean(dim=2)             # (C2,C1)
-        wh = self.head.weight.detach().float()[: self.n_out]            # (n_out,C2)
+        wh = self.note_head.weight.detach().float()[: self.n_out]        # (n_out,C2)
         return w0, w1, w2, wh
 
     def _get_act_vecs(self):
@@ -324,6 +325,7 @@ class LiveNetViz:
 
     def _update_nodes_glow(self):
         a0, a1, a2 = self._get_act_vecs()
+
         def set_glow(layer, mags):
             if mags is None:
                 return
@@ -333,16 +335,20 @@ class LiveNetViz:
                 if key in self.node_artists:
                     g = float(mags[i].item())
                     self.node_artists[key].set_facecolor((0.10, 0.60, 0.10, 0.06 + 0.55 * g))
+
         set_glow("c0", a0)
         set_glow("c1", a1)
         set_glow("c2", a2)
 
     def _update_edges_weights(self):
         w0, w1, w2, wh = self._get_weight_mats()
+
         def norm_abs(x):
             x = x.abs()
             return x / (x.max().clamp(min=1e-6))
+
         w0n, w1n, w2n, whn = norm_abs(w0.cpu()), norm_abs(w1.cpu()), norm_abs(w2.cpu()), norm_abs(wh.cpu())
+
         for a, b, ka, kb, line in self.edge_artists:
             ia, ib = ka[1], kb[1]
             if a == "in" and b == "c0":
@@ -370,14 +376,14 @@ class LiveNetViz:
         energies = np.array([float(np.mean(s * s)) if s.size else 0.0 for s in segs], dtype=np.float32)
         return int(np.argmax(energies))
 
-    def _choose_path(self, x_1: torch.Tensor, logits_1: torch.Tensor) -> Dict[str, int]:
+    def _choose_path(self, x_1: torch.Tensor, note_logits_1: torch.Tensor) -> Dict[str, int]:
         x_np = x_1.detach().float().cpu().numpy().reshape(-1)
         in_idx = self._choose_input_bucket(x_np)
         a0, a1, a2 = self._get_act_vecs()
         c0 = int(torch.argmax(a0).item()) if a0 is not None else 0
         c1 = int(torch.argmax(a1).item()) if a1 is not None else 0
         c2 = int(torch.argmax(a2).item()) if a2 is not None else 0
-        out_full = int(torch.argmax(torch.sigmoid(logits_1)).item())
+        out_full = int(torch.argmax(torch.softmax(note_logits_1, dim=0)).item())
         out = min(out_full, self.n_out - 1)
         return {"in": in_idx, "c0": c0, "c1": c1, "c2": c2, "out": out}
 
@@ -385,34 +391,36 @@ class LiveNetViz:
         if self._last_path is None:
             return
         p = self._last_path
-        segs = [("in","c0",p["in"],p["c0"]), ("c0","c1",p["c0"],p["c1"]),
-                ("c1","c2",p["c1"],p["c2"]), ("c2","out",p["c2"],p["out"])]
-        for a,b,si,di in segs:
-            line = self.edge_lookup.get((a,b,si,di))
+        segs = [("in", "c0", p["in"], p["c0"]), ("c0", "c1", p["c0"], p["c1"]),
+                ("c1", "c2", p["c1"], p["c2"]), ("c2", "out", p["c2"], p["out"])]
+        for a, b, si, di in segs:
+            line = self.edge_lookup.get((a, b, si, di))
             if line is None:
                 continue
             base = self.edge_base_style.get(line)
             if base is None:
                 continue
-            col,lw,al = base
-            line.set_color(col); line.set_linewidth(lw); line.set_alpha(al)
+            col, lw, al = base
+            line.set_color(col)
+            line.set_linewidth(lw)
+            line.set_alpha(al)
 
     def _apply_pulse(self, path: Dict[str, int]):
         self._revert_last_pulse()
         self._pulse_pos += self.pulse_speed
         if self._pulse_pos >= 4.0:
             self._pulse_pos = 0.0
-        segs = [("in","c0",path["in"],path["c0"]), ("c0","c1",path["c0"],path["c1"]),
-                ("c1","c2",path["c1"],path["c2"]), ("c2","out",path["c2"],path["out"])]
+        segs = [("in", "c0", path["in"], path["c0"]), ("c0", "c1", path["c0"], path["c1"]),
+                ("c1", "c2", path["c1"], path["c2"]), ("c2", "out", path["c2"], path["out"])]
         hot = int(np.floor(self._pulse_pos))
         frac = float(self._pulse_pos - hot)
         pulse = 0.5 + 0.5 * np.sin(2.0 * np.pi * frac)
 
-        for si,(a,b,src_i,dst_i) in enumerate(segs):
-            line = self.edge_lookup.get((a,b,src_i,dst_i))
+        for si, (a, b, src_i, dst_i) in enumerate(segs):
+            line = self.edge_lookup.get((a, b, src_i, dst_i))
             if line is None:
                 continue
-            base = self.edge_base_style.get(line, ((0.35,0.35,0.35), 0.5, 0.08))
+            base = self.edge_base_style.get(line, ((0.35, 0.35, 0.35), 0.5, 0.08))
             col, lw0, al0 = base
             if si < hot:
                 boost = 0.85
@@ -424,7 +432,7 @@ class LiveNetViz:
             line.set_linewidth(lw0 + 5.0 * boost)
             line.set_alpha(min(1.0, al0 + 0.85 * boost))
 
-        for layer in ("in","c0","c1","c2","out"):
+        for layer in ("in", "c0", "c1", "c2", "out"):
             idx = path[layer]
             key = (layer, idx)
             if key in self.node_artists:
@@ -436,9 +444,9 @@ class LiveNetViz:
                     self.node_artists[key].set_facecolor((0.15, 0.75, 0.20, 0.85))
         self._last_path = dict(path)
 
-    def _update_wave_and_preds(self, x_1: torch.Tensor, logits_1: torch.Tensor, true_str: str, onset_idx: int):
+    def _update_wave_and_preds(self, x_1: torch.Tensor, note_logits_1: torch.Tensor, true_str: str, onset_idx: int):
         x_np = x_1.detach().float().cpu().numpy().reshape(-1)
-        probs = torch.sigmoid(logits_1.detach()).cpu().numpy().reshape(-1)
+        probs = torch.softmax(note_logits_1.detach(), dim=0).cpu().numpy().reshape(-1)
 
         j = int(np.argmax(probs))
         p = float(probs[j])
@@ -447,13 +455,12 @@ class LiveNetViz:
         self.ax_wave.clear()
         self.ax_wave.set_facecolor("black")
         self.ax_wave.set_title(
-            f"Input ({len(x_np)/self.sr*1000.0:.1f}ms) — TRUE: {true_str} | PRED: {pred_name} ({p:.2f})",
+            f"Input ({len(x_np) / self.sr * 1000.0:.1f}ms) — TRUE: {true_str} | PRED: {pred_name} ({p:.2f})",
             color="white"
         )
         t = np.arange(len(x_np)) / float(self.sr) * 1000.0
         self.ax_wave.plot(t, x_np, linewidth=1.0)
 
-        # Draw onset marker if known
         if onset_idx is not None and int(onset_idx) >= 0 and int(onset_idx) < len(x_np):
             onset_ms = (float(onset_idx) / float(self.sr)) * 1000.0
             self.ax_wave.axvline(onset_ms, linewidth=2.0)
@@ -465,7 +472,7 @@ class LiveNetViz:
 
         self.ax_pred.clear()
         self.ax_pred.set_facecolor("black")
-        self.ax_pred.set_title("Top predictions (sigmoid view)", color="white")
+        self.ax_pred.set_title("Top NOTE predictions (softmax)", color="white")
         topk = min(self.topk, len(probs))
         idxs = np.argsort(-probs)[:topk]
         vals = probs[idxs]
@@ -474,26 +481,23 @@ class LiveNetViz:
         self.ax_pred.set_yticks(range(topk)[::-1])
         self.ax_pred.set_yticklabels(labels[::-1], color="white")
         self.ax_pred.set_xlim(0.0, 1.0)
-        self.ax_pred.axvline(self.thresh, linestyle="--", linewidth=1.0)
         self.ax_pred.tick_params(colors="white")
         for spine in self.ax_pred.spines.values():
             spine.set_color("white")
 
     @torch.no_grad()
-    def update(self, x_batch: torch.Tensor, y_info: torch.Tensor, onset_idx: torch.Tensor, device: str, stage2: bool):
+    def update(self, x_batch: torch.Tensor, y_note: torch.Tensor, onset_idx: torch.Tensor, device: str, stage2: bool):
         self.model.eval()
         x = x_batch[:1].to(device, non_blocking=True)
-        logits = self.model(x)
+        note_logits, _string_logits = self.model(x)
 
-        # onset index for this displayed sample (still valid after pad because padding is appended)
         oi = int(onset_idx[:1].detach().cpu().item())
 
         if stage2:
-            y = y_info[:1].detach().cpu()
+            y = y_note[:1].detach().cpu()
             true_str = label_to_note_name_multi(y[0], self.meta)
         else:
-            y = int(y_info[:1].detach().cpu().item())
-            # if metadata carries neg idx, use it; otherwise infer V (safe)
+            y = int(y_note[:1].detach().cpu().item())
             neg_idx = self.meta.get("stage1_neg_class_idx", None)
             true_str = label_to_note_name_single(y, self.meta, neg_class_idx=neg_idx)
 
@@ -502,9 +506,9 @@ class LiveNetViz:
             self._update_edges_weights()
         self._update_nodes_glow()
 
-        path = self._choose_path(x_1=x[0], logits_1=logits[0])
+        path = self._choose_path(x_1=x[0], note_logits_1=note_logits[0])
         self._apply_pulse(path)
-        self._update_wave_and_preds(x_1=x[0], logits_1=logits[0], true_str=true_str, onset_idx=oi)
+        self._update_wave_and_preds(x_1=x[0], note_logits_1=note_logits[0], true_str=true_str, onset_idx=oi)
 
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
@@ -522,7 +526,8 @@ class ClipInfo:
     transient_end: int
     num_samples: int
     sr: int
-    clip_type: str  # "single", "scale_segment", "chord", "note_repeat_segment"
+    clip_type: str  # "single", "scale_segment", "chord", "note_repeat_segment", "neg_segment"
+    string_idx: int  # 0..5 or -1
 
 
 def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, Any]]:
@@ -542,6 +547,9 @@ def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, A
         n = int(lab.get("num_samples", 0))
         clip_type = lab.get("type", it.get("type", "unknown"))
 
+        # dataset builder should add this; fallback: assume low E (0)
+        sidx = int(lab.get("string_idx", 0))
+
         clips.append(ClipInfo(
             audio_abs=audio_abs,
             multi_hot=mh,
@@ -550,6 +558,7 @@ def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, A
             num_samples=n,
             sr=sr,
             clip_type=clip_type,
+            string_idx=sidx,
         ))
     return clips, sr, vocab_size, meta
 
@@ -561,20 +570,18 @@ def train_val_split(clips: List[ClipInfo], val_ratio: float, seed: int):
     n_val = int(round(len(idxs) * val_ratio))
     val_set = set(idxs[:n_val])
     train = [c for i, c in enumerate(clips) if i not in val_set]
-    val   = [c for i, c in enumerate(clips) if i in val_set]
+    val = [c for i, c in enumerate(clips) if i in val_set]
     return train, val
 
 
 class OnsetDataset(Dataset):
     """
-    Each sample loads base_W samples, then optionally crops to crop_W before returning.
-
-    Returns: (x, y, onset_idx)
+    Returns: (x, y_note, y_string, onset_idx)
       x: (1, T)
-      y: stage1 -> scalar class index (Long), stage2 -> multi-hot (Float)
+      y_note: stage1 -> scalar class index (Long), stage2 -> multi-hot (Float)
+      y_string: Long in {0..5} or -1 ignore
       onset_idx: int in [0,T), or -1 if unknown/negative
     """
-
     def __init__(
         self,
         clips: List[ClipInfo],
@@ -626,29 +633,25 @@ class OnsetDataset(Dataset):
         self.crop_onset_jitter_ms = float(crop_onset_jitter_ms)
 
         s = p_on + p_neg
-        self.p_on  = p_on / s
+        self.p_on = p_on / s
         self.p_neg = p_neg / s
 
-        # Positives: anything that isn't an explicit neg segment and has a transient
         self.on_candidates = [
             i for i, c in enumerate(clips)
             if (c.clip_type != "neg_segment") and (c.transient_end > c.onset_sample)
         ]
-
-        # Negatives: explicit neg segments from dataset builder
         self.neg_candidates = [
             i for i, c in enumerate(clips)
             if (c.clip_type == "neg_segment")
         ]
 
-        # For Stage1-with-neg-class, we expect vocab_size == base_vocab+1 and NEG is the last idx
+        # Stage1-with-neg-class expects NEG to be last idx in vocab passed to dataset
         self.stage1_neg_class_idx = (self.V - 1) if (not self.stage2) else None
 
         self.audio_cache: Dict[str, np.ndarray] = {}
         self.cache_order: List[str] = []
         self.cache_max = int(audio_cache_max)
 
-        # Sanity for crop sizes
         if self.crop_W <= 0:
             self.crop_W = self.base_W
         if self.crop_W > self.base_W:
@@ -719,13 +722,10 @@ class OnsetDataset(Dataset):
 
         if is_pos and (onset_offset_in_base is not None) and (random.random() < self.crop_keep_onset_prob):
             sr = int(self.clips[0].sr) if self.clips else 48000
-
             target = int(round((self.crop_onset_target_ms / 1000.0) * sr))
             jitter = int(round((self.crop_onset_jitter_ms / 1000.0) * sr))
-
             j = random.randint(-jitter, jitter) if jitter > 0 else 0
             target = int(np.clip(target + j, 0, self.crop_W - 1))
-
             st = int(np.clip(onset_offset_in_base - target, 0, max_start))
         else:
             st = random.randint(0, max_start)
@@ -737,7 +737,7 @@ class OnsetDataset(Dataset):
 
         if mode == "on":
             ci = self.clips[random.choice(self.on_candidates)]
-            y  = self._load(ci.audio_abs, ci.sr)
+            y = self._load(ci.audio_abs, ci.sr)
 
             # POSITIVE: anchor base window around onset
             min_pos = int(self.onset_pos_min * self.base_W)
@@ -757,38 +757,39 @@ class OnsetDataset(Dataset):
 
             onset_offset_in_base = int(ci.onset_sample - start)
 
+            # NOTE label
             if self.stage2:
-                label = np.array(ci.multi_hot, dtype=np.float32)
+                y_note = np.array(ci.multi_hot, dtype=np.float32)
             else:
-                label = self._multi_hot_to_single_index(ci.multi_hot)
+                y_note = self._multi_hot_to_single_index(ci.multi_hot)
+
+            # STRING label (only trust if it’s truly unambiguous)
+            if (ci.clip_type in ("single", "note_repeat_segment")) and (0 <= int(ci.string_idx) < 6):
+                y_string = int(ci.string_idx)
+            else:
+                y_string = STRING_IGNORE_INDEX
 
             is_pos = True
 
         else:
-            # NEGATIVE: prefer explicit neg_segment clips if they exist
+            # NEGATIVE
             if self.neg_candidates:
                 ci = self.clips[random.choice(self.neg_candidates)]
-                y  = self._load(ci.audio_abs, ci.sr)
-
+                y = self._load(ci.audio_abs, ci.sr)
                 max_start = max(0, ci.num_samples - self.base_W)
                 start = random.randint(0, max_start) if max_start > 0 else 0
-
                 x = y[start: start + self.base_W]
                 if len(x) < self.base_W:
                     x = np.pad(x, (0, self.base_W - len(x)))
             else:
-                # Fallback: old behavior (pre-onset region from random clip)
                 ci = self.clips[random.randrange(len(self.clips))]
-                y  = self._load(ci.audio_abs, ci.sr)
-
+                y = self._load(ci.audio_abs, ci.sr)
                 max_start = max(0, ci.num_samples - self.base_W)
                 pre_end = max(0, ci.onset_sample - self.base_W)
-
                 if pre_end > 0:
                     start = random.randint(0, pre_end)
                 else:
                     start = max(0, max_start - random.randint(0, min(max_start, int(0.1 * ci.sr))))
-
                 start = int(np.clip(start, 0, max_start))
                 x = y[start: start + self.base_W]
                 if len(x) < self.base_W:
@@ -798,18 +799,17 @@ class OnsetDataset(Dataset):
             is_pos = False
 
             if self.stage2:
-                label = np.zeros(self.V, dtype=np.float32)
+                y_note = np.zeros(self.V, dtype=np.float32)
             else:
-                # Stage1: NEG is a real class (last index) *if your model/dataset vocab includes it*
-                label = int(self.stage1_neg_class_idx) if self.stage1_neg_class_idx is not None else 0
+                y_note = int(self.stage1_neg_class_idx) if self.stage1_neg_class_idx is not None else 0
 
-        # Augment base window -> crop (onset-aware) -> normalize what net sees
+            y_string = STRING_IGNORE_INDEX
+
+        # Augment -> crop -> normalize
         x = x.astype(np.float32)
         x = self._augment(x)
-
         x, crop_start = self._maybe_crop(x, onset_offset_in_base=onset_offset_in_base, is_pos=is_pos)
 
-        # Compute onset index inside the RETURNED window (after crop)
         onset_in_return = -1
         if is_pos and onset_offset_in_base is not None:
             onset_in_return = int(onset_offset_in_base - crop_start)
@@ -822,20 +822,27 @@ class OnsetDataset(Dataset):
             x[1:] = x[1:] - self.preemph_coef * x[:-1]
 
         x_t = torch.from_numpy(x).unsqueeze(0)
-        if self.stage2:
-            y_t = torch.from_numpy(label)
-        else:
-            y_t = torch.tensor(label, dtype=torch.long)
 
-        return x_t, y_t, int(onset_in_return)
+        if self.stage2:
+            y_note_t = torch.from_numpy(y_note)
+        else:
+            y_note_t = torch.tensor(int(y_note), dtype=torch.long)
+
+        y_string_t = torch.tensor(int(y_string), dtype=torch.long)
+        return x_t, y_note_t, y_string_t, int(onset_in_return)
+
+
 # ----------------------------
 # Model
 # ----------------------------
 class OnsetNet(nn.Module):
     """
-    Tiny 1D conv. Accepts variable input length due to AdaptiveAvgPool1d(1).
+    Tiny 1D conv with TWO heads:
+      - note_head: vocab_size outputs
+      - string_head: 6 outputs
+    Accepts variable input length due to AdaptiveAvgPool1d(1).
     """
-    def __init__(self, vocab_size: int, width: int = 64):
+    def __init__(self, note_vocab_size: int, width: int = 64, n_strings: int = 6):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(1, width // 2, kernel_size=9, stride=2, padding=4, bias=False),
@@ -852,13 +859,18 @@ class OnsetNet(nn.Module):
 
             nn.AdaptiveAvgPool1d(1),
         )
-        self.head = nn.Linear(width, vocab_size)
-        self.vocab_size = vocab_size
+        self.note_head = nn.Linear(width, note_vocab_size)
+        self.string_head = nn.Linear(width, n_strings)
+
+        self.note_vocab_size = note_vocab_size
+        self.n_strings = n_strings
         self.width = width
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         z = self.conv(x).squeeze(-1)
-        return self.head(z)
+        note_logits = self.note_head(z)
+        string_logits = self.string_head(z)
+        return note_logits, string_logits
 
     def count_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -876,15 +888,16 @@ def export_c_header(model: nn.Module, sr: int, vocab_size: int, export_window_sa
     lines = [
         "// Auto-generated - DO NOT EDIT",
         "// OnsetNet weights for Daisy Seed bare metal inference",
-        f"// sr={sr} vocab_size={vocab_size} window_samples={export_window_samples}",
+        f"// sr={sr} note_vocab_size={vocab_size} window_samples={export_window_samples}",
         "",
         "#pragma once",
         "#include <stdint.h>",
         "",
-        f"#define ONSET_SR           {sr}",
-        f"#define ONSET_VOCAB_SIZE   {vocab_size}",
-        f"#define ONSET_WINDOW       {export_window_samples}",
-        f"#define ONSET_WIDTH        {model.width}",
+        f"#define ONSET_SR                 {sr}",
+        f"#define ONSET_NOTE_VOCAB_SIZE    {vocab_size}",
+        f"#define ONSET_WINDOW             {export_window_samples}",
+        f"#define ONSET_WIDTH              {model.width}",
+        f"#define ONSET_N_STRINGS          {model.n_strings}",
         "",
         "static const char* onset_pitch_names[] = {",
     ]
@@ -905,12 +918,12 @@ def export_c_header(model: nn.Module, sr: int, vocab_size: int, export_window_sa
 
     sd = model.state_dict()
     layer_map = [
-        ("conv.0",  "l0_conv"),
-        ("conv.1",  "l0_bn"),
-        ("conv.3",  "l1_conv"),
-        ("conv.4",  "l1_bn"),
-        ("conv.6",  "l2_conv"),
-        ("conv.7",  "l2_bn"),
+        ("conv.0", "l0_conv"),
+        ("conv.1", "l0_bn"),
+        ("conv.3", "l1_conv"),
+        ("conv.4", "l1_bn"),
+        ("conv.6", "l2_conv"),
+        ("conv.7", "l2_bn"),
     ]
 
     for sd_prefix, c_prefix in layer_map:
@@ -922,8 +935,11 @@ def export_c_header(model: nn.Module, sr: int, vocab_size: int, export_window_sa
             if k in sd and not (suffix == "weight" and "conv" in sd_prefix and k == w_key):
                 lines += arr(f"{c_prefix}_{suffix}", sd[k])
 
-    lines += arr("head_weight", sd["head.weight"])
-    lines += arr("head_bias",   sd["head.bias"])
+    # Two heads
+    lines += arr("note_head_weight", sd["note_head.weight"])
+    lines += arr("note_head_bias", sd["note_head.bias"])
+    lines += arr("string_head_weight", sd["string_head.weight"])
+    lines += arr("string_head_bias", sd["string_head.bias"])
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -971,7 +987,9 @@ def build_scheduler(args, opt):
     if args.scheduler == "none":
         return None
     if args.scheduler == "cosine":
-        return torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_frac)
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_frac
+        )
     if args.scheduler == "step":
         return torch.optim.lr_scheduler.StepLR(opt, step_size=args.step_size, gamma=args.step_gamma)
     raise ValueError(f"Unknown scheduler: {args.scheduler}")
@@ -1021,9 +1039,9 @@ def train(args):
     # Windowing
     train_base_W = ms_to_samples(args.train_ms, sr)
     train_crop_W = ms_to_samples(args.crop_ms, sr)
-    val_base_W   = ms_to_samples(args.val_ms, sr)
-    val_crop_W   = ms_to_samples(args.val_crop_ms, sr)
-    export_W     = ms_to_samples(args.export_ms, sr)
+    val_base_W = ms_to_samples(args.val_ms, sr)
+    val_crop_W = ms_to_samples(args.val_crop_ms, sr)
+    export_W = ms_to_samples(args.export_ms, sr)
 
     print(
         f"[INFO] clips={len(clips)} sr={sr} vocab={vocab_size} "
@@ -1031,7 +1049,7 @@ def train(args):
         f"val_ms={args.val_ms:g} (base={val_base_W}) val_crop_ms={args.val_crop_ms:g} (crop={val_crop_W}) val_crop_prob={args.val_crop_prob:g} "
         f"export_ms={args.export_ms:g} (exportW={export_W})"
     )
-    
+
     base_vocab_size = vocab_size
     stage2 = bool(args.stage2)
 
@@ -1048,22 +1066,23 @@ def train(args):
     stage1_vocab_size = base_vocab_size + (1 if (not stage2 and args.stage1_neg_class) else 0)
     neg_class_idx = (base_vocab_size if stage1_vocab_size != base_vocab_size else None)
 
-    # stash into meta so viz can print "(none)"
     meta = dict(meta)
     meta["stage1_vocab_size"] = int(stage1_vocab_size)
     meta["stage1_neg_class_idx"] = int(neg_class_idx) if neg_class_idx is not None else -1
 
-    # Model output size
-    model_vocab = (stage1_vocab_size if not stage2 else base_vocab_size)
-    model = OnsetNet(vocab_size=model_vocab, width=args.width).to(device)
-    print(f"[INFO] params={model.count_params():,} width={args.width} model_vocab={model_vocab} neg_class_idx={neg_class_idx}")
+    # Model output sizes
+    model_note_vocab = (stage1_vocab_size if not stage2 else base_vocab_size)
+    model = OnsetNet(note_vocab_size=model_note_vocab, width=args.width, n_strings=N_STRINGS).to(device)
+    print(f"[INFO] params={model.count_params():,} width={args.width} note_vocab={model_note_vocab} neg_class_idx={neg_class_idx}")
 
-    # Loss
+    # Losses
     if stage2:
         pw = torch.full((base_vocab_size,), float(args.pos_weight), device=device)
-        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+        note_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+        string_loss_fn = None
     else:
-        loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+        note_loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+        string_loss_fn = nn.CrossEntropyLoss(ignore_index=STRING_IGNORE_INDEX)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=(device == "cuda"))
@@ -1081,10 +1100,12 @@ def train(args):
             stage2 = resumed_stage2
             print(f"[INFO] stage2 overridden by checkpoint: stage2={stage2}")
             if stage2:
-                pw = torch.full((vocab_size,), float(args.pos_weight), device=device)
-                loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+                pw = torch.full((base_vocab_size,), float(args.pos_weight), device=device)
+                note_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+                string_loss_fn = None
             else:
-                loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+                note_loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+                string_loss_fn = nn.CrossEntropyLoss(ignore_index=STRING_IGNORE_INDEX)
 
     # Datasets
     ds_vocab = (stage1_vocab_size if (not stage2) else base_vocab_size)
@@ -1166,7 +1187,7 @@ def train(args):
                 yield b
 
     train_it = infinite(train_loader)
-    val_it   = infinite(val_loader)
+    val_it = infinite(val_loader)
 
     th_grid = [round(x, 2) for x in np.linspace(args.th_sweep_min, args.th_sweep_max, args.th_sweep_steps)]
     global_step = 0
@@ -1185,9 +1206,10 @@ def train(args):
             # Train
             # ------------------------
             for step in range(args.steps_per_epoch):
-                x, y, onset_idx = next(train_it)
+                x, y_note, y_string, onset_idx = next(train_it)
                 x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
+                y_note = y_note.to(device, non_blocking=True)
+                y_string = y_string.to(device, non_blocking=True)
 
                 if args.warmup_steps > 0:
                     maybe_linear_warmup_lr(opt, args.lr, global_step, args.warmup_steps)
@@ -1195,11 +1217,14 @@ def train(args):
                 opt.zero_grad(set_to_none=True)
 
                 with autocast(device_type="cuda", enabled=(device == "cuda")):
-                    logits = model(x)
+                    note_logits, string_logits = model(x)
+
                     if stage2:
-                        loss = loss_fn(logits, y)
+                        loss = note_loss_fn(note_logits, y_note)
                     else:
-                        loss = loss_fn(logits, y.view(-1))
+                        note_loss = note_loss_fn(note_logits, y_note.view(-1))
+                        string_loss = string_loss_fn(string_logits, y_string.view(-1))
+                        loss = note_loss + float(args.string_loss_w) * string_loss
 
                 scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
@@ -1210,7 +1235,7 @@ def train(args):
                 global_step += 1
 
                 if viz is not None and (step % viz_every == 0):
-                    viz.update(x_batch=x, y_info=y, onset_idx=onset_idx, device=device, stage2=stage2)
+                    viz.update(x_batch=x, y_note=y_note, onset_idx=onset_idx, device=device, stage2=stage2)
 
             tr_loss /= args.steps_per_epoch
             if scheduler is not None and args.scheduler != "none":
@@ -1221,46 +1246,68 @@ def train(args):
             # ------------------------
             model.eval()
             v_loss = 0.0
-            all_logits, all_targets = [], []
+            all_note_logits, all_note_targets = [], []
+            all_string_logits, all_string_targets = [], []
 
             with torch.no_grad():
                 for _ in range(args.val_steps):
-                    x, y, onset_idx = next(val_it)
+                    x, y_note, y_string, onset_idx = next(val_it)
                     x = x.to(device, non_blocking=True)
-                    y = y.to(device, non_blocking=True)
+                    y_note = y_note.to(device, non_blocking=True)
+                    y_string = y_string.to(device, non_blocking=True)
 
-                    logits = model(x)
+                    note_logits, string_logits = model(x)
+
                     if stage2:
-                        v_loss += float(loss_fn(logits, y).item())
-                        all_logits.append(logits.cpu())
-                        all_targets.append(y.cpu())
+                        v_loss += float(note_loss_fn(note_logits, y_note).item())
+                        all_note_logits.append(note_logits.cpu())
+                        all_note_targets.append(y_note.cpu())
                     else:
-                        v_loss += float(loss_fn(logits, y.view(-1)).item())
-                        all_logits.append(logits.cpu())
-                        all_targets.append(y.view(-1).cpu())
+                        note_loss = note_loss_fn(note_logits, y_note.view(-1))
+                        string_loss = string_loss_fn(string_logits, y_string.view(-1))
+                        v_loss += float((note_loss + float(args.string_loss_w) * string_loss).item())
+
+                        all_note_logits.append(note_logits.cpu())
+                        all_note_targets.append(y_note.view(-1).cpu())
+                        all_string_logits.append(string_logits.cpu())
+                        all_string_targets.append(y_string.view(-1).cpu())
 
             v_loss /= args.val_steps
-            all_logits = torch.cat(all_logits)
-            all_targets = torch.cat(all_targets)
+            all_note_logits = torch.cat(all_note_logits)
+            all_note_targets = torch.cat(all_note_targets)
 
             lr_now = opt.param_groups[0]["lr"]
             dt = time.time() - t0
 
             if stage2:
-                best_f1, best_th, best_p, best_r = best_f1_over_thresholds(all_logits, all_targets, th_grid)
-                p_fix, r_fix, f1_fix = f1_scores_from_logits(all_logits, all_targets, thresh=args.thresh)
+                best_f1, best_th, best_p, best_r = best_f1_over_thresholds(all_note_logits, all_note_targets, th_grid)
+                p_fix, r_fix, f1_fix = f1_scores_from_logits(all_note_logits, all_note_targets, thresh=args.thresh)
                 metric_str = (
                     f"bestF1={best_f1:.3f}@{best_th:.2f} (P={best_p:.3f} R={best_r:.3f}) "
                     f"fixF1={f1_fix:.3f}@{args.thresh:.2f}"
                 )
                 score_for_best = best_f1
+                str_metric = ""
             else:
-                probs = torch.softmax(all_logits, dim=1)
-                top1 = (probs.argmax(dim=1) == all_targets).float().mean().item()
-                top3 = (probs.topk(k=min(3, probs.shape[1]), dim=1).indices == all_targets.unsqueeze(1)).any(dim=1).float().mean().item()
-                mean_true_p = probs[torch.arange(probs.shape[0]), all_targets].mean().item()
+                probs = torch.softmax(all_note_logits, dim=1)
+                top1 = (probs.argmax(dim=1) == all_note_targets).float().mean().item()
+                top3 = (probs.topk(k=min(3, probs.shape[1]), dim=1).indices == all_note_targets.unsqueeze(1)).any(dim=1).float().mean().item()
+                mean_true_p = probs[torch.arange(probs.shape[0]), all_note_targets].mean().item()
                 metric_str = f"top1={top1:.3f} top3={top3:.3f} mean_true_p={mean_true_p:.3f}"
                 score_for_best = top1
+
+                # String accuracy (ignore -1)
+                all_string_logits = torch.cat(all_string_logits) if all_string_logits else torch.empty(0)
+                all_string_targets = torch.cat(all_string_targets) if all_string_targets else torch.empty(0, dtype=torch.long)
+                if all_string_targets.numel() > 0:
+                    mask = (all_string_targets != STRING_IGNORE_INDEX)
+                    if mask.any():
+                        str_acc = (all_string_logits.argmax(dim=1)[mask] == all_string_targets[mask]).float().mean().item()
+                    else:
+                        str_acc = float("nan")
+                else:
+                    str_acc = float("nan")
+                str_metric = f" str_acc={str_acc:.3f}" if (str_acc == str_acc) else " str_acc=nan"
 
             aug_profile = (
                 f"aug(noise={train_ds.noise_std:g}, gain=[{train_ds.gain_db_min:g},{train_ds.gain_db_max:g}], "
@@ -1273,7 +1320,7 @@ def train(args):
             )
 
             print(
-                f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} {metric_str} "
+                f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} {metric_str}{str_metric} "
                 f"lr={lr_now:.2e} {aug_profile} {win_profile} t={dt:.1f}s"
             )
 
@@ -1369,6 +1416,9 @@ def main():
     # Stage2 BCE
     ap.add_argument("--pos_weight", type=float, default=2.0)
 
+    # NEW: string head weight (stage1 only)
+    ap.add_argument("--string_loss_w", type=float, default=0.3)
+
     # Curriculum aug
     ap.add_argument("--curriculum_epochs", type=int, default=15)
     ap.add_argument("--calm_noise_std", type=float, default=0.0)
@@ -1383,7 +1433,7 @@ def main():
     ap.add_argument("--full_enable_gain", type=int, default=1)
     ap.add_argument("--full_enable_polarity", type=int, default=1)
 
-    # Context + crop (defaults preserve old 10ms->10ms behavior)
+    # Context + crop
     ap.add_argument("--train_ms", type=float, default=DEFAULT_INFER_MS)
     ap.add_argument("--crop_ms", type=float, default=DEFAULT_INFER_MS)
     ap.add_argument("--crop_prob", type=float, default=1.0)
@@ -1398,10 +1448,8 @@ def main():
     ap.add_argument("--onset_pos_min", type=float, default=0.20)
     ap.add_argument("--onset_pos_max", type=float, default=0.65)
     ap.add_argument("--crop_keep_onset_prob", type=float, default=0.90)
-    ap.add_argument("--crop_onset_target_ms", type=float, default=1.0,
-                    help="When keeping onset in crop, place onset at this offset inside returned crop (ms).")
-    ap.add_argument("--crop_onset_jitter_ms", type=float, default=0.25,
-                    help="Random jitter (+/-) around crop_onset_target_ms (ms).")
+    ap.add_argument("--crop_onset_target_ms", type=float, default=1.0)
+    ap.add_argument("--crop_onset_jitter_ms", type=float, default=0.25)
 
     # Thresholds (viz + stage2)
     ap.add_argument("--thresh", type=float, default=0.2)
@@ -1418,7 +1466,7 @@ def main():
     ap.add_argument("--viz_pulse_speed", type=float, default=0.5)
 
     ap.add_argument("--stage1_neg_class", action="store_true",
-                help="Stage1 only: add an extra softmax class for negatives (no-note).")
+                    help="Stage1 only: add an extra softmax class for negatives (no-note).")
 
     args = ap.parse_args()
 

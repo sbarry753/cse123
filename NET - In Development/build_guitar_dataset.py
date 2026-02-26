@@ -3,6 +3,16 @@ build_guitar_dataset.py
 
 Creates a transient-triggered + sustain-labeled dataset for low-latency polyphonic guitar note detection.
 
+NEW (string classifier support):
+- Adds "string_idx" to every label JSON:
+    0 = low E, 1 = A, 2 = D, 3 = G, 4 = B, 5 = high E
+- For filenames like "F4_5.wav", "_5" is used as string_idx.
+- If NO "_#" suffix exists, assumes string_idx = 0 (low E).
+- For scale files (e.g. "A2-A4.wav") where filename doesn't include "_#",
+  we infer string_idx from folder name if possible (e.g. ".../string_3/..."),
+  otherwise default to 0.
+- For chord files, string_idx is set to -1 (multi-string / not a single string).
+
 Key improvement:
 - For scale/note-repeat (60 BPM grid with human drift), we detect the PICK
   as the earliest strong positive-going transient (not max energy).
@@ -202,6 +212,23 @@ def pad_to_length(x: np.ndarray, length: int, mode: str = "zeros") -> np.ndarray
 
 
 # ----------------------------
+# String helpers (NEW)
+# ----------------------------
+def infer_string_idx_from_path(path: str) -> int:
+    """
+    Infer string idx from directory names like:
+      .../string_0/... or .../string0/... or .../str_5/...
+    Returns 0..5 if found, else 0 (default low E).
+    """
+    parts = [p.lower() for p in os.path.normpath(path).split(os.sep)]
+    for p in parts:
+        m = re.match(r'^(string|str)[_\-]?([0-5])$', p)
+        if m:
+            return int(m.group(2))
+    return 0
+
+
+# ----------------------------
 # Robust onset detection (single/chord)
 # ----------------------------
 def detect_onset_sample(y: np.ndarray, sr: int, search_limit_ms: Optional[float] = None) -> int:
@@ -328,7 +355,6 @@ def estimate_sustain_end(y: np.ndarray, sr: int, transient_end: int) -> Tuple[in
 
 # ----------------------------
 # OPTIONAL: Find truly quiet start for tail negatives
-# (Works best when you have >1s of audio available to the right, but we keep it optional.)
 # ----------------------------
 def find_quiet_start_for_negative(
     y: np.ndarray,
@@ -440,6 +466,11 @@ def find_pick_near_time(y: np.ndarray, sr: int, center_samp: int, half_window_sa
 # Filename parsers
 # ----------------------------
 def parse_single_filename(stem: str) -> Tuple[str, int]:
+    """
+    Supports:
+      F4_5.wav  -> (pitch="F4", string_idx=5)
+      A#3.wav   -> (pitch="A#3", string_idx=0)   # default low E
+    """
     if "_" in stem:
         m = re.match(r'^(.+?)_(\d+)$', stem)
         if not m:
@@ -448,7 +479,7 @@ def parse_single_filename(stem: str) -> Tuple[str, int]:
         string_idx = int(m.group(2))
         return pitch, string_idx
     pitch = normalize_pitch_str(stem)
-    return pitch, -1
+    return pitch, 0  # default low E
 
 
 def parse_scale_filename(stem: str) -> Tuple[str, str]:
@@ -526,6 +557,13 @@ def build_vocab(collected_midis: List[int]) -> Dict[str, Any]:
             "neg_silence_rel_drop_db": NEG_SILENCE_REL_DROP_DB,
             "neg_silence_hangover_ms": NEG_SILENCE_HANGOVER_MS,
         },
+        # Optional: document string labeling
+        "string_labeling": {
+            "string_idx_meaning": "0=lowE, 1=A, 2=D, 3=G, 4=B, 5=highE; -1=unknown/multi",
+            "filename_suffix_rule": "If filename token ends with _<0..5>, use that. If absent, default 0.",
+            "scale_path_rule": "If scale filename has no suffix, try infer from folder like string_3, else default 0.",
+            "chord_rule": "string_idx = -1",
+        }
     }
 
 
@@ -577,6 +615,7 @@ def emit_negative_clip(
     neg_subtype: str,
     ref_pos_id: str,
     extra_dbg: Dict[str, Any],
+    string_idx: int,  # NEW
 ) -> int:
     out_name = f"sample_{sample_idx:06d}.wav"
     out_wav = os.path.join(audio_out, out_name)
@@ -590,6 +629,7 @@ def emit_negative_clip(
         "source_path": os.path.relpath(source_wav_path, raw_root),
         "take_id": take_id,
         "sr": sr,
+        "string_idx": int(string_idx),  # NEW
         "active_notes_midi": [],
         "active_notes_pitch": [],
         "multi_hot": [0] * int(vocab_size),
@@ -642,7 +682,6 @@ def maybe_emit_negative_from_lead_silence(
     if lead < one_sec or len(full_y) < one_sec:
         return sample_idx, False
 
-    # choose random 1s window inside the lead silence region
     max_start = lead - one_sec
     st = 0 if max_start <= 0 else int(np.random.randint(0, max_start + 1))
     neg = full_y[st:st + one_sec].copy()
@@ -654,6 +693,8 @@ def maybe_emit_negative_from_lead_silence(
         "start_sample": int(st),
         "end_sample": int(st + one_sec),
     }
+
+    sidx = infer_string_idx_from_path(source_wav_path)
 
     sample_idx = emit_negative_clip(
         mf=mf,
@@ -670,6 +711,7 @@ def maybe_emit_negative_from_lead_silence(
         neg_subtype="lead_silence",
         ref_pos_id=ref_pos_id,
         extra_dbg=dbg,
+        string_idx=sidx,  # NEW
     )
     return sample_idx, True
 
@@ -695,8 +737,6 @@ def maybe_emit_negative_from_tail_silence(
 ) -> Tuple[int, bool]:
     """
     Optional negatives: try to find a quiet region AFTER sus_end.
-    IMPORTANT: because seg_out is ~1s long, we only emit a 1s negative if quiet_start is near 0.
-    So instead we emit from quiet_start to END of segment, then pad to 1s.
     """
     one_sec = int(sr)
     sus_end = int(np.clip(sus_end, 0, len(seg_out)))
@@ -715,7 +755,6 @@ def maybe_emit_negative_from_tail_silence(
 
     quiet_start = int(np.clip(quiet_start, 0, len(seg_out)))
 
-    # take from quiet_start to end; pad to 1s
     neg = seg_out[quiet_start:].copy()
     neg = pad_to_length(neg, one_sec, mode=neg_pad_mode)
 
@@ -730,6 +769,8 @@ def maybe_emit_negative_from_tail_silence(
         "neg_silence_rel_drop_db": float(NEG_SILENCE_REL_DROP_DB),
         "neg_silence_hangover_ms": float(NEG_SILENCE_HANGOVER_MS),
     }
+
+    sidx = infer_string_idx_from_path(source_wav_path)
 
     sample_idx = emit_negative_clip(
         mf=mf,
@@ -746,6 +787,7 @@ def maybe_emit_negative_from_tail_silence(
         neg_subtype="tail_silence",
         ref_pos_id=ref_pos_id,
         extra_dbg=dbg,
+        string_idx=sidx,  # NEW
     )
     return sample_idx, True
 
@@ -763,10 +805,8 @@ def build_dataset(
     neg_min_silence_ms: float = 150.0,
     neg_pad_mode: str = "zeros",
     neg_max_total: int = 100,
-    # NEW: reliable neg source from lead silence
     neg_use_lead_silence: bool = True,
     neg_lead_silence_sec: float = 1.0,
-    # Optional: also try tail silence
     neg_use_tail_silence: bool = False,
 ):
     audio_out = os.path.join(out_root, "audio")
@@ -859,14 +899,12 @@ def build_dataset(
     neg_max_total = int(max(0, neg_max_total))
 
     with open(manifest_path, "w") as mf:
-        # Cache full_y per wav for lead-silence negatives (scale/note only)
         full_audio_cache: Dict[str, np.ndarray] = {}
 
         for wav_path, rel_type in discovered:
             stem = os.path.splitext(os.path.basename(wav_path))[0]
             take_id = infer_take_id(wav_path)
 
-            # Preload full audio for scale/note (so we can pull lead-silence negatives)
             if rel_type in ("scale", "note") and add_negatives and neg_use_lead_silence and (neg_written < neg_max_total):
                 if wav_path not in full_audio_cache:
                     full_y, _sr = read_audio_mono(wav_path, sr)
@@ -894,6 +932,7 @@ def build_dataset(
                     "source_path": os.path.relpath(wav_path, raw_root),
                     "take_id": take_id,
                     "sr": sr,
+                    "string_idx": int(sidx),  # NEW
                     "active_notes_midi": notes_midi,
                     "active_notes_pitch": [midi_to_pitch(midi_note)],
                     "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
@@ -941,6 +980,7 @@ def build_dataset(
                     "source_path": os.path.relpath(wav_path, raw_root),
                     "take_id": take_id,
                     "sr": sr,
+                    "string_idx": -1,  # NEW (multi-string)
                     "active_notes_midi": notes_midi,
                     "active_notes_pitch": [midi_to_pitch(m) for m in notes_midi],
                     "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
@@ -970,6 +1010,8 @@ def build_dataset(
                 start_pitch, end_pitch = parse_scale_filename(stem)
                 start_midi = pitch_to_midi(start_pitch)
                 n_notes = scale_note_count(start_pitch, end_pitch)
+
+                scale_string_idx = infer_string_idx_from_path(wav_path)  # NEW
 
                 one_sec = sr
                 half = int(SCALE_SEARCH_HALF_SEC * sr)
@@ -1017,7 +1059,6 @@ def build_dataset(
                     sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
                     sus_end = min(sus_end, len(seg_out))
 
-                    # POS
                     pos_id = f"{sample_idx:06d}"
                     out_name = f"sample_{sample_idx:06d}.wav"
                     out_wav = os.path.join(audio_out, out_name)
@@ -1029,6 +1070,7 @@ def build_dataset(
                         "source_path": os.path.relpath(wav_path, raw_root),
                         "take_id": take_id,
                         "sr": sr,
+                        "string_idx": int(scale_string_idx),  # NEW
                         "scale_segment_index": i,
                         "expected_time_sec": float(SCALE_FIRST_SILENCE_SEC + i * SCALE_STEP_SEC),
                         "active_notes_midi": notes_midi,
@@ -1055,14 +1097,12 @@ def build_dataset(
                     }) + "\n")
                     sample_idx += 1
 
-                    # NEG(s)
                     if add_negatives and (neg_written < neg_max_total):
                         for _ in range(max(1, int(neg_per_pos))):
                             if neg_written >= neg_max_total:
                                 break
 
                             wrote = False
-                            # 1) Reliable lead-silence negatives
                             if neg_use_lead_silence:
                                 full_y = full_audio_cache.get(wav_path, None)
                                 if full_y is not None:
@@ -1083,7 +1123,6 @@ def build_dataset(
                                         ref_pos_id=pos_id,
                                     )
 
-                            # 2) Optional tail-silence negatives
                             if (not wrote) and neg_use_tail_silence:
                                 sample_idx, wrote = maybe_emit_negative_from_tail_silence(
                                     mf=mf,
@@ -1165,7 +1204,6 @@ def build_dataset(
                     sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
                     sus_end = min(sus_end, len(seg_out))
 
-                    # POS
                     pos_id = f"{sample_idx:06d}"
                     out_name = f"sample_{sample_idx:06d}.wav"
                     out_wav = os.path.join(audio_out, out_name)
@@ -1177,6 +1215,7 @@ def build_dataset(
                         "source_path": os.path.relpath(wav_path, raw_root),
                         "take_id": take_id,
                         "sr": sr,
+                        "string_idx": int(sidx),  # NEW
                         "note_repeat_index": i,
                         "expected_time_sec": float(NOTE_FIRST_SILENCE_SEC + i * NOTE_STEP_SEC),
                         "active_notes_midi": notes_midi,
@@ -1203,7 +1242,6 @@ def build_dataset(
                     }) + "\n")
                     sample_idx += 1
 
-                    # NEG(s)
                     if add_negatives and (neg_written < neg_max_total):
                         for _ in range(max(1, int(neg_per_pos))):
                             if neg_written >= neg_max_total:
