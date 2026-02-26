@@ -10,12 +10,12 @@ using namespace daisy::seed;
 
 #define POT1 A6
 
-constexpr size_t BLOCK_SIZE = 16;
+constexpr size_t BLOCK_SIZE = 32;
 constexpr auto SAMPLE_RATE = SaiHandle::Config::SampleRate::SAI_48KHZ;
 
 DaisySeed hw;
 CpuLoadMeter cpu_load;
-Passthrough effect;
+Reverb effect;
 daisysp::Oscillator osc;
 
 static float in_buf[2][BLOCK_SIZE];
@@ -58,7 +58,7 @@ int main(void) {
 	cpu_load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
 	initADC();
 
-	osc.Init((float)SAMPLE_RATE);
+	osc.Init(hw.AudioSampleRate());
 	osc.SetWaveform(daisysp::Oscillator::WAVE_SIN);
 	osc.SetFreq(220.0f);
 	osc.SetAmp(0.4f);
@@ -66,22 +66,34 @@ int main(void) {
 	hw.StartAudio(AudioCallback);
 
 	int counter = 0;
+	float total_avg = 0.0f;
+	float max_load = 0.0f;
+	float min_load = 10000.0f;
 
 	while(1) {
-		const float avgLoad = cpu_load.GetAvgCpuLoad();
-		const float maxLoad = cpu_load.GetMaxCpuLoad();
-		const float minLoad = cpu_load.GetMinCpuLoad();
-		hw.PrintLine("Processing Load %:");
-		hw.PrintLine("Max: " FLT_FMT3, FLT_VAR3(maxLoad * 100.0f));
-		hw.PrintLine("Avg: " FLT_FMT3, FLT_VAR3(avgLoad * 100.0f));
-		hw.PrintLine("Min: " FLT_FMT3, FLT_VAR3(minLoad * 100.0f));
-		hw.PrintLine("");
-		counter++;
-		System::Delay(1000);
+		const float avg_sample = cpu_load.GetAvgCpuLoad();
+		if (!std::isnan(avg_sample)) {
+			total_avg += avg_sample;
+			counter++;
+		}
+		const float cur_max = cpu_load.GetMaxCpuLoad();
+		const float cur_min = cpu_load.GetMinCpuLoad();
+		if (!std::isnan(cur_max)) max_load = std::max(cur_max, max_load);
+		if (!std::isnan(cur_min)) min_load = std::min(cur_min, min_load);
+
+		System::Delay(500);
 
 		if (counter == 10) {
-			hw.PrintLine("Resetting CPU Load...");
+			float avg_load = total_avg / (float)counter;
+			hw.PrintLine("Processing Load %:");
+			hw.PrintLine("Max: " FLT_FMT3, FLT_VAR3(max_load * 100.0f));
+			hw.PrintLine("Avg: " FLT_FMT3, FLT_VAR3(avg_load * 100.0f));
+			hw.PrintLine("Min: " FLT_FMT3, FLT_VAR3(min_load * 100.0f));
+			hw.PrintLine("");
 			counter = 0;
+			total_avg = 0.0f;
+			max_load = 0.0f;
+			min_load = 10000.0f;
 			cpu_load.Reset();
 		}
 	}

@@ -91,12 +91,15 @@ struct Delay : BaseEffect {
 
     void init(float sample_rate) override {
         delay_.Init();
+        
     }
 
     inline void process_audio(AudioHandle::InputBuffer& in,
                               AudioHandle::OutputBuffer& out,
                        size_t size,
                        float pot_val) override {
+
+        delay_.SetDelay(pot_val);               
         for(size_t i = 0; i < size; i++) {
             float input = in[0][i];
             const float del_out = delay_.Read();
