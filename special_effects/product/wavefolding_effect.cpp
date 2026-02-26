@@ -1,20 +1,18 @@
 #include "wavefolding_effect.h"
 
-float processWavefolding(float inputSample, float gain) {
-    // 1. Push the volume up
-    float folded = inputSample * gain;
+float processWavefolding(float inputSample, float amount) {
+    // 1. Push the signal to force folds
+    float folded = inputSample * amount;
     
-    // 2. Fold the signal back on itself if it crosses 1.0 or -1.0
+    // 2. Bounce the signal off the 1.0 / -1.0 ceilings
     while (folded > 1.0f || folded < -1.0f) {
         if (folded > 1.0f) {
-            // If it goes over 1.0, mirror it back down
             folded = 2.0f - folded;
         } else if (folded < -1.0f) {
-            // If it goes under -1.0, mirror it back up
             folded = -2.0f - folded;
         }
     }
     
-    // 3. Drop the volume safely for output
-    return folded * 0.5f; 
+    // 3. Return the folded wave. The peak will never exceed 1.0.
+    return folded; 
 }

@@ -1,9 +1,10 @@
 #include "fuzz_effect.h"
-#include <algorithm> // For std::clamp
+#include <algorithm> 
 
-// Define the actual math for the fuzz effect
-float processFuzz(float inputSample, float gain) {
-    float boosted = inputSample * gain; 
-    float clipped = std::clamp(boosted, -1.0f, 1.0f);
-    return clipped * 0.5f; 
+float processFuzz(float inputSample, float amount) {
+    // 1. Push the signal to change the shape
+    float driven = inputSample * amount; 
+    
+    // 2. Hard clip it. The output will never exceed 1.0 or -1.0.
+    return std::clamp(driven, -1.0f, 1.0f);
 }
