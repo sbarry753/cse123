@@ -3,14 +3,16 @@ build_guitar_dataset.py
 
 Creates a transient-triggered + sustain-labeled dataset for low-latency polyphonic guitar note detection.
 
-Key improvement (THIS VERSION):
-- For scale/note-repeat (60 BPM grid with human drift), we now detect the PICK
-  as the *earliest strong positive-going transient*, not the max-energy transient.
+Key improvement:
+- For scale/note-repeat (60 BPM grid with human drift), we detect the PICK
+  as the earliest strong positive-going transient (not max energy).
 
-NEW (negatives):
-- Generates NEGATIVE samples ("no sound being played") from the quiet tail
-  AFTER sustain end, but (IMPORTANT) we now SEARCH for a truly quiet region
-  instead of blindly slicing at sus_end (sus_end can be early on guitar decay).
+NEGATIVES (fixed + reliable):
+- Your recording pattern: 60 BPM, one note per second, and the FIRST second is silent.
+  So we generate negatives from the known silent lead-in (first 1.0s) of each
+  scale/note recording. This is stable and avoids "sus_end is early" problems.
+- Optionally also generate tail-silence negatives inside each 1-second segment, but
+  only when there is enough room and we find a truly quiet region.
 - Global cap on negatives to prevent imbalance (e.g. 100).
 """
 
@@ -43,12 +45,10 @@ SUS_HANGOVER_MS = 60
 SUS_NOISE_PAD_DB = 6.0
 SUS_REL_DROP_DB = 35.0
 
-# ----------------------------
-# NEW: stricter silence detection for NEGATIVE slicing
-# ----------------------------
-NEG_SILENCE_NOISE_PAD_DB = 2.0     # closer to noise floor = stricter
-NEG_SILENCE_REL_DROP_DB = 45.0     # require larger drop from peak = stricter
-NEG_SILENCE_HANGOVER_MS = 120.0    # must stay quiet longer for negatives
+# Neg silence detection (used only for OPTIONAL tail negatives)
+NEG_SILENCE_NOISE_PAD_DB = 2.0
+NEG_SILENCE_REL_DROP_DB = 45.0
+NEG_SILENCE_HANGOVER_MS = 120.0
 
 # Scale fixed-1s segmentation with drift compensation
 SCALE_FIRST_SILENCE_SEC = 1.0
@@ -192,6 +192,15 @@ def relative_type_from_path(path: str) -> str:
     return "unknown"
 
 
+def pad_to_length(x: np.ndarray, length: int, mode: str = "zeros") -> np.ndarray:
+    if len(x) >= length:
+        return x[:length]
+    pad = length - len(x)
+    if mode == "edge" and len(x) > 0:
+        return np.pad(x, (0, pad), mode="edge")
+    return np.pad(x, (0, pad), mode="constant", constant_values=0.0)
+
+
 # ----------------------------
 # Robust onset detection (single/chord)
 # ----------------------------
@@ -254,7 +263,7 @@ def align_and_label_transient(y: np.ndarray, sr: int, onset_sample: int) -> Tupl
 
 
 # ----------------------------
-# Sustain end estimation
+# Sustain end estimation (used for labeling only)
 # ----------------------------
 def _rms_env(y: np.ndarray, frame: int = SUS_FRAME, hop: int = SUS_HOP) -> np.ndarray:
     if len(y) < frame:
@@ -318,7 +327,8 @@ def estimate_sustain_end(y: np.ndarray, sr: int, transient_end: int) -> Tuple[in
 
 
 # ----------------------------
-# NEW: Find truly quiet start for negatives
+# OPTIONAL: Find truly quiet start for tail negatives
+# (Works best when you have >1s of audio available to the right, but we keep it optional.)
 # ----------------------------
 def find_quiet_start_for_negative(
     y: np.ndarray,
@@ -332,11 +342,6 @@ def find_quiet_start_for_negative(
     rel_drop_db: float = NEG_SILENCE_REL_DROP_DB,
     hangover_ms: float = NEG_SILENCE_HANGOVER_MS,
 ) -> Optional[int]:
-    """
-    Returns the first sample index >= search_from_samp where the RMS stays below a
-    STRICT silence threshold for at least min_quiet_ms (and with hangover).
-    If no such region exists, returns None.
-    """
     if len(y) < frame + hop:
         return None
 
@@ -347,42 +352,30 @@ def find_quiet_start_for_negative(
 
     hang_frames = max(1, int((hangover_ms / 1000.0) * sr / hop))
     quiet_frames = max(1, int((min_quiet_ms / 1000.0) * sr / hop))
+    need = max(quiet_frames, hang_frames)
 
-    # Peak after start_frame (local peak)
     peak_db = float(np.max(env_db[start_frame:])) if start_frame < len(env_db) else float(env_db[-1])
 
-    # Noise floor from tail median
     tail_len_s = 0.4
     tail_frames = int((tail_len_s * sr) / hop)
     tail_frames = min(tail_frames, max(10, int(0.15 * len(env_db))))
     tail_start = max(0, len(env_db) - tail_frames)
     noise_db = float(np.median(env_db[tail_start:])) if len(env_db) else -120.0
 
-    # STRICT threshold: take the LOWER of the two (harder to be "below")
     thr_abs_db = noise_db + float(noise_pad_db)
     thr_rel_db = peak_db - float(rel_drop_db)
     thr_db = min(thr_abs_db, thr_rel_db)
 
     below = env_db < thr_db
 
-    # We want a contiguous run of "below" that lasts at least quiet_frames,
-    # and also satisfies hangover (basically a second guard).
-    need = max(quiet_frames, hang_frames)
-
+    last_ok = None
     for f in range(start_frame, len(env_db) - need):
         if np.all(below[f:f + need]):
-            return int(f * hop)
+            last_ok = f
 
-    return None
-
-
-def pad_to_length(x: np.ndarray, length: int, mode: str = "zeros") -> np.ndarray:
-    if len(x) >= length:
-        return x[:length]
-    pad = length - len(x)
-    if mode == "edge" and len(x) > 0:
-        return np.pad(x, (0, pad), mode="edge")
-    return np.pad(x, (0, pad), mode="constant", constant_values=0.0)
+    if last_ok is None:
+        return None
+    return int(last_ok * hop)
 
 
 # ----------------------------
@@ -522,21 +515,13 @@ def build_vocab(collected_midis: List[int]) -> Dict[str, Any]:
             "noise_pad_db": SUS_NOISE_PAD_DB,
             "rel_drop_db": SUS_REL_DROP_DB,
         },
-        "pick_detection": {
-            "frame": PICK_FRAME,
-            "hop": PICK_HOP,
-            "refine": PICK_REFINE,
-            "min_search_ms": PICK_MIN_SEARCH_MS,
-            "max_search_ms": PICK_MAX_SEARCH_MS,
-            "peak_frac": PICK_PEAK_FRAC,
-            "noise_mult": PICK_NOISE_MULT,
-        },
         "negatives": {
             "enabled": False,
             "neg_per_pos": 0,
             "neg_min_silence_ms": 0.0,
             "neg_pad_mode": "zeros",
             "neg_max_total": 0,
+            "neg_source": "lead_silence_first_sec",
             "neg_silence_noise_pad_db": NEG_SILENCE_NOISE_PAD_DB,
             "neg_silence_rel_drop_db": NEG_SILENCE_REL_DROP_DB,
             "neg_silence_hangover_ms": NEG_SILENCE_HANGOVER_MS,
@@ -576,7 +561,120 @@ def safe_string_map_from_chord(parsed: Dict[int, Optional[str]]) -> Tuple[Dict[i
     return string_map, notes_midi
 
 
-def maybe_emit_negative(
+def emit_negative_clip(
+    *,
+    mf,
+    audio_out: str,
+    labels_out: str,
+    out_root: str,
+    raw_root: str,
+    sample_idx: int,
+    source_wav_path: str,
+    take_id: str,
+    sr: int,
+    vocab_size: int,
+    audio_1s: np.ndarray,
+    neg_subtype: str,
+    ref_pos_id: str,
+    extra_dbg: Dict[str, Any],
+) -> int:
+    out_name = f"sample_{sample_idx:06d}.wav"
+    out_wav = os.path.join(audio_out, out_name)
+    write_wav(out_wav, audio_1s, sr)
+
+    label = {
+        "id": f"{sample_idx:06d}",
+        "type": "neg_segment",
+        "neg_subtype": str(neg_subtype),
+        "ref_positive_id": str(ref_pos_id),
+        "source_path": os.path.relpath(source_wav_path, raw_root),
+        "take_id": take_id,
+        "sr": sr,
+        "active_notes_midi": [],
+        "active_notes_pitch": [],
+        "multi_hot": [0] * int(vocab_size),
+        "string_map_midi": {str(k): -1 for k in range(6)},
+        "transient_window_start": 0,
+        "transient_window_end": 0,
+        "sustain_region": [0, 0],
+        "sustain_end_debug": extra_dbg,
+        "onset_sample": 0,
+        "num_samples": int(len(audio_1s)),
+    }
+
+    out_json = os.path.join(labels_out, f"sample_{sample_idx:06d}.json")
+    with open(out_json, "w") as f:
+        json.dump(label, f, indent=2)
+
+    mf.write(json.dumps({
+        "id": label["id"],
+        "audio": os.path.relpath(out_wav, out_root),
+        "label": os.path.relpath(out_json, out_root),
+        "type": "neg_segment",
+    }) + "\n")
+
+    return sample_idx + 1
+
+
+def maybe_emit_negative_from_lead_silence(
+    *,
+    mf,
+    audio_out: str,
+    labels_out: str,
+    out_root: str,
+    raw_root: str,
+    sample_idx: int,
+    source_wav_path: str,
+    take_id: str,
+    sr: int,
+    vocab_size: int,
+    full_y: np.ndarray,
+    lead_silence_sec: float,
+    neg_pad_mode: str,
+    ref_pos_id: str,
+) -> Tuple[int, bool]:
+    """
+    Reliable negatives: slice a 1-second negative out of the FIRST lead_silence_sec seconds.
+    For your recordings, lead_silence_sec should be 1.0.
+    """
+    one_sec = int(sr)
+    lead = int(lead_silence_sec * sr)
+    if lead < one_sec or len(full_y) < one_sec:
+        return sample_idx, False
+
+    # choose random 1s window inside the lead silence region
+    max_start = lead - one_sec
+    st = 0 if max_start <= 0 else int(np.random.randint(0, max_start + 1))
+    neg = full_y[st:st + one_sec].copy()
+    neg = pad_to_length(neg, one_sec, mode=neg_pad_mode)
+
+    dbg = {
+        "neg_source": "lead_silence",
+        "lead_silence_sec": float(lead_silence_sec),
+        "start_sample": int(st),
+        "end_sample": int(st + one_sec),
+    }
+
+    sample_idx = emit_negative_clip(
+        mf=mf,
+        audio_out=audio_out,
+        labels_out=labels_out,
+        out_root=out_root,
+        raw_root=raw_root,
+        sample_idx=sample_idx,
+        source_wav_path=source_wav_path,
+        take_id=take_id,
+        sr=sr,
+        vocab_size=vocab_size,
+        audio_1s=neg,
+        neg_subtype="lead_silence",
+        ref_pos_id=ref_pos_id,
+        extra_dbg=dbg,
+    )
+    return sample_idx, True
+
+
+def maybe_emit_negative_from_tail_silence(
     *,
     mf,
     audio_out: str,
@@ -592,93 +690,64 @@ def maybe_emit_negative(
     seg_out: np.ndarray,
     neg_min_silence_ms: float,
     neg_pad_mode: str,
-    clip_subtype: str,
     ref_pos_id: str,
+    neg_min_after_sus_ms: float = 250.0,
 ) -> Tuple[int, bool]:
     """
-    Build one negative clip from a truly quiet region AFTER sustain end.
-
-    IMPORTANT FIX:
-      - We do NOT assume sus_end is silent.
-      - We search forward from sus_end for a contiguous region of quiet lasting
-        neg_min_silence_ms (with stricter thresholds).
+    Optional negatives: try to find a quiet region AFTER sus_end.
+    IMPORTANT: because seg_out is ~1s long, we only emit a 1s negative if quiet_start is near 0.
+    So instead we emit from quiet_start to END of segment, then pad to 1s.
     """
     one_sec = int(sr)
-    min_sil = int((neg_min_silence_ms / 1000.0) * sr)
-
     sus_end = int(np.clip(sus_end, 0, len(seg_out)))
+    guard = int((neg_min_after_sus_ms / 1000.0) * sr)
+    search_from = int(np.clip(sus_end + guard, 0, len(seg_out)))
 
-    # If there isn't even enough room to be quiet, bail early
-    if (len(seg_out) - sus_end) < max(1, min_sil):
+    min_sil = int((neg_min_silence_ms / 1000.0) * sr)
+    if (len(seg_out) - search_from) < max(1, min_sil):
         return sample_idx, False
 
     quiet_start = find_quiet_start_for_negative(
-        seg_out, sr, search_from_samp=sus_end, min_quiet_ms=neg_min_silence_ms
+        seg_out, sr, search_from_samp=search_from, min_quiet_ms=neg_min_silence_ms
     )
     if quiet_start is None:
         return sample_idx, False
 
     quiet_start = int(np.clip(quiet_start, 0, len(seg_out)))
 
-    # extra safety: ensure the first min_sil samples from quiet_start are actually low-energy
-    if min_sil > 0:
-        probe = seg_out[quiet_start:min(len(seg_out), quiet_start + min_sil)]
-        if probe.size < min_sil:
-            return sample_idx, False
-        # quick RMS gate vs tail RMS
-        probe_rms = float(np.sqrt(np.mean(probe * probe) + 1e-12))
-        tail = seg_out[max(0, len(seg_out) - min_sil):]
-        tail_rms = float(np.sqrt(np.mean(tail * tail) + 1e-12)) if tail.size else probe_rms
-        # probe should be close to tail noise; allow small slack
-        if probe_rms > max(1e-6, tail_rms * 1.8):
-            return sample_idx, False
-
-    neg = seg_out[quiet_start:quiet_start + one_sec].copy()
+    # take from quiet_start to end; pad to 1s
+    neg = seg_out[quiet_start:].copy()
     neg = pad_to_length(neg, one_sec, mode=neg_pad_mode)
 
-    out_name = f"sample_{sample_idx:06d}.wav"
-    out_wav = os.path.join(audio_out, out_name)
-    write_wav(out_wav, neg, sr)
-
-    label = {
-        "id": f"{sample_idx:06d}",
-        "type": "neg_segment",
-        "neg_subtype": clip_subtype,
-        "ref_positive_id": ref_pos_id,
-        "source_path": os.path.relpath(source_wav_path, raw_root),
-        "take_id": take_id,
-        "sr": sr,
-        "active_notes_midi": [],
-        "active_notes_pitch": [],
-        "multi_hot": [0] * int(vocab_size),
-        "string_map_midi": {str(k): -1 for k in range(6)},
-        "transient_window_start": 0,
-        "transient_window_end": 0,
-        "sustain_region": [0, 0],
-        "sustain_end_debug": {
-            "quiet_start": int(quiet_start),
-            "sus_end_used_as_search_from": int(sus_end),
-            "neg_min_silence_ms": float(neg_min_silence_ms),
-            "neg_silence_noise_pad_db": float(NEG_SILENCE_NOISE_PAD_DB),
-            "neg_silence_rel_drop_db": float(NEG_SILENCE_REL_DROP_DB),
-            "neg_silence_hangover_ms": float(NEG_SILENCE_HANGOVER_MS),
-        },
-        "onset_sample": 0,
-        "num_samples": int(one_sec),
+    dbg = {
+        "neg_source": "tail_silence",
+        "quiet_start": int(quiet_start),
+        "sus_end_used": int(sus_end),
+        "search_from": int(search_from),
+        "neg_min_silence_ms": float(neg_min_silence_ms),
+        "neg_min_after_sus_ms": float(neg_min_after_sus_ms),
+        "neg_silence_noise_pad_db": float(NEG_SILENCE_NOISE_PAD_DB),
+        "neg_silence_rel_drop_db": float(NEG_SILENCE_REL_DROP_DB),
+        "neg_silence_hangover_ms": float(NEG_SILENCE_HANGOVER_MS),
     }
 
-    out_json = os.path.join(labels_out, f"sample_{sample_idx:06d}.json")
-    with open(out_json, "w") as f:
-        json.dump(label, f, indent=2)
-
-    mf.write(json.dumps({
-        "id": label["id"],
-        "audio": os.path.relpath(out_wav, out_root),
-        "label": os.path.relpath(out_json, out_root),
-        "type": "neg_segment",
-    }) + "\n")
-
-    return sample_idx + 1, True
+    sample_idx = emit_negative_clip(
+        mf=mf,
+        audio_out=audio_out,
+        labels_out=labels_out,
+        out_root=out_root,
+        raw_root=raw_root,
+        sample_idx=sample_idx,
+        source_wav_path=source_wav_path,
+        take_id=take_id,
+        sr=sr,
+        vocab_size=vocab_size,
+        audio_1s=neg,
+        neg_subtype="tail_silence",
+        ref_pos_id=ref_pos_id,
+        extra_dbg=dbg,
+    )
+    return sample_idx, True
 
 
 # ----------------------------
@@ -694,6 +763,11 @@ def build_dataset(
     neg_min_silence_ms: float = 150.0,
     neg_pad_mode: str = "zeros",
     neg_max_total: int = 100,
+    # NEW: reliable neg source from lead silence
+    neg_use_lead_silence: bool = True,
+    neg_lead_silence_sec: float = 1.0,
+    # Optional: also try tail silence
+    neg_use_tail_silence: bool = False,
 ):
     audio_out = os.path.join(out_root, "audio")
     labels_out = os.path.join(out_root, "labels")
@@ -770,6 +844,9 @@ def build_dataset(
     meta["negatives"]["neg_min_silence_ms"] = float(neg_min_silence_ms)
     meta["negatives"]["neg_pad_mode"] = str(neg_pad_mode)
     meta["negatives"]["neg_max_total"] = int(neg_max_total)
+    meta["negatives"]["neg_use_lead_silence"] = bool(neg_use_lead_silence)
+    meta["negatives"]["neg_lead_silence_sec"] = float(neg_lead_silence_sec)
+    meta["negatives"]["neg_use_tail_silence"] = bool(neg_use_tail_silence)
 
     ensure_dir(out_root)
     with open(os.path.join(out_root, "metadata.json"), "w") as f:
@@ -782,9 +859,18 @@ def build_dataset(
     neg_max_total = int(max(0, neg_max_total))
 
     with open(manifest_path, "w") as mf:
+        # Cache full_y per wav for lead-silence negatives (scale/note only)
+        full_audio_cache: Dict[str, np.ndarray] = {}
+
         for wav_path, rel_type in discovered:
             stem = os.path.splitext(os.path.basename(wav_path))[0]
             take_id = infer_take_id(wav_path)
+
+            # Preload full audio for scale/note (so we can pull lead-silence negatives)
+            if rel_type in ("scale", "note") and add_negatives and neg_use_lead_silence and (neg_written < neg_max_total):
+                if wav_path not in full_audio_cache:
+                    full_y, _sr = read_audio_mono(wav_path, sr)
+                    full_audio_cache[wav_path] = full_y
 
             if rel_type == "single":
                 y, _sr = read_audio_mono(wav_path, sr)
@@ -969,29 +1055,54 @@ def build_dataset(
                     }) + "\n")
                     sample_idx += 1
 
-                    # NEG(s) with global cap
+                    # NEG(s)
                     if add_negatives and (neg_written < neg_max_total):
                         for _ in range(max(1, int(neg_per_pos))):
                             if neg_written >= neg_max_total:
                                 break
-                            sample_idx, wrote = maybe_emit_negative(
-                                mf=mf,
-                                audio_out=audio_out,
-                                labels_out=labels_out,
-                                out_root=out_root,
-                                raw_root=raw_root,
-                                sample_idx=sample_idx,
-                                source_wav_path=wav_path,
-                                take_id=take_id,
-                                sr=sr,
-                                vocab_size=vocab_size,
-                                sus_end=sus_end,
-                                seg_out=seg_out,
-                                neg_min_silence_ms=neg_min_silence_ms,
-                                neg_pad_mode=neg_pad_mode,
-                                clip_subtype="scale_segment",
-                                ref_pos_id=pos_id,
-                            )
+
+                            wrote = False
+                            # 1) Reliable lead-silence negatives
+                            if neg_use_lead_silence:
+                                full_y = full_audio_cache.get(wav_path, None)
+                                if full_y is not None:
+                                    sample_idx, wrote = maybe_emit_negative_from_lead_silence(
+                                        mf=mf,
+                                        audio_out=audio_out,
+                                        labels_out=labels_out,
+                                        out_root=out_root,
+                                        raw_root=raw_root,
+                                        sample_idx=sample_idx,
+                                        source_wav_path=wav_path,
+                                        take_id=take_id,
+                                        sr=sr,
+                                        vocab_size=vocab_size,
+                                        full_y=full_y,
+                                        lead_silence_sec=neg_lead_silence_sec,
+                                        neg_pad_mode=neg_pad_mode,
+                                        ref_pos_id=pos_id,
+                                    )
+
+                            # 2) Optional tail-silence negatives
+                            if (not wrote) and neg_use_tail_silence:
+                                sample_idx, wrote = maybe_emit_negative_from_tail_silence(
+                                    mf=mf,
+                                    audio_out=audio_out,
+                                    labels_out=labels_out,
+                                    out_root=out_root,
+                                    raw_root=raw_root,
+                                    sample_idx=sample_idx,
+                                    source_wav_path=wav_path,
+                                    take_id=take_id,
+                                    sr=sr,
+                                    vocab_size=vocab_size,
+                                    sus_end=sus_end,
+                                    seg_out=seg_out,
+                                    neg_min_silence_ms=neg_min_silence_ms,
+                                    neg_pad_mode=neg_pad_mode,
+                                    ref_pos_id=pos_id,
+                                )
+
                             if wrote:
                                 neg_written += 1
 
@@ -1092,29 +1203,54 @@ def build_dataset(
                     }) + "\n")
                     sample_idx += 1
 
-                    # NEG(s) with global cap
+                    # NEG(s)
                     if add_negatives and (neg_written < neg_max_total):
                         for _ in range(max(1, int(neg_per_pos))):
                             if neg_written >= neg_max_total:
                                 break
-                            sample_idx, wrote = maybe_emit_negative(
-                                mf=mf,
-                                audio_out=audio_out,
-                                labels_out=labels_out,
-                                out_root=out_root,
-                                raw_root=raw_root,
-                                sample_idx=sample_idx,
-                                source_wav_path=wav_path,
-                                take_id=take_id,
-                                sr=sr,
-                                vocab_size=vocab_size,
-                                sus_end=sus_end,
-                                seg_out=seg_out,
-                                neg_min_silence_ms=neg_min_silence_ms,
-                                neg_pad_mode=neg_pad_mode,
-                                clip_subtype="note_repeat_segment",
-                                ref_pos_id=pos_id,
-                            )
+
+                            wrote = False
+                            if neg_use_lead_silence:
+                                full_y = full_audio_cache.get(wav_path, None)
+                                if full_y is None:
+                                    full_y, _ = read_audio_mono(wav_path, sr)
+                                    full_audio_cache[wav_path] = full_y
+                                sample_idx, wrote = maybe_emit_negative_from_lead_silence(
+                                    mf=mf,
+                                    audio_out=audio_out,
+                                    labels_out=labels_out,
+                                    out_root=out_root,
+                                    raw_root=raw_root,
+                                    sample_idx=sample_idx,
+                                    source_wav_path=wav_path,
+                                    take_id=take_id,
+                                    sr=sr,
+                                    vocab_size=vocab_size,
+                                    full_y=full_y,
+                                    lead_silence_sec=neg_lead_silence_sec,
+                                    neg_pad_mode=neg_pad_mode,
+                                    ref_pos_id=pos_id,
+                                )
+
+                            if (not wrote) and neg_use_tail_silence:
+                                sample_idx, wrote = maybe_emit_negative_from_tail_silence(
+                                    mf=mf,
+                                    audio_out=audio_out,
+                                    labels_out=labels_out,
+                                    out_root=out_root,
+                                    raw_root=raw_root,
+                                    sample_idx=sample_idx,
+                                    source_wav_path=wav_path,
+                                    take_id=take_id,
+                                    sr=sr,
+                                    vocab_size=vocab_size,
+                                    sus_end=sus_end,
+                                    seg_out=seg_out,
+                                    neg_min_silence_ms=neg_min_silence_ms,
+                                    neg_pad_mode=neg_pad_mode,
+                                    ref_pos_id=pos_id,
+                                )
+
                             if wrote:
                                 neg_written += 1
 
@@ -1138,17 +1274,28 @@ def main():
 
     # Negatives
     ap.add_argument("--add_negatives", action="store_true",
-                    help="Generate negative (no-sound) samples from quiet tails after sustain end.")
+                    help="Generate negative (no-sound) samples.")
     ap.add_argument("--neg_per_pos", type=int, default=1,
                     help="How many negatives to try per positive segment (scale/note).")
-    ap.add_argument("--neg_min_silence_ms", type=float, default=150.0,
-                    help="Require at least this much silence (contiguous) to generate a negative.")
     ap.add_argument("--neg_pad_mode", type=str, default="zeros", choices=["zeros", "edge"],
                     help="Padding mode for negative clips.")
     ap.add_argument("--neg_max_total", type=int, default=100,
                     help="Global cap on total negatives to generate (prevents imbalance).")
 
+    # New: reliable lead-silence negatives
+    ap.add_argument("--neg_use_lead_silence", type=int, default=1,
+                    help="Use first silent second of scale/note recordings for negatives (recommended).")
+    ap.add_argument("--neg_lead_silence_sec", type=float, default=1.0,
+                    help="How many seconds at the start are guaranteed silent (your setup: 1.0).")
+
+    # Optional tail silence
+    ap.add_argument("--neg_use_tail_silence", type=int, default=0,
+                    help="Also try generating negatives from tail silence inside each 1s segment (optional).")
+    ap.add_argument("--neg_min_silence_ms", type=float, default=150.0,
+                    help="(Tail silence only) require this much contiguous silence.")
+
     args = ap.parse_args()
+
     build_dataset(
         args.raw,
         args.out,
@@ -1158,6 +1305,9 @@ def main():
         neg_min_silence_ms=args.neg_min_silence_ms,
         neg_pad_mode=args.neg_pad_mode,
         neg_max_total=args.neg_max_total,
+        neg_use_lead_silence=bool(args.neg_use_lead_silence),
+        neg_lead_silence_sec=float(args.neg_lead_silence_sec),
+        neg_use_tail_silence=bool(args.neg_use_tail_silence),
     )
 
 
