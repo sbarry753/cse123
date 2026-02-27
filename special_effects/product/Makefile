@@ -1,21 +1,8 @@
-# The compiler
-CXX = g++
-
-# Compiler flags
-CXXFLAGS = -std=c++17 -Wall
-
-# Target executable name
 TARGET = effect_processor
+CPP_SOURCES = main.cpp
 
-# All source files to compile
-SRCS = main.cpp fuzz_effect.cpp distortion_effect.cpp wavefolding_effect.cpp
+LIBDAISY_DIR = libDaisy
+DAISYSP_DIR = DaisySP
+SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 
-# Default target
-all: $(TARGET)
-
-$(TARGET): $(SRCS)
-	$(CXX) $(CXXFLAGS) $(SRCS) -o $(TARGET)
-
-# Clean up compiled files
-clean:
-	rm -f $(TARGET) output.wav
+include $(SYSTEM_FILES_DIR)/Makefile

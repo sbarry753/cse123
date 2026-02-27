@@ -1,78 +1,45 @@
-//#include "DaisySP/daisysp.h"
-#include <iostream>
-#include <string>
-#include "AudioFile.h"
+#include "daisy_seed.h"
 #include "fuzz_effect.h"
 #include "distortion_effect.h"
 #include "wavefolding_effect.h"
 #include "agc.h"
 
-int main(int argc, char* argv[]) {
-    // We now expect 4 arguments: the program, the gain, the effect, and the file
-    if (argc < 4) {
-        std::cerr << "Usage: ./effect_processor <gain> <effect_name> <path_to_input_file.wav>\n";
-        std::cerr << "Example: ./effect_processor 10.5 fuzz_effect audio.wav\n";
-        return 1;
-    }
+using namespace daisy;
 
-    // 1. Parse the arguments
-    float userGain = 0.0f;
-    try {
-        userGain = std::stof(argv[1]); // Convert the text input into a decimal number
-    } catch (const std::exception& e) {
-        std::cerr << "Error: Gain must be a valid number.\n";
-        return 1;
-    }
-    
-    std::string effectName = argv[2];
-    std::string inputFile = argv[3];
-    std::string outputFile = "output.wav";
+DaisySeed hw;
+AutoGainControl agc[2]; // one per channel
 
-    // 2. Validate the effect name before doing any heavy lifting
-    if (effectName != "fuzz_effect" && effectName != "distortion_effect" && effectName != "wavefolding_effect") {
-        std::cerr << "Error: Unknown effect '" << effectName << "'\n";
-        std::cerr << "Available effects: fuzz_effect, distortion_effect, wavefolding_effect\n";
-        return 1;
-    }
+// This replaces your for loop — the hardware calls it automatically
+void AudioCallback(AudioHandle::InputBuffer in,
+                   AudioHandle::OutputBuffer out,
+                   size_t size) {
 
-    AudioFile<float> audioFile;
+    // Read knob on ADC pin 0 for gain (maps 0.0-1.0 to 1.0-20.0)
+    float userGain = 1.0f + hw.adc.GetFloat(0) * 19.0f;
 
-    if (!audioFile.load(inputFile)) {
-        std::cerr << "Error: Could not load " << inputFile << "\n";
-        return 1;
-    }
-
-    int numChannels = audioFile.getNumChannels();
-    int numSamples = audioFile.getNumSamplesPerChannel();
-
-    // Create our real-time volume leveler
-    AutoGainControl agc;
-
-    std::cout << "Processing audio in real-time with a gain of " << userGain << "...\n";
-
-    for (int channel = 0; channel < numChannels; channel++) {
-        for (int i = 0; i < numSamples; i++) {
-            float cleanSample = audioFile.samples[channel][i];
-            float shapedSample = 0.0f;
-
-            // 3. Apply the raw math using your custom userGain variable
-            if (effectName == "fuzz_effect") {
-                shapedSample = processFuzz(cleanSample, userGain);
-            } 
-            else if (effectName == "distortion_effect") {
-                shapedSample = processDistortion(cleanSample, userGain);
-            }
-            else if (effectName == "wavefolding_effect") {
-                shapedSample = processWavefolding(cleanSample, userGain);
-            }
+    for (size_t i = 0; i < size; i++) {
+        for (int ch = 0; ch < 2; ch++) {
+            float cleanSample = in[ch][i];
             
-            // 4. Pass the clean and shaped samples to the AGC to fix the VOLUME
-            audioFile.samples[channel][i] = agc.process(cleanSample, shapedSample);
+            // For now hardcode an effect — later a switch can read a physical switch pin
+            float shapedSample = processDistortion(cleanSample, userGain);
+            
+            out[ch][i] = agc[ch].process(cleanSample, shapedSample);
         }
     }
+}
 
-    audioFile.save(outputFile);
-    std::cout << "Success! Effect applied and saved to " << outputFile << "\n";
+int main() {
+    hw.Init();
+    hw.SetAudioBlockSize(4);
 
-    return 0;
+    // Set up one ADC pin for the gain knob
+    AdcChannelConfig adcConfig;
+    adcConfig.InitSingle(hw.GetPin(15)); // pin 15 is a common ADC pin on the Seed
+    hw.adc.Init(&adcConfig, 1);
+    hw.adc.Start();
+
+    hw.StartAudio(AudioCallback);
+
+    while (true) {} // everything happens in the callback
 }

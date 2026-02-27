@@ -4,3 +4,6 @@
 [submodule "lib/DaisySP"]
 	path = lib/DaisySP
 	url = https://github.com/electro-smith/DaisySP.git
+[submodule "special_effects/product/libDaisy"]
+	path = special_effects/product/libDaisy
+	url = https://github.com/electro-smith/libDaisy

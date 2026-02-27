@@ -1,3 +1,6 @@
+#ifndef AGC_H
+#define AGC_H
+
 #include <cmath>
 
 class AutoGainControl {
@@ -34,3 +37,4 @@ public:
     }
 };
 
+#endif // AGC_H
