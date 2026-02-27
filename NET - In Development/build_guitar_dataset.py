@@ -3,27 +3,40 @@ build_guitar_dataset.py
 
 Creates a transient-triggered + sustain-labeled dataset for low-latency polyphonic guitar note detection.
 
-NEW (string classifier support):
+UPDATED (explicit region labels):
+- Adds "pick_region": [start, end] (attack window) in *saved-clip sample coordinates*
+- Adds "sustain_region": [start, end] in *saved-clip sample coordinates*
+- Adds "segment_source_region": [abs_start, abs_end] region in the ORIGINAL source wav
+- Adds "onset_source_sample": absolute onset sample in the ORIGINAL source wav (0 for negatives)
+
+IMPORTANT behavioral change for scale/note-repeat (1-second interval recordings):
+- We DO NOT trim/realign the 1-second segment anymore.
+- We keep seg_out exactly 1.0s (padded if needed).
+- Onset/pick/sustain regions are labeled inside that 1.0s saved clip.
+This makes "pick_region" and "sustain_region" stable and easy to use for overlap-based targets
+even if your training crops randomly.
+
+String classifier support (unchanged):
 - Adds "string_idx" to every label JSON:
     0 = low E, 1 = A, 2 = D, 3 = G, 4 = B, 5 = high E
 - For filenames like "F4_5.wav", "_5" is used as string_idx.
 - If NO "_#" suffix exists, assumes string_idx = 0 (low E).
 - For scale files (e.g. "A2-A4.wav") where filename doesn't include "_#",
-  we infer string_idx from folder name if possible (e.g. ".../string_3/..."),
+  infer string_idx from folder name if possible (e.g. ".../string_3/..."),
   otherwise default to 0.
-- For chord files, string_idx is set to -1 (multi-string / not a single string).
+- For chord files, string_idx = -1 (multi-string / unknown).
 
-Key improvement:
-- For scale/note-repeat (60 BPM grid with human drift), we detect the PICK
-  as the earliest strong positive-going transient (not max energy).
+Negatives:
+- If enabled, generate negatives from the known silent lead-in (first 1.0s) of each
+  scale/note recording (stable).
+- Optional tail-silence negatives inside each 1-second segment (only if truly quiet).
+- Global cap on negatives.
 
-NEGATIVES (fixed + reliable):
-- Your recording pattern: 60 BPM, one note per second, and the FIRST second is silent.
-  So we generate negatives from the known silent lead-in (first 1.0s) of each
-  scale/note recording. This is stable and avoids "sus_end is early" problems.
-- Optionally also generate tail-silence negatives inside each 1-second segment, but
-  only when there is enough room and we find a truly quiet region.
-- Global cap on negatives to prevent imbalance (e.g. 100).
+Output:
+- out_root/audio/sample_XXXXXX.wav
+- out_root/labels/sample_XXXXXX.json
+- out_root/manifest.jsonl
+- out_root/metadata.json
 """
 
 import os
@@ -42,9 +55,9 @@ import soundfile as sf
 # ----------------------------
 DEFAULT_SR = 48000
 
-TRANSIENT_MS = 5.0
-PRE_ROLL_MS = 2.0
-ONSET_SEARCH_MAX_MS = 80.0
+TRANSIENT_MS = 5.0          # pick/attack region length
+PRE_ROLL_MS = 2.0           # for single/chord trim behavior (kept)
+ONSET_SEARCH_MAX_MS = 80.0  # (single/chord) onset detect search limit if desired
 
 # Sustain end detection tuning
 SUS_HOP = 128
@@ -212,7 +225,7 @@ def pad_to_length(x: np.ndarray, length: int, mode: str = "zeros") -> np.ndarray
 
 
 # ----------------------------
-# String helpers (NEW)
+# String helpers
 # ----------------------------
 def infer_string_idx_from_path(path: str) -> int:
     """
@@ -229,7 +242,7 @@ def infer_string_idx_from_path(path: str) -> int:
 
 
 # ----------------------------
-# Robust onset detection (single/chord)
+# Onset detection (single/chord)
 # ----------------------------
 def detect_onset_sample(y: np.ndarray, sr: int, search_limit_ms: Optional[float] = None) -> int:
     if len(y) < int(0.01 * sr):
@@ -274,11 +287,20 @@ def detect_onset_sample(y: np.ndarray, sr: int, search_limit_ms: Optional[float]
 
 
 # ----------------------------
-# Transient alignment
+# Transient alignment (legacy; kept for single/chord)
 # ----------------------------
-def align_and_label_transient(y: np.ndarray, sr: int, onset_sample: int) -> Tuple[np.ndarray, int, int, int]:
+def transient_len_samples(sr: int) -> int:
+    return int(round((TRANSIENT_MS / 1000.0) * sr))
+
+
+def align_and_label_transient(y: np.ndarray, sr: int, onset_sample: int) -> Tuple[np.ndarray, int, int, int, int]:
+    """
+    Trims y so the onset is near the start (with PRE_ROLL_MS),
+    and returns:
+      y_out, onset_out, transient_start, transient_end, trim_start_in_source
+    """
     pre = int((PRE_ROLL_MS / 1000.0) * sr)
-    tlen = int((TRANSIENT_MS / 1000.0) * sr)
+    tlen = transient_len_samples(sr)
 
     trim_start = max(0, onset_sample - pre)
     y_out = y[trim_start:].copy()
@@ -286,11 +308,11 @@ def align_and_label_transient(y: np.ndarray, sr: int, onset_sample: int) -> Tupl
     onset_out = onset_sample - trim_start
     transient_start = onset_out
     transient_end = min(len(y_out), transient_start + tlen)
-    return y_out, onset_out, transient_start, transient_end
+    return y_out, onset_out, transient_start, transient_end, trim_start
 
 
 # ----------------------------
-# Sustain end estimation (used for labeling only)
+# Sustain end estimation (labeling only)
 # ----------------------------
 def _rms_env(y: np.ndarray, frame: int = SUS_FRAME, hop: int = SUS_HOP) -> np.ndarray:
     if len(y) < frame:
@@ -557,12 +579,17 @@ def build_vocab(collected_midis: List[int]) -> Dict[str, Any]:
             "neg_silence_rel_drop_db": NEG_SILENCE_REL_DROP_DB,
             "neg_silence_hangover_ms": NEG_SILENCE_HANGOVER_MS,
         },
-        # Optional: document string labeling
         "string_labeling": {
             "string_idx_meaning": "0=lowE, 1=A, 2=D, 3=G, 4=B, 5=highE; -1=unknown/multi",
             "filename_suffix_rule": "If filename token ends with _<0..5>, use that. If absent, default 0.",
             "scale_path_rule": "If scale filename has no suffix, try infer from folder like string_3, else default 0.",
             "chord_rule": "string_idx = -1",
+        },
+        "region_labels": {
+            "pick_region": "Attack window in saved clip samples: [onset_sample, onset_sample + transient_len)",
+            "sustain_region": "Sustain region in saved clip samples: [pick_end, sustain_end)",
+            "segment_source_region": "Where the saved clip came from in the original wav: [abs_start, abs_end)",
+            "onset_source_sample": "Absolute onset sample in original wav",
         }
     }
 
@@ -615,11 +642,15 @@ def emit_negative_clip(
     neg_subtype: str,
     ref_pos_id: str,
     extra_dbg: Dict[str, Any],
-    string_idx: int,  # NEW
+    string_idx: int,
+    segment_source_region: Optional[Tuple[int, int]] = None,
 ) -> int:
     out_name = f"sample_{sample_idx:06d}.wav"
     out_wav = os.path.join(audio_out, out_name)
     write_wav(out_wav, audio_1s, sr)
+
+    if segment_source_region is None:
+        segment_source_region = (0, int(len(audio_1s)))
 
     label = {
         "id": f"{sample_idx:06d}",
@@ -629,16 +660,25 @@ def emit_negative_clip(
         "source_path": os.path.relpath(source_wav_path, raw_root),
         "take_id": take_id,
         "sr": sr,
-        "string_idx": int(string_idx),  # NEW
+        "string_idx": int(string_idx),
+
         "active_notes_midi": [],
         "active_notes_pitch": [],
         "multi_hot": [0] * int(vocab_size),
         "string_map_midi": {str(k): -1 for k in range(6)},
+
+        # Regions
+        "segment_source_region": [int(segment_source_region[0]), int(segment_source_region[1])],
+        "onset_source_sample": 0,
+        "onset_sample": 0,
+        "pick_region": [0, 0],
+        "sustain_region": [0, 0],
+
+        # Legacy fields (kept)
         "transient_window_start": 0,
         "transient_window_end": 0,
-        "sustain_region": [0, 0],
         "sustain_end_debug": extra_dbg,
-        "onset_sample": 0,
+
         "num_samples": int(len(audio_1s)),
     }
 
@@ -673,10 +713,6 @@ def maybe_emit_negative_from_lead_silence(
     neg_pad_mode: str,
     ref_pos_id: str,
 ) -> Tuple[int, bool]:
-    """
-    Reliable negatives: slice a 1-second negative out of the FIRST lead_silence_sec seconds.
-    For your recordings, lead_silence_sec should be 1.0.
-    """
     one_sec = int(sr)
     lead = int(lead_silence_sec * sr)
     if lead < one_sec or len(full_y) < one_sec:
@@ -711,7 +747,8 @@ def maybe_emit_negative_from_lead_silence(
         neg_subtype="lead_silence",
         ref_pos_id=ref_pos_id,
         extra_dbg=dbg,
-        string_idx=sidx,  # NEW
+        string_idx=sidx,
+        segment_source_region=(int(st), int(st + one_sec)),
     )
     return sample_idx, True
 
@@ -735,9 +772,6 @@ def maybe_emit_negative_from_tail_silence(
     ref_pos_id: str,
     neg_min_after_sus_ms: float = 250.0,
 ) -> Tuple[int, bool]:
-    """
-    Optional negatives: try to find a quiet region AFTER sus_end.
-    """
     one_sec = int(sr)
     sus_end = int(np.clip(sus_end, 0, len(seg_out)))
     guard = int((neg_min_after_sus_ms / 1000.0) * sr)
@@ -787,7 +821,8 @@ def maybe_emit_negative_from_tail_silence(
         neg_subtype="tail_silence",
         ref_pos_id=ref_pos_id,
         extra_dbg=dbg,
-        string_idx=sidx,  # NEW
+        string_idx=sidx,
+        segment_source_region=(int(quiet_start), int(min(len(seg_out), quiet_start + one_sec))),
     )
     return sample_idx, True
 
@@ -849,6 +884,7 @@ def build_dataset(
                 discovered.append((wav_path, "chord"))
 
             else:
+                # Fallback guesses
                 if NOTE_RE.match(stem) or re.search(r'_[0-5]$', stem):
                     pitch, _ = parse_single_filename(stem)
                     all_midis.append(pitch_to_midi(pitch))
@@ -897,6 +933,7 @@ def build_dataset(
 
     neg_written = 0
     neg_max_total = int(max(0, neg_max_total))
+    tlen = transient_len_samples(sr)
 
     with open(manifest_path, "w") as mf:
         full_audio_cache: Dict[str, np.ndarray] = {}
@@ -910,6 +947,9 @@ def build_dataset(
                     full_y, _sr = read_audio_mono(wav_path, sr)
                     full_audio_cache[wav_path] = full_y
 
+            # ----------------------------
+            # SINGLE
+            # ----------------------------
             if rel_type == "single":
                 y, _sr = read_audio_mono(wav_path, sr)
                 pitch, sidx = parse_single_filename(stem)
@@ -918,9 +958,13 @@ def build_dataset(
                 notes_midi = [int(midi_note)]
                 string_map = safe_string_map_from_single(sidx, midi_note)
 
-                onset = detect_onset_sample(y, sr)
-                y_out, onset_out, t_start, t_end = align_and_label_transient(y, sr, onset)
+                onset_abs = detect_onset_sample(y, sr, search_limit_ms=ONSET_SEARCH_MAX_MS)
+                y_out, onset_out, t_start, t_end, trim_start = align_and_label_transient(y, sr, onset_abs)
                 sus_end, sus_dbg = estimate_sustain_end(y_out, sr, t_end)
+                sus_end = min(sus_end, len(y_out))
+
+                pick_region = [int(t_start), int(t_end)]
+                sustain_region = [int(t_end), int(sus_end)]
 
                 out_name = f"sample_{sample_idx:06d}.wav"
                 out_wav = os.path.join(audio_out, out_name)
@@ -932,16 +976,25 @@ def build_dataset(
                     "source_path": os.path.relpath(wav_path, raw_root),
                     "take_id": take_id,
                     "sr": sr,
-                    "string_idx": int(sidx),  # NEW
+                    "string_idx": int(sidx),
+
                     "active_notes_midi": notes_midi,
                     "active_notes_pitch": [midi_to_pitch(midi_note)],
                     "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
                     "string_map_midi": {str(k): int(v) for k, v in string_map.items()},
+
+                    # Regions (NEW)
+                    "segment_source_region": [int(trim_start), int(len(y))],
+                    "onset_source_sample": int(onset_abs),
+                    "onset_sample": int(onset_out),
+                    "pick_region": pick_region,
+                    "sustain_region": sustain_region,
+
+                    # Legacy fields (kept)
                     "transient_window_start": int(t_start),
                     "transient_window_end": int(t_end),
-                    "sustain_region": [int(t_end), int(min(sus_end, len(y_out)))],
                     "sustain_end_debug": sus_dbg,
-                    "onset_sample": int(onset_out),
+
                     "num_samples": int(len(y_out)),
                 }
 
@@ -957,6 +1010,9 @@ def build_dataset(
                 }) + "\n")
                 sample_idx += 1
 
+            # ----------------------------
+            # CHORD
+            # ----------------------------
             elif rel_type == "chord":
                 y, _sr = read_audio_mono(wav_path, sr)
                 parsed = parse_chord_filename(stem)
@@ -966,9 +1022,13 @@ def build_dataset(
                     print(f"[WARN] Chord parsed with 0 notes, skipping: {wav_path}")
                     continue
 
-                onset = detect_onset_sample(y, sr)
-                y_out, onset_out, t_start, t_end = align_and_label_transient(y, sr, onset)
+                onset_abs = detect_onset_sample(y, sr, search_limit_ms=ONSET_SEARCH_MAX_MS)
+                y_out, onset_out, t_start, t_end, trim_start = align_and_label_transient(y, sr, onset_abs)
                 sus_end, sus_dbg = estimate_sustain_end(y_out, sr, t_end)
+                sus_end = min(sus_end, len(y_out))
+
+                pick_region = [int(t_start), int(t_end)]
+                sustain_region = [int(t_end), int(sus_end)]
 
                 out_name = f"sample_{sample_idx:06d}.wav"
                 out_wav = os.path.join(audio_out, out_name)
@@ -980,16 +1040,25 @@ def build_dataset(
                     "source_path": os.path.relpath(wav_path, raw_root),
                     "take_id": take_id,
                     "sr": sr,
-                    "string_idx": -1,  # NEW (multi-string)
+                    "string_idx": -1,
+
                     "active_notes_midi": notes_midi,
                     "active_notes_pitch": [midi_to_pitch(m) for m in notes_midi],
                     "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
                     "string_map_midi": {str(k): int(v) for k, v in string_map.items()},
+
+                    # Regions (NEW)
+                    "segment_source_region": [int(trim_start), int(len(y))],
+                    "onset_source_sample": int(onset_abs),
+                    "onset_sample": int(onset_out),
+                    "pick_region": pick_region,
+                    "sustain_region": sustain_region,
+
+                    # Legacy fields
                     "transient_window_start": int(t_start),
                     "transient_window_end": int(t_end),
-                    "sustain_region": [int(t_end), int(min(sus_end, len(y_out)))],
                     "sustain_end_debug": sus_dbg,
-                    "onset_sample": int(onset_out),
+
                     "num_samples": int(len(y_out)),
                 }
 
@@ -1005,13 +1074,16 @@ def build_dataset(
                 }) + "\n")
                 sample_idx += 1
 
+            # ----------------------------
+            # SCALE (1-second segments, NOT trimmed)
+            # ----------------------------
             elif rel_type == "scale":
                 y, _sr = read_audio_mono(wav_path, sr)
                 start_pitch, end_pitch = parse_scale_filename(stem)
                 start_midi = pitch_to_midi(start_pitch)
                 n_notes = scale_note_count(start_pitch, end_pitch)
 
-                scale_string_idx = infer_string_idx_from_path(wav_path)  # NEW
+                scale_string_idx = infer_string_idx_from_path(wav_path)
 
                 one_sec = sr
                 half = int(SCALE_SEARCH_HALF_SEC * sr)
@@ -1030,19 +1102,21 @@ def build_dataset(
                 if len(picks) < n_notes:
                     print(f"[WARN] Scale file ended early or missing notes; found {len(picks)}/{n_notes}: {wav_path}")
 
+                # Ensure monotonic picks
                 for i in range(1, len(picks)):
                     if picks[i] <= picks[i - 1] + int(0.05 * sr):
                         picks[i] = min(len(y) - 1, picks[i - 1] + int(0.05 * sr))
 
-                for i, pick in enumerate(picks):
+                for i, pick_abs in enumerate(picks):
                     midi_note = int(start_midi + i)
                     notes_midi = [midi_note]
 
-                    clip_start = pick - pre
-                    clip_end = clip_start + one_sec
+                    # Build a 1-second segment around the pick with pre-roll
+                    clip_start = int(pick_abs - pre)
+                    clip_end = int(clip_start + one_sec)
 
                     if i + 1 < len(picks):
-                        latest_end = picks[i + 1] - guard
+                        latest_end = int(picks[i + 1] - guard)
                         if clip_end > latest_end:
                             clip_end = latest_end
                             clip_start = clip_end - one_sec
@@ -1053,11 +1127,19 @@ def build_dataset(
                     seg = y[clip_start:min(len(y), clip_end)].copy()
                     seg = pad_to_length(seg, one_sec, mode=SCALE_PAD_MODE)
 
-                    onset_local = int(np.clip(pick - clip_start, 0, one_sec - 1))
-                    seg_out, onset_out, t_start, t_end = align_and_label_transient(seg, sr, onset_local)
+                    onset_local = int(np.clip(pick_abs - clip_start, 0, one_sec - 1))
+
+                    # NO TRIM: seg_out is exactly 1 second
+                    seg_out = seg
+                    onset_out = onset_local
+                    t_start = onset_out
+                    t_end = min(len(seg_out), t_start + tlen)
 
                     sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
                     sus_end = min(sus_end, len(seg_out))
+
+                    pick_region = [int(t_start), int(t_end)]
+                    sustain_region = [int(t_end), int(sus_end)]
 
                     pos_id = f"{sample_idx:06d}"
                     out_name = f"sample_{sample_idx:06d}.wav"
@@ -1070,18 +1152,28 @@ def build_dataset(
                         "source_path": os.path.relpath(wav_path, raw_root),
                         "take_id": take_id,
                         "sr": sr,
-                        "string_idx": int(scale_string_idx),  # NEW
+                        "string_idx": int(scale_string_idx),
+
                         "scale_segment_index": i,
                         "expected_time_sec": float(SCALE_FIRST_SILENCE_SEC + i * SCALE_STEP_SEC),
+
                         "active_notes_midi": notes_midi,
                         "active_notes_pitch": [midi_to_pitch(midi_note)],
                         "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
                         "string_map_midi": {str(k): -1 for k in range(6)},
+
+                        # Regions (NEW)
+                        "segment_source_region": [int(clip_start), int(min(len(y), clip_start + one_sec))],
+                        "onset_source_sample": int(pick_abs),
+                        "onset_sample": int(onset_out),
+                        "pick_region": pick_region,
+                        "sustain_region": sustain_region,
+
+                        # Legacy fields
                         "transient_window_start": int(t_start),
                         "transient_window_end": int(t_end),
-                        "sustain_region": [int(t_end), int(sus_end)],
                         "sustain_end_debug": sus_dbg,
-                        "onset_sample": int(onset_out),
+
                         "num_samples": int(len(seg_out)),
                     }
 
@@ -1097,6 +1189,7 @@ def build_dataset(
                     }) + "\n")
                     sample_idx += 1
 
+                    # Negatives
                     if add_negatives and (neg_written < neg_max_total):
                         for _ in range(max(1, int(neg_per_pos))):
                             if neg_written >= neg_max_total:
@@ -1145,6 +1238,9 @@ def build_dataset(
                             if wrote:
                                 neg_written += 1
 
+            # ----------------------------
+            # NOTE-REPEAT (1-second segments, NOT trimmed)
+            # ----------------------------
             elif rel_type == "note":
                 y, _sr = read_audio_mono(wav_path, sr)
                 pitch, sidx = parse_single_filename(stem)
@@ -1180,14 +1276,14 @@ def build_dataset(
 
                 string_map = safe_string_map_from_single(sidx, midi_note)
 
-                for i, pick in enumerate(picks[:n_reps]):
+                for i, pick_abs in enumerate(picks[:n_reps]):
                     notes_midi = [midi_note]
 
-                    clip_start = pick - pre
-                    clip_end = clip_start + one_sec
+                    clip_start = int(pick_abs - pre)
+                    clip_end = int(clip_start + one_sec)
 
                     if i + 1 < len(picks):
-                        latest_end = picks[i + 1] - guard
+                        latest_end = int(picks[i + 1] - guard)
                         if clip_end > latest_end:
                             clip_end = latest_end
                             clip_start = clip_end - one_sec
@@ -1198,11 +1294,19 @@ def build_dataset(
                     seg = y[clip_start:min(len(y), clip_end)].copy()
                     seg = pad_to_length(seg, one_sec, mode=NOTE_PAD_MODE)
 
-                    onset_local = int(np.clip(pick - clip_start, 0, one_sec - 1))
-                    seg_out, onset_out, t_start, t_end = align_and_label_transient(seg, sr, onset_local)
+                    onset_local = int(np.clip(pick_abs - clip_start, 0, one_sec - 1))
+
+                    # NO TRIM: seg_out is exactly 1 second
+                    seg_out = seg
+                    onset_out = onset_local
+                    t_start = onset_out
+                    t_end = min(len(seg_out), t_start + tlen)
 
                     sus_end, sus_dbg = estimate_sustain_end(seg_out, sr, t_end)
                     sus_end = min(sus_end, len(seg_out))
+
+                    pick_region = [int(t_start), int(t_end)]
+                    sustain_region = [int(t_end), int(sus_end)]
 
                     pos_id = f"{sample_idx:06d}"
                     out_name = f"sample_{sample_idx:06d}.wav"
@@ -1215,18 +1319,28 @@ def build_dataset(
                         "source_path": os.path.relpath(wav_path, raw_root),
                         "take_id": take_id,
                         "sr": sr,
-                        "string_idx": int(sidx),  # NEW
+                        "string_idx": int(sidx),
+
                         "note_repeat_index": i,
                         "expected_time_sec": float(NOTE_FIRST_SILENCE_SEC + i * NOTE_STEP_SEC),
+
                         "active_notes_midi": notes_midi,
                         "active_notes_pitch": [midi_to_pitch(midi_note)],
                         "multi_hot": encode_multi_hot(notes_midi, midi_to_index, vocab_size),
                         "string_map_midi": {str(k): int(v) for k, v in string_map.items()},
+
+                        # Regions (NEW)
+                        "segment_source_region": [int(clip_start), int(min(len(y), clip_start + one_sec))],
+                        "onset_source_sample": int(pick_abs),
+                        "onset_sample": int(onset_out),
+                        "pick_region": pick_region,
+                        "sustain_region": sustain_region,
+
+                        # Legacy fields
                         "transient_window_start": int(t_start),
                         "transient_window_end": int(t_end),
-                        "sustain_region": [int(t_end), int(sus_end)],
                         "sustain_end_debug": sus_dbg,
-                        "onset_sample": int(onset_out),
+
                         "num_samples": int(len(seg_out)),
                     }
 
@@ -1301,7 +1415,7 @@ def build_dataset(
     if add_negatives:
         print(f"- negatives_written: {neg_written}/{neg_max_total}")
     else:
-        print(f"- negatives_written: 0")
+        print("- negatives_written: 0")
 
 
 def main():
@@ -1320,7 +1434,7 @@ def main():
     ap.add_argument("--neg_max_total", type=int, default=100,
                     help="Global cap on total negatives to generate (prevents imbalance).")
 
-    # New: reliable lead-silence negatives
+    # Reliable lead-silence negatives
     ap.add_argument("--neg_use_lead_silence", type=int, default=1,
                     help="Use first silent second of scale/note recordings for negatives (recommended).")
     ap.add_argument("--neg_lead_silence_sec", type=float, default=1.0,

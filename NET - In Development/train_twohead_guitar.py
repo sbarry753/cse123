@@ -1,33 +1,37 @@
 """
 train_twohead_guitar.py
 
-Stage 1 (default): single-note transient classification (+ optional neg class)
-  - Note head loss: Softmax Cross Entropy (nn.CrossEntropyLoss)
-  - Note label: single class index (0..V-1) derived from multi_hot argmax
-  - Optional neg class: --stage1_neg_class adds 1 extra class at end
+UPDATED to use NEW dataset labels for pick/sustain:
 
-NEW (Stage 1): string classification head (6-way)
-  - String head loss: Softmax Cross Entropy, IGNORE_INDEX = -1
-  - String label: 0..5 for known single/note_repeat clips, -1 otherwise
-  - Total loss: note_loss + --string_loss_w * string_loss
+Dataset labels must contain either:
+  - "pick_region": [p0, p1]  (samples, clip coordinates, [start,end))
+    OR fallback to:
+  - "transient_window_start" / "transient_window_end"
 
-Stage 2 (--stage2): multi-label (single + chords)
-  - Note head loss: BCEWithLogitsLoss on note head
-  - String head is still computed but not trained (string loss = 0)
+And:
+  - "sustain_region": [s0, s1] (samples, clip coordinates, [start,end))
 
-Visualizer:
-  - Wiring-style network diagram with animated pulse path (inputs -> conv layers -> outputs)
-  - Shows current input waveform and top note predictions
-  - Draws onset line if known
+Training now uses these regions directly:
+  y_pick   = 1 if returned window overlaps pick_region else 0
+  y_sus    = 1 if returned window overlaps sustain_region else 0
 
-Context windowing:
-  - base window length: --train_ms / --val_ms
-  - optional cropping: --crop_ms / --val_crop_ms
-  - onset anchoring for positives and onset-aware crop
+The dataset still returns onset_idx for visualization (onset line), but onset_idx
+is NOT used to supervise pick/sustain anymore.
 
-IMPORTANT:
-  - Dataset returns (x, y_note, y_string, onset_idx_in_returned_window)
-  - DataLoader uses a padding collate_fn so mixed lengths stack fine
+Returns from Dataset:
+  (x, y_note, y_string, y_pick, y_sus, onset_idx)
+
+Collate pads x and stacks y_*.
+
+Stage 1 (default):
+  - note head: CE (optionally + neg class)
+  - string head: CE ignore_index=-1
+  - pick/sustain heads: BCE
+
+Stage 2 (--stage2):
+  - note head: BCE multi-label
+  - string head not trained
+  - pick/sustain still trained
 """
 
 import os
@@ -142,19 +146,23 @@ def pad_collate_1d_with_onset(batch):
     """
     Pads variable-length audio tensors in a batch to the max length.
 
-    Each item: (x, y_note, y_string, onset_idx)
+    Each item: (x, y_note, y_string, y_pick, y_sus, onset_idx)
       x: (1, T) float tensor
       y_note: stage1 -> scalar long tensor, stage2 -> (V,) float tensor
-      y_string: (B,) long tensor with 0..5 or -1 ignore
-      onset_idx: int, -1 if unknown/neg
+      y_string: long tensor with 0..5 or -1 ignore
+      y_pick: float tensor scalar (0/1)
+      y_sus:  float tensor scalar (0/1)
+      onset_idx: int, -1 if unknown
 
     Returns:
       x_padded: (B, 1, Tmax)
       y_note:   (B,) or (B, V)
       y_string: (B,)
+      y_pick:   (B,)
+      y_sus:    (B,)
       onset_idx:(B,)
     """
-    xs, y_notes, y_strings, ons = zip(*batch)
+    xs, y_notes, y_strings, y_picks, y_suss, ons = zip(*batch)
     max_T = max(int(x.shape[-1]) for x in xs)
 
     x_out = []
@@ -168,8 +176,10 @@ def pad_collate_1d_with_onset(batch):
 
     y_note_out = torch.stack(y_notes, dim=0)
     y_string_out = torch.stack(y_strings, dim=0)
+    y_pick_out = torch.stack(y_picks, dim=0)
+    y_sus_out = torch.stack(y_suss, dim=0)
     on_out = torch.tensor(ons, dtype=torch.long)
-    return x_out, y_note_out, y_string_out, on_out
+    return x_out, y_note_out, y_string_out, y_pick_out, y_sus_out, on_out
 
 
 # ----------------------------
@@ -489,7 +499,7 @@ class LiveNetViz:
     def update(self, x_batch: torch.Tensor, y_note: torch.Tensor, onset_idx: torch.Tensor, device: str, stage2: bool):
         self.model.eval()
         x = x_batch[:1].to(device, non_blocking=True)
-        note_logits, _string_logits = self.model(x)
+        note_logits, _string_logits, _picked_logit, _sustain_logit = self.model(x)
 
         oi = int(onset_idx[:1].detach().cpu().item())
 
@@ -523,11 +533,14 @@ class ClipInfo:
     audio_abs: str
     multi_hot: List[int]
     onset_sample: int
-    transient_end: int
     num_samples: int
     sr: int
     clip_type: str  # "single", "scale_segment", "chord", "note_repeat_segment", "neg_segment"
     string_idx: int  # 0..5 or -1
+
+    # NEW: labeled regions in CLIP coordinates: [start,end)
+    pick_region: Tuple[int, int]
+    sustain_region: Tuple[int, int]
 
 
 def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, Any]]:
@@ -537,29 +550,52 @@ def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, A
 
     manifest = read_manifest(os.path.join(dataset_root, "manifest.jsonl"))
     clips: List[ClipInfo] = []
+
     for it in manifest:
         audio_abs = os.path.join(dataset_root, it["audio"])
         lab = load_json(os.path.join(dataset_root, it["label"]))
 
         mh = lab.get("multi_hot", [0] * vocab_size)
         onset = int(lab.get("onset_sample", 0))
-        t_end = int(lab.get("transient_window_end", onset + int(0.005 * sr)))
         n = int(lab.get("num_samples", 0))
         clip_type = lab.get("type", it.get("type", "unknown"))
-
-        # dataset builder should add this; fallback: assume low E (0)
         sidx = int(lab.get("string_idx", 0))
+
+        # Prefer explicit pick_region if present, else fallback to transient window
+        if "pick_region" in lab:
+            p0, p1 = lab["pick_region"]
+        else:
+            p0 = int(lab.get("transient_window_start", onset))
+            p1 = int(lab.get("transient_window_end", onset + int(0.005 * sr)))
+
+        if "sustain_region" in lab:
+            s0, s1 = lab["sustain_region"]
+        else:
+            s0, s1 = 0, 0
+
+        def clamp_pair(a, b):
+            a = int(a); b = int(b)
+            a = max(0, min(a, n))
+            b = max(0, min(b, n))
+            if b < a:
+                a, b = b, a
+            return (a, b)
+
+        p0, p1 = clamp_pair(p0, p1)
+        s0, s1 = clamp_pair(s0, s1)
 
         clips.append(ClipInfo(
             audio_abs=audio_abs,
             multi_hot=mh,
             onset_sample=onset,
-            transient_end=t_end,
             num_samples=n,
             sr=sr,
             clip_type=clip_type,
             string_idx=sidx,
+            pick_region=(p0, p1),
+            sustain_region=(s0, s1),
         ))
+
     return clips, sr, vocab_size, meta
 
 
@@ -576,11 +612,16 @@ def train_val_split(clips: List[ClipInfo], val_ratio: float, seed: int):
 
 class OnsetDataset(Dataset):
     """
-    Returns: (x, y_note, y_string, onset_idx)
+    Returns: (x, y_note, y_string, y_pick, y_sus, onset_idx)
       x: (1, T)
       y_note: stage1 -> scalar class index (Long), stage2 -> multi-hot (Float)
       y_string: Long in {0..5} or -1 ignore
-      onset_idx: int in [0,T), or -1 if unknown/negative
+      y_pick: float {0,1} from labeled region overlap
+      y_sus:  float {0,1} from labeled region overlap
+      onset_idx: int for viz (-1 if unknown/neg)
+
+    Optional: post_onset_prob still supported (just affects sampling diversity),
+              but pick/sus supervision always comes from region overlap.
     """
     def __init__(
         self,
@@ -625,6 +666,9 @@ class OnsetDataset(Dataset):
         self.enable_gain = bool(enable_gain)
         self.enable_polarity = bool(enable_polarity)
 
+        # optional sustain-only sampling to diversify windows
+        self.post_onset_prob = 0.0
+
         # Onset anchor config
         self.onset_pos_min = float(onset_pos_min)
         self.onset_pos_max = float(onset_pos_max)
@@ -638,7 +682,7 @@ class OnsetDataset(Dataset):
 
         self.on_candidates = [
             i for i, c in enumerate(clips)
-            if (c.clip_type != "neg_segment") and (c.transient_end > c.onset_sample)
+            if (c.clip_type != "neg_segment") and (c.num_samples > 0)
         ]
         self.neg_candidates = [
             i for i, c in enumerate(clips)
@@ -657,6 +701,11 @@ class OnsetDataset(Dataset):
         if self.crop_W > self.base_W:
             self.crop_W = self.base_W
         self.crop_prob = float(np.clip(self.crop_prob, 0.0, 1.0))
+
+    @staticmethod
+    def _overlap_any(a0: int, a1: int, b0: int, b1: int) -> bool:
+        # overlap of [a0,a1) and [b0,b1)
+        return (a0 < b1) and (b0 < a1)
 
     def set_aug_profile(
         self,
@@ -739,23 +788,40 @@ class OnsetDataset(Dataset):
             ci = self.clips[random.choice(self.on_candidates)]
             y = self._load(ci.audio_abs, ci.sr)
 
-            # POSITIVE: anchor base window around onset
-            min_pos = int(self.onset_pos_min * self.base_W)
-            max_pos = int(self.onset_pos_max * self.base_W)
-            min_pos = int(np.clip(min_pos, 0, self.base_W - 1))
-            max_pos = int(np.clip(max_pos, min_pos, self.base_W - 1))
+            do_post = (random.random() < float(getattr(self, "post_onset_prob", 0.0)))
 
-            onset_offset = random.randint(min_pos, max_pos)
+            if do_post:
+                # POSITIVE WINDOW: sample after pick end (usually into sustain)
+                max_start = max(0, ci.num_samples - self.base_W)
+                post_start_min = int(np.clip(ci.pick_region[1], 0, max_start))
+                if post_start_min < max_start:
+                    start = random.randint(post_start_min, max_start)
+                else:
+                    start = post_start_min
 
-            max_start = max(0, ci.num_samples - self.base_W)
-            start = ci.onset_sample - onset_offset
-            start = int(np.clip(start, 0, max_start))
+                x = y[start: start + self.base_W]
+                if len(x) < self.base_W:
+                    x = np.pad(x, (0, self.base_W - len(x)))
 
-            x = y[start: start + self.base_W]
-            if len(x) < self.base_W:
-                x = np.pad(x, (0, self.base_W - len(x)))
+                onset_offset_in_base = None  # onset line unknown for this window
+            else:
+                # POSITIVE PICKED WINDOW: anchor base window around onset
+                min_pos = int(self.onset_pos_min * self.base_W)
+                max_pos = int(self.onset_pos_max * self.base_W)
+                min_pos = int(np.clip(min_pos, 0, self.base_W - 1))
+                max_pos = int(np.clip(max_pos, min_pos, self.base_W - 1))
 
-            onset_offset_in_base = int(ci.onset_sample - start)
+                onset_offset = random.randint(min_pos, max_pos)
+
+                max_start = max(0, ci.num_samples - self.base_W)
+                start = ci.onset_sample - onset_offset
+                start = int(np.clip(start, 0, max_start))
+
+                x = y[start: start + self.base_W]
+                if len(x) < self.base_W:
+                    x = np.pad(x, (0, self.base_W - len(x)))
+
+                onset_offset_in_base = int(ci.onset_sample - start)
 
             # NOTE label
             if self.stage2:
@@ -763,7 +829,7 @@ class OnsetDataset(Dataset):
             else:
                 y_note = self._multi_hot_to_single_index(ci.multi_hot)
 
-            # STRING label (only trust if it’s truly unambiguous)
+            # STRING label (only trust if unambiguous)
             if (ci.clip_type in ("single", "note_repeat_segment")) and (0 <= int(ci.string_idx) < 6):
                 y_string = int(ci.string_idx)
             else:
@@ -805,17 +871,30 @@ class OnsetDataset(Dataset):
 
             y_string = STRING_IGNORE_INDEX
 
-        # Augment -> crop -> normalize
+        # Augment
         x = x.astype(np.float32)
         x = self._augment(x)
-        x, crop_start = self._maybe_crop(x, onset_offset_in_base=onset_offset_in_base, is_pos=is_pos)
 
+        # Crop (track where returned window is in CLIP coords)
+        x, crop_start = self._maybe_crop(x, onset_offset_in_base=onset_offset_in_base, is_pos=is_pos)
+        final_start_in_clip = int(start + crop_start)
+        final_end_in_clip = int(final_start_in_clip + len(x))
+
+        # onset index in returned window (viz only)
         onset_in_return = -1
         if is_pos and onset_offset_in_base is not None:
             onset_in_return = int(onset_offset_in_base - crop_start)
             if onset_in_return < 0 or onset_in_return >= len(x):
                 onset_in_return = -1
 
+        # NEW: pick/sustain targets from region overlap (clip coords)
+        pr0, pr1 = ci.pick_region
+        sr0, sr1 = ci.sustain_region
+
+        y_pick = 1.0 if self._overlap_any(final_start_in_clip, final_end_in_clip, pr0, pr1) else 0.0
+        y_sus = 1.0 if self._overlap_any(final_start_in_clip, final_end_in_clip, sr0, sr1) else 0.0
+
+        # Normalize
         x = self._rms_norm(x)
 
         if self.preemph_coef > 0:
@@ -829,7 +908,10 @@ class OnsetDataset(Dataset):
             y_note_t = torch.tensor(int(y_note), dtype=torch.long)
 
         y_string_t = torch.tensor(int(y_string), dtype=torch.long)
-        return x_t, y_note_t, y_string_t, int(onset_in_return)
+        y_pick_t = torch.tensor(float(y_pick), dtype=torch.float32)
+        y_sus_t = torch.tensor(float(y_sus), dtype=torch.float32)
+
+        return x_t, y_note_t, y_string_t, y_pick_t, y_sus_t, int(onset_in_return)
 
 
 # ----------------------------
@@ -837,9 +919,12 @@ class OnsetDataset(Dataset):
 # ----------------------------
 class OnsetNet(nn.Module):
     """
-    Tiny 1D conv with TWO heads:
+    Tiny 1D conv with FOUR heads:
       - note_head: vocab_size outputs
       - string_head: 6 outputs
+      - picked_head: 1 output (binary)
+      - sustain_head: 1 output (binary)
+
     Accepts variable input length due to AdaptiveAvgPool1d(1).
     """
     def __init__(self, note_vocab_size: int, width: int = 64, n_strings: int = 6):
@@ -861,16 +946,20 @@ class OnsetNet(nn.Module):
         )
         self.note_head = nn.Linear(width, note_vocab_size)
         self.string_head = nn.Linear(width, n_strings)
+        self.picked_head = nn.Linear(width, 1)
+        self.sustain_head = nn.Linear(width, 1)
 
         self.note_vocab_size = note_vocab_size
         self.n_strings = n_strings
         self.width = width
 
     def forward(self, x: torch.Tensor):
-        z = self.conv(x).squeeze(-1)
-        note_logits = self.note_head(z)
-        string_logits = self.string_head(z)
-        return note_logits, string_logits
+        z = self.conv(x).squeeze(-1)  # (B, width)
+        note_logits = self.note_head(z)                  # (B, V)
+        string_logits = self.string_head(z)              # (B, 6)
+        picked_logit = self.picked_head(z).squeeze(-1)   # (B,)
+        sustain_logit = self.sustain_head(z).squeeze(-1) # (B,)
+        return note_logits, string_logits, picked_logit, sustain_logit
 
     def count_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -898,6 +987,7 @@ def export_c_header(model: nn.Module, sr: int, vocab_size: int, export_window_sa
         f"#define ONSET_WINDOW             {export_window_samples}",
         f"#define ONSET_WIDTH              {model.width}",
         f"#define ONSET_N_STRINGS          {model.n_strings}",
+        f"#define ONSET_HAS_PICK_SUSTAIN   1",
         "",
         "static const char* onset_pitch_names[] = {",
     ]
@@ -935,11 +1025,16 @@ def export_c_header(model: nn.Module, sr: int, vocab_size: int, export_window_sa
             if k in sd and not (suffix == "weight" and "conv" in sd_prefix and k == w_key):
                 lines += arr(f"{c_prefix}_{suffix}", sd[k])
 
-    # Two heads
+    # Heads
     lines += arr("note_head_weight", sd["note_head.weight"])
     lines += arr("note_head_bias", sd["note_head.bias"])
     lines += arr("string_head_weight", sd["string_head.weight"])
     lines += arr("string_head_bias", sd["string_head.bias"])
+
+    lines += arr("picked_head_weight", sd["picked_head.weight"])
+    lines += arr("picked_head_bias", sd["picked_head.bias"])
+    lines += arr("sustain_head_weight", sd["sustain_head.weight"])
+    lines += arr("sustain_head_bias", sd["sustain_head.bias"])
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1084,6 +1179,8 @@ def train(args):
         note_loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
         string_loss_fn = nn.CrossEntropyLoss(ignore_index=STRING_IGNORE_INDEX)
 
+    ps_loss_fn = nn.BCEWithLogitsLoss()
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=(device == "cuda"))
     scheduler = build_scheduler(args, opt)
@@ -1132,6 +1229,7 @@ def train(args):
         crop_onset_target_ms=args.crop_onset_target_ms,
         crop_onset_jitter_ms=args.crop_onset_jitter_ms,
     )
+    train_ds.post_onset_prob = float(args.post_onset_prob)
 
     val_ds = OnsetDataset(
         val_clips,
@@ -1153,6 +1251,7 @@ def train(args):
         onset_pos_max=args.onset_pos_max,
         crop_keep_onset_prob=args.crop_keep_onset_prob,
     )
+    val_ds.post_onset_prob = float(args.post_onset_prob)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=False,
@@ -1206,10 +1305,13 @@ def train(args):
             # Train
             # ------------------------
             for step in range(args.steps_per_epoch):
-                x, y_note, y_string, onset_idx = next(train_it)
+                x, y_note, y_string, y_pick, y_sus, onset_idx = next(train_it)
                 x = x.to(device, non_blocking=True)
                 y_note = y_note.to(device, non_blocking=True)
                 y_string = y_string.to(device, non_blocking=True)
+                y_pick = y_pick.to(device, non_blocking=True)
+                y_sus = y_sus.to(device, non_blocking=True)
+                onset_idx = onset_idx.to(device, non_blocking=True)
 
                 if args.warmup_steps > 0:
                     maybe_linear_warmup_lr(opt, args.lr, global_step, args.warmup_steps)
@@ -1217,14 +1319,19 @@ def train(args):
                 opt.zero_grad(set_to_none=True)
 
                 with autocast(device_type="cuda", enabled=(device == "cuda")):
-                    note_logits, string_logits = model(x)
+                    note_logits, string_logits, picked_logit, sustain_logit = model(x)
+
+                    ps_loss = (
+                        ps_loss_fn(picked_logit, y_pick) * float(args.picked_loss_w)
+                        + ps_loss_fn(sustain_logit, y_sus) * float(args.sustain_loss_w)
+                    )
 
                     if stage2:
-                        loss = note_loss_fn(note_logits, y_note)
+                        loss = note_loss_fn(note_logits, y_note) + ps_loss
                     else:
                         note_loss = note_loss_fn(note_logits, y_note.view(-1))
                         string_loss = string_loss_fn(string_logits, y_string.view(-1))
-                        loss = note_loss + float(args.string_loss_w) * string_loss
+                        loss = note_loss + float(args.string_loss_w) * string_loss + ps_loss
 
                 scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
@@ -1248,33 +1355,60 @@ def train(args):
             v_loss = 0.0
             all_note_logits, all_note_targets = [], []
             all_string_logits, all_string_targets = [], []
+            all_pick_logits, all_sus_logits = [], []
+            all_pick_t, all_sus_t = [], []
 
             with torch.no_grad():
                 for _ in range(args.val_steps):
-                    x, y_note, y_string, onset_idx = next(val_it)
+                    x, y_note, y_string, y_pick, y_sus, onset_idx = next(val_it)
                     x = x.to(device, non_blocking=True)
                     y_note = y_note.to(device, non_blocking=True)
                     y_string = y_string.to(device, non_blocking=True)
+                    y_pick = y_pick.to(device, non_blocking=True)
+                    y_sus = y_sus.to(device, non_blocking=True)
+                    onset_idx = onset_idx.to(device, non_blocking=True)
 
-                    note_logits, string_logits = model(x)
+                    note_logits, string_logits, picked_logit, sustain_logit = model(x)
+
+                    ps_loss = (
+                        ps_loss_fn(picked_logit, y_pick) * float(args.picked_loss_w)
+                        + ps_loss_fn(sustain_logit, y_sus) * float(args.sustain_loss_w)
+                    )
 
                     if stage2:
-                        v_loss += float(note_loss_fn(note_logits, y_note).item())
+                        v_loss += float((note_loss_fn(note_logits, y_note) + ps_loss).item())
                         all_note_logits.append(note_logits.cpu())
                         all_note_targets.append(y_note.cpu())
                     else:
                         note_loss = note_loss_fn(note_logits, y_note.view(-1))
                         string_loss = string_loss_fn(string_logits, y_string.view(-1))
-                        v_loss += float((note_loss + float(args.string_loss_w) * string_loss).item())
+                        v_loss += float((note_loss + float(args.string_loss_w) * string_loss + ps_loss).item())
 
                         all_note_logits.append(note_logits.cpu())
                         all_note_targets.append(y_note.view(-1).cpu())
                         all_string_logits.append(string_logits.cpu())
                         all_string_targets.append(y_string.view(-1).cpu())
 
+                    all_pick_logits.append(picked_logit.cpu())
+                    all_sus_logits.append(sustain_logit.cpu())
+                    all_pick_t.append(y_pick.cpu())
+                    all_sus_t.append(y_sus.cpu())
+
             v_loss /= args.val_steps
             all_note_logits = torch.cat(all_note_logits)
             all_note_targets = torch.cat(all_note_targets)
+
+            all_pick_logits = torch.cat(all_pick_logits) if all_pick_logits else torch.empty(0)
+            all_sus_logits = torch.cat(all_sus_logits) if all_sus_logits else torch.empty(0)
+            all_pick_t = torch.cat(all_pick_t) if all_pick_t else torch.empty(0)
+            all_sus_t = torch.cat(all_sus_t) if all_sus_t else torch.empty(0)
+
+            # accuracies for pick/sustain at 0.5
+            if all_pick_logits.numel() > 0:
+                pick_acc = ((torch.sigmoid(all_pick_logits) >= 0.5).float() == all_pick_t).float().mean().item()
+                sus_acc = ((torch.sigmoid(all_sus_logits) >= 0.5).float() == all_sus_t).float().mean().item()
+            else:
+                pick_acc, sus_acc = float("nan"), float("nan")
 
             lr_now = opt.param_groups[0]["lr"]
             dt = time.time() - t0
@@ -1309,6 +1443,8 @@ def train(args):
                     str_acc = float("nan")
                 str_metric = f" str_acc={str_acc:.3f}" if (str_acc == str_acc) else " str_acc=nan"
 
+            ps_metric = f" pick_acc={pick_acc:.3f} sus_acc={sus_acc:.3f}"
+
             aug_profile = (
                 f"aug(noise={train_ds.noise_std:g}, gain=[{train_ds.gain_db_min:g},{train_ds.gain_db_max:g}], "
                 f"pol={'on' if train_ds.enable_polarity else 'off'})"
@@ -1320,8 +1456,8 @@ def train(args):
             )
 
             print(
-                f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} {metric_str}{str_metric} "
-                f"lr={lr_now:.2e} {aug_profile} {win_profile} t={dt:.1f}s"
+                f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} {metric_str}{str_metric}{ps_metric} "
+                f"lr={lr_now:.2e} post_onset_p={train_ds.post_onset_prob:g} {aug_profile} {win_profile} t={dt:.1f}s"
             )
 
             # Save checkpoints
@@ -1416,8 +1552,14 @@ def main():
     # Stage2 BCE
     ap.add_argument("--pos_weight", type=float, default=2.0)
 
-    # NEW: string head weight (stage1 only)
+    # String head weight (stage1 only)
     ap.add_argument("--string_loss_w", type=float, default=0.3)
+
+    # picked/sustain weights + optional post-onset sampling
+    ap.add_argument("--picked_loss_w", type=float, default=0.15)
+    ap.add_argument("--sustain_loss_w", type=float, default=0.15)
+    ap.add_argument("--post_onset_prob", type=float, default=0.35,
+                    help="For positive clips, probability of sampling a later window (helps balance).")
 
     # Curriculum aug
     ap.add_argument("--curriculum_epochs", type=int, default=15)
