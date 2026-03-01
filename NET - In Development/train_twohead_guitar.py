@@ -32,6 +32,8 @@ Stage 2 (--stage2):
   - note head: BCE multi-label
   - string head not trained
   - pick/sustain still trained
+
+python train_twohead_guitar.py --dataset labels --out stage1_5ms_cos_sus  --width 96 --lr 8e-4 --weight_decay 2e-4 --epochs 500 --scheduler cosine --cosine_min_frac 0.03 --p_on 0.9 --p_neg 0.1 --val_p_on 0.9 --val_p_neg 0.1 --curriculum_epochs 40 --calm_noise_std 0.0 --calm_enable_polarity 0 --calm_gain_min -3 --calm_gain_max 2 --full_noise_std 0.0008 --full_enable_polarity 1 --full_gain_min -16 --full_gain_max 6 --preemph_coef 0.1 --train_ms 45 --crop_ms 8 --crop_prob 1.0 --val_ms 45 --val_crop_ms 8 --val_crop_prob 1.0 --export_ms 8 --onset_pos_min 0.10 --onset_pos_max 0.90 --crop_keep_onset_prob 0.0 --stage1_neg_class --post_onset_prob 0.35 --picked_loss_w 0.15 --sustain_loss_w 0.15
 """
 
 import os
