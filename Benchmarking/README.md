@@ -52,3 +52,5 @@ The mentioned block sizes will be tested for each effect. The sample rate across
 
 ## Results
 [Results Spreadsheet](https://docs.google.com/spreadsheets/d/1QgfL2nDbECkWdAaCYBFUneOOQhCu9Kp85AZZbPZRD8g/edit?usp=sharing)
+
+From the results, we can see the effects did not stress the CPU much; the highest maximum CPU load was approximately 14%. There are some trends observed however. For all effects, increasing block size reduced max CPU load to a very small degree (1%). As the CPU did not undergo heavy computation, we still would like to have an idea of the limits of the Daisy Seed. We plan to stress-test the MCU with matrix multiplication. Matrix multiplication is a particularly relevant benchmark because it is computationally demanding and it is used heavily in neural networks, which we are implementing for note/chord detection. We will test different matrix/block sizes and different matrix multiplication algorithms (differing by optimization level). 
