@@ -10,14 +10,28 @@ using namespace daisy::seed;
 
 #define POT1 A6
 
-constexpr size_t BLOCK_SIZE = 32;
+constexpr size_t BLOCK_SIZE = 16;
 constexpr auto SAMPLE_RATE = SaiHandle::Config::SampleRate::SAI_48KHZ;
 
 DaisySeed hw;
 CpuLoadMeter cpu_load;
-Reverb effect;
-daisysp::Oscillator osc;
 
+#ifdef MAT_MUL
+#include "matrix.h"
+constexpr size_t ROWS = 24;
+constexpr size_t COLS = 24;
+
+// Matrix1D mat_a(ROWS, COLS);
+// Matrix1D mat_b(ROWS, COLS);
+// Matrix1D mat_c(ROWS, COLS);
+
+CMSISMatrix mat_a(ROWS, COLS);
+CMSISMatrix mat_b(ROWS, COLS);
+CMSISMatrix mat_c(ROWS, COLS);
+static volatile float cs = 0.0f;
+#else
+daisysp::Oscillator osc;
+Reverb effect;
 static float in_buf[2][BLOCK_SIZE];
 static const float* const in_ptrs[2] = {in_buf[0], in_buf[1]};
 static AudioHandle::InputBuffer effect_in = in_ptrs;
@@ -40,12 +54,21 @@ static inline void generateInput(size_t size) {
 		in_buf[1][i] = s;
 	}
 }
+#endif
 
 static void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size) {
 	cpu_load.OnBlockStart();
+
+#ifdef MAT_MUL
+	CMSISMatrix::matmul(mat_a, mat_b, mat_c);
+	cs += mat_c.checksum();
+	// std::fill(&out[0][0], &out[0][size], 0.0f);
+	// std::fill(&out[1][0], &out[1][size], 0.0f);
+#else
 	float pot_val = processADC();
 	generateInput(size);
 	effect.process_audio(effect_in, out, size, pot_val);
+#endif
 	cpu_load.OnBlockEnd();
 }
 
@@ -54,14 +77,22 @@ int main(void) {
 	hw.StartLog();
 	hw.SetAudioBlockSize(BLOCK_SIZE);
 	hw.SetAudioSampleRate(SAMPLE_RATE);
-	effect.init(hw.AudioSampleRate());
-	cpu_load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
-	initADC();
 
+#ifdef MAT_MUL
+	mat_a.fill_matrix();
+	mat_b.fill_matrix();
+#else
+	
+	initADC();
 	osc.Init(hw.AudioSampleRate());
 	osc.SetWaveform(daisysp::Oscillator::WAVE_SIN);
 	osc.SetFreq(220.0f);
 	osc.SetAmp(0.4f);
+
+	effect.init(hw.AudioSampleRate());
+#endif
+
+	cpu_load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
 
 	hw.StartAudio(AudioCallback);
 
