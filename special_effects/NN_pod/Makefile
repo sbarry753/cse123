@@ -2,7 +2,7 @@
 TARGET = daisy
 
 # Sources
-CPP_SOURCES = daisy.cpp
+CPP_SOURCES = main.cpp
 
 # Target hardware
 C_DEFS = -DPOD
