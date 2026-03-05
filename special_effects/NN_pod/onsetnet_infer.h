@@ -11,30 +11,16 @@
 // -------------------------
 static inline float sigmoidf_fast(float x)
 {
-    // good enough for gating
     return 1.0f / (1.0f + expf(-x));
 }
 
-static inline float clampf(float x, float lo, float hi)
-{
-    return (x < lo) ? lo : (x > hi) ? hi : x;
-}
-
-static inline float rmsf(const float* x, int n)
+static inline float rmsf_local(const float* x, int n)
 {
     double acc = 0.0;
     for(int i = 0; i < n; i++)
         acc += (double)x[i] * (double)x[i];
     acc /= (double)(n > 0 ? n : 1);
     return (float)sqrt(acc + 1e-12);
-}
-
-static inline float dbfs_from_rms(float r)
-{
-    // dBFS where full-scale = 1.0
-    if(r < 1e-12f)
-        r = 1e-12f;
-    return 20.0f * log10f(r);
 }
 
 // -------------------------
@@ -71,11 +57,8 @@ static inline float bn1(float x, float mean, float var, float w, float b)
 class OnsetNetInfer
 {
   public:
-    // x must be 384 samples, roughly normalized to ~RMS 1 (or close).
     void Forward(const float* x, OnsetNetOut& y) const
     {
-        // Buffers sized by the known layer shapes.
-        // (Static to avoid stack blowups if you prefer; but this is fine on H7.)
         float c0[48 * 192];
         float c1[96 * 96];
         float c2[96 * 48];
@@ -87,9 +70,9 @@ class OnsetNetInfer
                   48,
                   192,
                   l0_conv_weight,
-                  /*k=*/9,
-                  /*stride=*/2,
-                  /*pad=*/4);
+                  9,
+                  2,
+                  4);
         bn_relu_inplace(c0, 48, 192, l0_bn_running_mean, l0_bn_running_var, l0_bn_weight, l0_bn_bias);
 
         // ---- Conv1 ----
@@ -100,9 +83,9 @@ class OnsetNetInfer
                    96,
                    96,
                    l1_conv_weight,
-                   /*k=*/5,
-                   /*stride=*/2,
-                   /*pad=*/2);
+                   5,
+                   2,
+                   2);
         bn_relu_inplace(c1, 96, 96, l1_bn_running_mean, l1_bn_running_var, l1_bn_weight, l1_bn_bias);
 
         // ---- Conv2 ----
@@ -113,9 +96,9 @@ class OnsetNetInfer
                    96,
                    48,
                    l2_conv_weight,
-                   /*k=*/5,
-                   /*stride=*/2,
-                   /*pad=*/2);
+                   5,
+                   2,
+                   2);
         bn_relu_inplace(c2, 96, 48, l2_bn_running_mean, l2_bn_running_var, l2_bn_weight, l2_bn_bias);
 
         // ---- Global avg pool over time (T=48) -> feat[96] ----
@@ -130,7 +113,6 @@ class OnsetNetInfer
         }
 
         // ---- Heads ----
-        // Note logits (50)
         for(int i = 0; i < 50; i++)
         {
             double acc = (double)note_head_bias[i];
@@ -140,7 +122,6 @@ class OnsetNetInfer
             y.note_logits[i] = (float)acc;
         }
 
-        // String logits (6)
         for(int i = 0; i < ONSET_N_STRINGS; i++)
         {
             double acc = (double)string_head_bias[i];
@@ -150,7 +131,6 @@ class OnsetNetInfer
             y.string_logits[i] = (float)acc;
         }
 
-        // Pick / sustain
         {
             double accp = (double)picked_head_bias[0];
             double accs = (double)sustain_head_bias[0];
@@ -164,7 +144,6 @@ class OnsetNetInfer
         }
     }
 
-    // Softmax for 50 logits -> probs
     static void Softmax50(const float* logits, float* probs)
     {
         float mx = logits[0];
@@ -194,20 +173,19 @@ class OnsetNetInfer
     {
         for(int c = 0; c < C; c++)
         {
-            float m = mean[c];
-            float v = var[c];
+            float m  = mean[c];
+            float v  = var[c];
             float ww = w[c];
             float bb = b[c];
             float* row = &x[c * T];
             for(int t = 0; t < T; t++)
             {
-                float y = bn1(row[t], m, v, ww, bb);
-                row[t] = (y > 0.0f) ? y : 0.0f;
+                float yy = bn1(row[t], m, v, ww, bb);
+                row[t] = (yy > 0.0f) ? yy : 0.0f;
             }
         }
     }
 
-    // Conv for in_ch = 1
     static void conv1d_1in(const float* in,
                           int inT,
                           float* out,
@@ -237,7 +215,6 @@ class OnsetNetInfer
         }
     }
 
-    // Conv for general inC
     static void conv1d_nin(const float* in,
                            int inC,
                            int inT,
