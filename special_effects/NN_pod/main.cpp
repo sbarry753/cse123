@@ -23,9 +23,13 @@
  */
 
 #include "daisy_pod.h"
+#include "daisy_seed.h"
 #include "daisysp.h"
 #include "onset_weights.h"
+#include "tflite_onset_runner.h"
 #include <cmath>
+#include <cstdio>
+#include <cstdint>
 #include <cstring>
 
 using namespace daisy;
@@ -113,7 +117,6 @@ static void ring_get_last(float* out, int n) {
 // Audio callback
 // ---------------------------------------------------------------------------
 static bool  g_muted = false;
-static float g_test_phase = 0.0f;
 
 static void AudioCallback(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer out,
@@ -259,80 +262,11 @@ static void build_midi_vocab(){
 // ---------------------------------------------------------------------------
 // OnsetNet forward pass
 // ---------------------------------------------------------------------------
-static constexpr int kT0=192, kT1=96, kT2=48;
-static float g_a0[48*kT0], g_a1[96*kT1], g_a2[96*kT2], g_z[ONSET_WIDTH];
 static float g_win[kWinSamp], g_pe[kWinSamp], g_nn_in[kWinSamp];
+using NNOut = onset_tflite::Output;
 
-static void conv_bn_relu(
-    const float* x,  int c_in,  int T_in,
-    float*       out, int c_out, int T_out,
-    const float* W,
-    const float* bnw, const float* bnb,
-    const float* bnm, const float* bnv,
-    int K, int stride, int pad)
-{
-    for(int co=0;co<c_out;co++){
-        const float* Wco = W + co*c_in*K;
-        float*       o   = out + co*T_out;
-        for(int t=0;t<T_out;t++){
-            float acc=0.0f;
-            int t0 = t*stride - pad;
-            for(int ci=0;ci<c_in;ci++){
-                const float* xci = x   + ci*T_in;
-                const float* Wci = Wco + ci*K;
-                for(int k=0;k<K;k++){
-                    int ti = t0+k;
-                    if((unsigned)ti < (unsigned)T_in) acc += xci[ti]*Wci[k];
-                }
-            }
-            float bn = (acc-bnm[co])/sqrtf(bnv[co]+1e-5f)*bnw[co]+bnb[co];
-            o[t] = bn>0.0f ? bn : 0.0f;
-        }
-    }
-}
-
-static void softmax_ip(float* a, int n){
-    float mx=a[0];
-    for(int i=1;i<n;i++) if(a[i]>mx) mx=a[i];
-    float s=0;
-    for(int i=0;i<n;i++){ a[i]=expf(a[i]-mx); s+=a[i]; }
-    float inv=1.0f/(s+1e-12f);
-    for(int i=0;i<n;i++) a[i]*=inv;
-}
-
-static inline float sigmoid(float x){ return 1.0f/(1.0f+expf(-x)); }
-
-struct NNOut {
-    float note_probs[NOTE_HEAD_OUT];
-    float pick_score;
-    float sus_score;
-};
-
-static void nn_forward(NNOut& o){
-    conv_bn_relu(g_nn_in,1,kWinSamp, g_a0,48,kT0,
-        l0_conv_weight,l0_bn_weight,l0_bn_bias,l0_bn_running_mean,l0_bn_running_var,9,2,4);
-    conv_bn_relu(g_a0,48,kT0, g_a1,96,kT1,
-        l1_conv_weight,l1_bn_weight,l1_bn_bias,l1_bn_running_mean,l1_bn_running_var,5,2,2);
-    conv_bn_relu(g_a1,96,kT1, g_a2,96,kT2,
-        l2_conv_weight,l2_bn_weight,l2_bn_bias,l2_bn_running_mean,l2_bn_running_var,5,2,2);
-
-    for(int c=0;c<ONSET_WIDTH;c++){
-        float acc=0.0f;
-        const float* ch = g_a2+c*kT2;
-        for(int t=0;t<kT2;t++) acc+=ch[t];
-        g_z[c] = acc/(float)kT2;
-    }
-
-    for(int i=0;i<NOTE_HEAD_OUT;i++){
-        float acc = note_head_bias[i];
-        const float* wi = note_head_weight + i*ONSET_WIDTH;
-        for(int j=0;j<ONSET_WIDTH;j++) acc+=wi[j]*g_z[j];
-        o.note_probs[i] = acc;
-    }
-    softmax_ip(o.note_probs, NOTE_HEAD_OUT);
-
-    { float acc=picked_head_bias[0];  for(int j=0;j<ONSET_WIDTH;j++) acc+=picked_head_weight[j]*g_z[j];  o.pick_score=sigmoid(acc); }
-    { float acc=sustain_head_bias[0]; for(int j=0;j<ONSET_WIDTH;j++) acc+=sustain_head_weight[j]*g_z[j]; o.sus_score =sigmoid(acc); }
+static void nn_forward(NNOut& o) {
+    onset_tflite::forward(g_nn_in, kWinSamp, o);
 }
 
 static void top_k(const float* p, int n, int k, int* idx){
@@ -360,22 +294,110 @@ static int    g_grace_left  = 0;
 static int    g_min_left    = 0;
 static int    g_change_flash= 0;
 
-static void tick_nn(){
+struct TickNnProfile {
+    uint32_t ticks;
+    uint32_t window_ticks;
+    uint32_t voicing_ticks;
+    uint32_t prep_ticks;
+    uint32_t nn_ticks;
+    uint32_t candidates_ticks;
+    uint32_t goertzel_ticks;
+    uint32_t state_ticks;
+    uint32_t leds_ticks;
+    uint32_t total_ticks;
+    uint32_t max_total_ticks;
+    bool ready;
+};
+
+static constexpr uint32_t kProfileEveryTicks = 32;
+static TickNnProfile g_tick_nn_profile = {};
+
+static inline uint32_t ticks_to_us(uint32_t ticks) {
+    uint32_t ticks_per_us = System::GetTickFreq() / 1000000U;
+    if(ticks_per_us == 0) ticks_per_us = 1;
+    return ticks / ticks_per_us;
+}
+
+static inline void profile_tick_nn(uint32_t window_ticks,
+                                   uint32_t voicing_ticks,
+                                   uint32_t prep_ticks,
+                                   uint32_t nn_ticks,
+                                   uint32_t candidates_ticks,
+                                   uint32_t goertzel_ticks,
+                                   uint32_t state_ticks,
+                                   uint32_t leds_ticks,
+                                   uint32_t total_ticks) {
+    g_tick_nn_profile.ticks += 1;
+    g_tick_nn_profile.window_ticks += window_ticks;
+    g_tick_nn_profile.voicing_ticks += voicing_ticks;
+    g_tick_nn_profile.prep_ticks += prep_ticks;
+    g_tick_nn_profile.nn_ticks += nn_ticks;
+    g_tick_nn_profile.candidates_ticks += candidates_ticks;
+    g_tick_nn_profile.goertzel_ticks += goertzel_ticks;
+    g_tick_nn_profile.state_ticks += state_ticks;
+    g_tick_nn_profile.leds_ticks += leds_ticks;
+    g_tick_nn_profile.total_ticks += total_ticks;
+    if(total_ticks > g_tick_nn_profile.max_total_ticks)
+        g_tick_nn_profile.max_total_ticks = total_ticks;
+    if(g_tick_nn_profile.ticks >= kProfileEveryTicks)
+        g_tick_nn_profile.ready = true;
+}
+
+// To see console output, connect to the Daisy serial connection
+// I used 'screen /dev/tty.usb*' to connect to the USB serial interface
+
+static void print_tick_nn_profile(){
+    if(!g_tick_nn_profile.ready || g_tick_nn_profile.ticks == 0)
+        return;
+
+    const uint32_t ticks = g_tick_nn_profile.ticks;
+    hw.seed.PrintLine(
+        "tick_nn avg_us[%lu]: total=%lu win=%lu voice=%lu prep=%lu nn=%lu cand=%lu goertzel=%lu state=%lu led=%lu max=%lu",
+        (unsigned long)ticks,
+        (unsigned long)ticks_to_us(g_tick_nn_profile.total_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.window_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.voicing_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.prep_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.nn_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.candidates_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.goertzel_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.state_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.leds_ticks / ticks),
+        (unsigned long)ticks_to_us(g_tick_nn_profile.max_total_ticks));
+    g_tick_nn_profile = {};
+}
+
+static bool tick_nn(){
+    uint32_t t0 = System::GetTick();
+    uint32_t t_prev = t0;
+
     // 1. Get window
     ring_get_last(g_win, kWinSamp);
+    uint32_t t1 = System::GetTick();
+    uint32_t window_ticks = t1 - t_prev;
+    t_prev = t1;
 
     // 2. Voicing gate
     float r  = calc_rms(g_win, kWinSamp);
     float db = calc_dbfs(r);
     if(!g_voiced){ if(db >= kVoicedDbOn)  g_voiced=true; }
     else         { if(db <= kVoicedDbOff) g_voiced=false; }
+    uint32_t t2 = System::GetTick();
+    uint32_t voicing_ticks = t2 - t_prev;
+    t_prev = t2;
 
     // 3. Pre-emphasis + RMS normalise for NN
     do_preemph(g_pe, g_win, kWinSamp, kPreemph);
     rms_norm(g_nn_in, g_pe, kWinSamp);
+    uint32_t t3 = System::GetTick();
+    uint32_t prep_ticks = t3 - t_prev;
+    t_prev = t3;
 
     // 4. NN forward
     nn_forward(g_nn_out);
+    uint32_t t4 = System::GetTick();
+    uint32_t nn_ticks = t4 - t_prev;
+    t_prev = t4;
 
     // 5. Top-K candidates — skip silence class (index 49)
     int tk[kTopK];
@@ -395,6 +417,9 @@ static void tick_nn(){
         cand_midi_idx[valid_k]= idx;
         valid_k++;
     }
+    uint32_t t5 = System::GetTick();
+    uint32_t candidates_ticks = t5 - t_prev;
+    t_prev = t5;
 
     // NN top-1 confidence (ignoring silence)
     float nn_conf = (valid_k > 0) ? cand_conf[0] : 0.0f;
@@ -407,6 +432,9 @@ static void tick_nn(){
                                 cand_hz, cand_conf, valid_k,
                                 &refined_hz);
     }
+    uint32_t t6 = System::GetTick();
+    uint32_t goertzel_ticks = t6 - t_prev;
+    t_prev = t6;
 
     // 7. Grace frame counts from knob2
     float grace_ms = hw.knob2.Process() * 500.0f + 50.0f;  // 50–550ms
@@ -468,6 +496,9 @@ static void tick_nn(){
             g_synth.set_active(false);
         }
     }
+    uint32_t t7 = System::GetTick();
+    uint32_t state_ticks = t7 - t_prev;
+    t_prev = t7;
 
     // 9. LEDs
     bool in_grace = g_note_active && !should_play;
@@ -479,19 +510,42 @@ static void tick_nn(){
     if(g_change_flash > 0){ g_change_flash--; hw.led2.Set(1,1,1); }
     else hw.led2.Set(0.0f, 0.0f, g_voiced ? 1.0f : 0.0f);
     hw.UpdateLeds();
+    uint32_t t8 = System::GetTick();
+    uint32_t leds_ticks = t8 - t_prev;
+
+    profile_tick_nn(window_ticks,
+                    voicing_ticks,
+                    prep_ticks,
+                    nn_ticks,
+                    candidates_ticks,
+                    goertzel_ticks,
+                    state_ticks,
+                    leds_ticks,
+                    t8 - t0);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main(){
-    hw.Init();
+    hw.Init(true);
     // Block size = window size so each callback delivers exactly one hop
     hw.SetAudioBlockSize(kWinSamp);
     hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
 
     build_midi_vocab();
     g_synth.init(SR, kSynthAttackMs, kSynthReleaseMs);
+    hw.seed.StartLog();
+    hw.seed.PrintLine("Pod booted");
+    
+    if(onset_tflite::init()){
+        hw.seed.PrintLine("TFLM ready, arena=%lu bytes",
+                          (unsigned long)onset_tflite::arena_used_bytes());
+    } else {
+        hw.seed.PrintLine("TFLM init failed: %s", onset_tflite::init_error());
+        onset_tflite::log_init_snapshot(hw.seed);
+    }
 
     hw.StartAudio(AudioCallback);
 
@@ -507,6 +561,7 @@ int main(){
         if((int32_t)(now-last) >= (int32_t)kHopMs){
             last = now;
             tick_nn();
+            print_tick_nn_profile();
         }
     }
 }

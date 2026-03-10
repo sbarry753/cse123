@@ -4,3 +4,6 @@
 [submodule "lib/DaisySP"]
 	path = lib/DaisySP
 	url = https://github.com/electro-smith/DaisySP.git
+[submodule "lib/tflite-micro"]
+	path = lib/tflite-micro
+	url = https://github.com/tensorflow/tflite-micro.git

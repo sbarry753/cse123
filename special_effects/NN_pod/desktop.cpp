@@ -9,6 +9,18 @@
  *
  * Build:
  *   g++ -std=c++14 -O2 -o onsetnet onsetnet_desktop.cpp -lportaudio -lm
+   g++ -std=c++14 -O2 \
+  -I/opt/homebrew/include \
+  -L/opt/homebrew/lib \
+  -o onsetnet desktop.cpp \
+  -lportaudio \
+  -framework CoreAudio \
+  -framework AudioToolbox \
+  -framework AudioUnit \
+  -framework CoreFoundation \
+  -framework CoreServices \
+  -lm
+ *
  *
  * Run:
  *   ./onsetnet --list
