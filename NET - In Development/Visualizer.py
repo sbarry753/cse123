@@ -2,6 +2,12 @@
 """
 onsetnet_visualizer_duplex_synth_grace.py
 
+Adds WAV sample synth support with looping:
+- Use --synth-wave wav
+- Use --wav-file path/to/file.wav
+- Use --wav-root-midi to set the source sample pitch
+- Use --wav-loop to loop the sample
+
 Fixes your “E4 ↔ none” rapid toggling + synth noise when NN drops out:
 - Adds a *voicing gate* (based on RMS dBFS) so we only consider notes while DI is actually sounding.
 - Adds *note grace / hangover* time: if NN becomes uncertain but audio is still voiced, we keep the last note.
@@ -17,6 +23,11 @@ Run:
   python onsetnet_visualizer_duplex_synth_grace.py --device "WASAPI" --wasapi-exclusive --synth \
     --checkpoint onset_best.pt --metadata metadata.json
 
+WAV sample synth example:
+  python onsetnet_visualizer_duplex_synth_grace.py --device "WASAPI" --wasapi-exclusive --synth \
+    --synth-wave wav --wav-file mysample.wav --wav-root-midi 64 --wav-loop \
+    --checkpoint onset_best.pt --metadata metadata.json
+
 Notes:
 - This assumes your checkpoint has picked_head and sustain_head.
 """
@@ -28,6 +39,7 @@ import re
 import sys
 import threading
 import time
+import wave
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
@@ -42,6 +54,61 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 
 # =============================================================================
+# WAV helpers
+# =============================================================================
+def load_wav_mono(path: str) -> Tuple[np.ndarray, int]:
+    """
+    Load a PCM/float WAV file as mono float32 in [-1, 1].
+    Supports 8/16/24/32-bit PCM and 32-bit float WAVs.
+    """
+    with wave.open(path, "rb") as wf:
+        n_channels = int(wf.getnchannels())
+        sampwidth = int(wf.getsampwidth())
+        sr = int(wf.getframerate())
+        n_frames = int(wf.getnframes())
+        raw = wf.readframes(n_frames)
+
+    if sampwidth == 1:
+        # 8-bit PCM unsigned
+        x = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+        x = (x - 128.0) / 128.0
+
+    elif sampwidth == 2:
+        # 16-bit PCM
+        x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    elif sampwidth == 3:
+        # 24-bit PCM
+        b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        y = (
+            b[:, 0].astype(np.int32)
+            | (b[:, 1].astype(np.int32) << 8)
+            | (b[:, 2].astype(np.int32) << 16)
+        )
+        sign = (y & 0x800000) != 0
+        y = y.astype(np.int32)
+        y[sign] -= 1 << 24
+        x = y.astype(np.float32) / 8388608.0
+
+    elif sampwidth == 4:
+        # Try float32 first, then int32 PCM fallback
+        try:
+            x = np.frombuffer(raw, dtype=np.float32).astype(np.float32)
+            if not np.all(np.isfinite(x)) or np.max(np.abs(x)) > 8.0:
+                raise ValueError("Not float32 WAV payload")
+        except Exception:
+            x = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise RuntimeError(f"Unsupported WAV sample width: {sampwidth} bytes")
+
+    if n_channels > 1:
+        x = x.reshape(-1, n_channels).mean(axis=1)
+
+    x = np.clip(x, -1.0, 1.0).astype(np.float32, copy=False)
+    return x, sr
+
+
+# =============================================================================
 # Synth
 # =============================================================================
 class MonoSynth:
@@ -52,6 +119,10 @@ class MonoSynth:
         attack_ms: float = 2.0,
         release_ms: float = 35.0,
         gain: float = 0.14,
+        wav_data: Optional[np.ndarray] = None,
+        wav_sr: Optional[int] = None,
+        wav_root_hz: float = 440.0,
+        wav_loop: bool = True,
     ):
         self.sr = int(sr)
         self.waveform = str(waveform)
@@ -63,6 +134,13 @@ class MonoSynth:
         self.target = 0.0
         self.attack_samps = max(1, int(round(attack_ms * 1e-3 * self.sr)))
         self.release_samps = max(1, int(round(release_ms * 1e-3 * self.sr)))
+
+        # WAV mode
+        self.wav_data = None if wav_data is None else np.asarray(wav_data, dtype=np.float32).reshape(-1)
+        self.wav_sr = int(wav_sr) if wav_sr is not None else self.sr
+        self.wav_root_hz = float(wav_root_hz)
+        self.wav_loop = bool(wav_loop)
+        self.wav_pos = 0.0
 
         self._lock = threading.Lock()
 
@@ -93,6 +171,78 @@ class MonoSynth:
             if release_ms is not None:
                 self.release_samps = max(1, int(round(float(release_ms) * 1e-3 * self.sr)))
 
+    def set_wav(
+        self,
+        wav_data: np.ndarray,
+        wav_sr: int,
+        *,
+        root_hz: float = 440.0,
+        loop: bool = True,
+    ):
+        with self._lock:
+            self.wav_data = np.asarray(wav_data, dtype=np.float32).reshape(-1)
+            self.wav_sr = int(wav_sr)
+            self.wav_root_hz = float(root_hz)
+            self.wav_loop = bool(loop)
+            self.wav_pos = 0.0
+
+    def _render_wav(
+        self,
+        n: int,
+        freq: float,
+        gain: float,
+        target: float,
+        attack_samps: int,
+        release_samps: int,
+    ) -> np.ndarray:
+        out = np.zeros((n,), dtype=np.float32)
+        if self.wav_data is None or self.wav_data.size == 0:
+            return out
+
+        src = self.wav_data
+        src_len = int(src.size)
+        pos = float(self.wav_pos)
+        env = float(self.env)
+
+        step_up = 1.0 / attack_samps
+        step_dn = 1.0 / release_samps
+
+        # Playback increment in source-samples per output-sample.
+        # freq == wav_root_hz -> original sample pitch/speed.
+        incr = (float(self.wav_sr) / float(self.sr)) * (float(freq) / max(1e-6, float(self.wav_root_hz)))
+
+        for i in range(n):
+            if env < target:
+                env = min(target, env + step_up)
+            elif env > target:
+                env = max(target, env - step_dn)
+
+            if self.wav_loop:
+                while pos >= src_len:
+                    pos -= src_len
+                while pos < 0.0:
+                    pos += src_len
+
+                i0 = int(pos) % src_len
+                i1 = (i0 + 1) % src_len
+                frac = pos - float(int(pos))
+                s = (1.0 - frac) * float(src[i0]) + frac * float(src[i1])
+            else:
+                if pos >= src_len - 1:
+                    s = 0.0
+                else:
+                    i0 = int(pos)
+                    i1 = min(i0 + 1, src_len - 1)
+                    frac = pos - float(i0)
+                    s = (1.0 - frac) * float(src[i0]) + frac * float(src[i1])
+
+            out[i] = float(s) * (gain * env)
+            pos += incr
+
+        self.wav_pos = pos
+        self.env = env
+        return out
+
     def render(self, n: int) -> np.ndarray:
         n = int(n)
         out = np.zeros((n,), dtype=np.float32)
@@ -106,6 +256,9 @@ class MonoSynth:
             waveform = str(self.waveform)
             attack_samps = int(self.attack_samps)
             release_samps = int(self.release_samps)
+
+        if waveform == "wav":
+            return self._render_wav(n, freq, gain, target, attack_samps, release_samps)
 
         step_up = (1.0 / attack_samps)
         step_dn = (1.0 / release_samps)
@@ -534,7 +687,7 @@ class LabeledSlider(QtWidgets.QWidget):
 
 @dataclass
 class NNOut:
-    note_probs: np.ndarray  # [V]
+    note_probs: np.ndarray
     pick_score: float
     sus_score: float
     string_probs: Optional[np.ndarray] = None
@@ -609,8 +762,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.topk = int(args.topk)
 
         # thresholds
-        self.nn_on = float(args.nn_on)      # enter note if fused >= nn_on
-        self.nn_off = float(args.nn_off)    # exit allowed when fused < nn_off (hysteresis)
+        self.nn_on = float(args.nn_on)
+        self.nn_off = float(args.nn_off)
 
         # FFT guidance
         self.fft_cents = float(args.fft_cents)
@@ -625,12 +778,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sustain_block = float(args.sustain_block)
         self.preemph_coef = float(args.preemph)
 
-        # NEW: voicing gate + grace/hold
-        self.voiced_db_on = float(args.voiced_db_on)     # consider "voiced" if db >= on
-        self.voiced_db_off = float(args.voiced_db_off)   # consider "unvoiced" if db <= off (hysteresis)
-        self.note_grace_ms = float(args.note_grace_ms)   # hold last note when NN drops but still voiced
-        self.min_note_ms = float(args.min_note_ms)       # minimum on-time after onset
-        self.freq_smooth = float(args.freq_smooth)       # 0..1, higher = smoother
+        # voicing gate + grace/hold
+        self.voiced_db_on = float(args.voiced_db_on)
+        self.voiced_db_off = float(args.voiced_db_off)
+        self.note_grace_ms = float(args.note_grace_ms)
+        self.min_note_ms = float(args.min_note_ms)
+        self.freq_smooth = float(args.freq_smooth)
 
         # internal state
         self.pickdet: Optional[PeakPickDetector] = None
@@ -1075,12 +1228,37 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # synth
         if self.synth_enabled:
+            wav_data = None
+            wav_sr = None
+
+            if self.args.synth_wave == "wav":
+                if not self.args.wav_file:
+                    QtWidgets.QMessageBox.critical(
+                        self,
+                        "WAV error",
+                        "You selected --synth-wave wav but did not provide --wav-file"
+                    )
+                    return
+                try:
+                    wav_data, wav_sr = load_wav_mono(self.args.wav_file)
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(
+                        self,
+                        "WAV error",
+                        f"Failed to load WAV file:\n\n{e}"
+                    )
+                    return
+
             self.synth = MonoSynth(
                 sr=self.sr,
                 waveform=self.args.synth_wave,
                 attack_ms=self.args.synth_attack_ms,
                 release_ms=self.args.synth_release_ms,
                 gain=self.args.synth_gain,
+                wav_data=wav_data,
+                wav_sr=wav_sr,
+                wav_root_hz=midi_to_hz(float(self.args.wav_root_midi)),
+                wav_loop=bool(self.args.wav_loop),
             )
             self.synth.set_active(False)
         else:
@@ -1212,7 +1390,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         t0 = time.perf_counter()
 
-        win_samp = int(round(self.win_ms * 1e-3 * self.sr))  # 8ms
+        win_samp = int(round(self.win_ms * 1e-3 * self.sr))
         x = self.ring.get_last(win_samp)
 
         # measure RMS for voicing gate
@@ -1222,7 +1400,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # preprocess for NN/FFT
         x_p = preemph(x, self.preemph_coef)
-        x_n = rms_norm_floor(x_p, floor_rms=1e-4)  # DI can be quiet; slightly lower than before
+        x_n = rms_norm_floor(x_p, floor_rms=1e-4)
 
         # FFT size
         n_fft = 4096
@@ -1267,7 +1445,7 @@ class MainWindow(QtWidgets.QMainWindow):
         nn_conf = float(top_targets[0][1]) if top_targets else 0.0
         refined_hz = float(best.refined_hz) if best else float("nan")
 
-        # Fuse NN + FFT (same as before, but stable)
+        # Fuse NN + FFT
         fused = 0.0
         if best is not None:
             nz = mag[mag > 0]
@@ -1293,9 +1471,8 @@ class MainWindow(QtWidgets.QMainWindow):
         min_frames = int(round(self.min_note_ms / max(1e-6, self.hop_ms)))
 
         # ------------------------
-        # NOTE STATE MACHINE (fixed)
+        # NOTE STATE MACHINE
         # ------------------------
-        # Rule: we only START a note on a pick + voiced + confident classification.
         started = False
         if trig and self.voiced and (best is not None) and (fused >= self.nn_on) and np.isfinite(refined_hz):
             idx0 = int(idxs[0])
@@ -1317,24 +1494,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.synth.set_freq(self.note_hz)
                 self.synth.set_active(True)
 
-        # If we have an active note, keep it stable:
+        # If we have an active note, keep it stable
         if self.note_active and not started:
-            # decrement minimum on-time first
             if self.min_frames_left > 0:
                 self.min_frames_left -= 1
 
-            # If still voiced, keep “hangover” and optionally track pitch around last MIDI
             if self.voiced:
-                # refresh grace while voiced (this is the key to stopping E4↔none chattering)
                 self.grace_frames_left = grace_frames
 
-                # If NN/FFT are giving us something usable, update frequency smoothly.
-                # Even if NN drops out, we keep searching around last MIDI.
                 targets = []
                 if self.note_midi is not None:
-                    # track around previous note (very stable on DI sustain)
                     targets.append((int(self.note_midi), 1.0))
-                # also include NN top1 as a fallback (if it’s different and strong)
                 if top_targets:
                     targets.append((int(top_targets[0][0]), float(top_targets[0][1])))
 
@@ -1342,15 +1512,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 if g2:
                     hz2 = float(g2[0].refined_hz)
                     if np.isfinite(hz2) and hz2 > 20:
-                        # Smooth frequency to avoid zipper noise / warble.
                         a = float(np.clip(self.freq_smooth, 0.0, 0.99))
                         if np.isfinite(self.note_hz):
                             self.note_hz = a * float(self.note_hz) + (1.0 - a) * hz2
                         else:
                             self.note_hz = hz2
 
-                        # Optional: update displayed note name if NN is confidently a nearby note
-                        # but DO NOT drop to none.
                         if top_targets:
                             midi_nn = int(top_targets[0][0])
                             if float(top_targets[0][1]) >= self.nn_on and abs(midi_nn - int(self.note_midi or midi_nn)) <= 1:
@@ -1360,19 +1527,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         if self.synth is not None:
                             self.synth.set_freq(self.note_hz)
 
-                # Decide whether we should *allow* exiting while voiced:
-                # Only allow exit if confidence is truly low AND grace window elapsed AND min duration met.
                 if (fused < self.nn_off) and (self.min_frames_left <= 0):
                     self.grace_frames_left -= 1
                 else:
                     self.grace_frames_left = grace_frames
 
             else:
-                # Unvoiced: count down grace to release note; require minimum on-time first
                 if self.min_frames_left <= 0:
                     self.grace_frames_left -= 1
 
-            # If grace expired, turn off note/synth
             if self.grace_frames_left <= 0 and self.min_frames_left <= 0:
                 self.note_active = False
                 self.note_midi = None
@@ -1498,7 +1661,7 @@ def parse_args():
     ap.add_argument("--hop-ms", type=float, default=4.0)
     ap.add_argument("--topk", type=int, default=3)
 
-    # NEW: confidence hysteresis (fix chatter)
+    # confidence hysteresis
     ap.add_argument("--nn-on", type=float, default=0.38, help="Enter note if fused >= this")
     ap.add_argument("--nn-off", type=float, default=0.25, help="Allow note to decay only if fused < this")
 
@@ -1514,7 +1677,7 @@ def parse_args():
     ap.add_argument("--sustain-block", type=float, default=0.75)
     ap.add_argument("--preemph", type=float, default=0.10)
 
-    # NEW: voicing + grace hold (your request)
+    # voicing + grace hold
     ap.add_argument("--voiced-db-on", type=float, default=-45.0, help="DI considered voiced when dB >= this")
     ap.add_argument("--voiced-db-off", type=float, default=-55.0, help="DI considered unvoiced when dB <= this")
     ap.add_argument("--note-grace-ms", type=float, default=160.0, help="Hold last note this long while still voiced")
@@ -1522,10 +1685,14 @@ def parse_args():
     ap.add_argument("--freq-smooth", type=float, default=0.85, help="0..0.99 smoothing for tracked FFT pitch")
 
     ap.add_argument("--synth", action="store_true")
-    ap.add_argument("--synth-wave", type=str, default="sine", choices=["sine", "square", "saw"])
+    ap.add_argument("--synth-wave", type=str, default="sine", choices=["sine", "square", "saw", "wav"])
     ap.add_argument("--synth-gain", type=float, default=0.14)
     ap.add_argument("--synth-attack-ms", type=float, default=2.0)
     ap.add_argument("--synth-release-ms", type=float, default=35.0)
+
+    ap.add_argument("--wav-file", type=str, default=None, help="Path to WAV file to use as synth source")
+    ap.add_argument("--wav-root-midi", type=float, default=69.0, help="MIDI note the WAV is tuned to")
+    ap.add_argument("--wav-loop", action="store_true", help="Loop the WAV file continuously")
 
     ap.add_argument("--wasapi-exclusive", action="store_true")
     ap.add_argument("--asio-in-ch", type=int, default=None)
