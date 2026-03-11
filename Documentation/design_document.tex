@@ -1,0 +1,162 @@
+\documentclass[12pt]{article}
+
+\usepackage{amsmath}
+\usepackage{enumitem}
+
+\title{\textbf{Polyphonic Guitar Synthesizer Pedal}\\
+\vspace{0.5em}
+\large System Overview and Design Description}
+
+% Use full names?
+\author{Team 2: Kai, Zion, Barry, Nick, Yasmeen and Aaryan}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+% --- Add executive summary --- %
+
+\newpage
+
+\section{Overview}
+\subsection{Need and Goal Statements}
+\textbf{Need Statement:} Existing guitar-controlled synthesizers cannot detect and play more than one note at once, which limits the expressiveness of the guitar.\\
+\textbf{Goal Statement:} Design a polyphonic guitar synth pedal that is intuitive for guitarists and suitable for live performance.
+
+\subsection{Design Objectives}
+
+\begin{enumerate}[label=(\alph*)]
+
+    \item \textbf{Polyphonic Note Detection} \\
+    The guitar is inherently polyphonic, but accurate and general-purpose polyphonic note detection is still an open challenge. In order to provide accurate polyphonic note detection, the device needs to accurately infer the number of distinct notes played in a guitar chord, and their individual pitches.
+
+    \item \textbf{Low Latency} \\
+    A latency of $10\,\text{ms}$ is targeted, to facilitate an intuitive and enjoyable user experience. The player should not perceive any delay between playing a note and hearing the synthesized sound through their amplifier. This strict latency requirement drives many of our architectural and algorithmic decisions.
+
+    \item \textbf{Form factor} \\
+    The device must fit comfortably onto a guitar pedalboard, and match the design language of existing guitar effects pedals. Additionally, the device must accept 9VDC power from a coaxial jack (5.5mm x 2.1mm, center-negative), standard for guitar pedals.
+
+%    Note: By existing design language, I mean:\\
+%    - Input goes from right to left \\
+%    - Power jack is facing away from user \\
+%    - All user controls located on the upward-face of the pedal\\
+%    - Bypass footswitch is located on lower portion of the interface\\
+%    - Knobs and parameter controls are located on the upper portion of the interface\\
+%   Where should this information go?
+
+\end{enumerate}
+
+%\subsection{Existing Products}
+% other guitar synth pedals (BOSS GT-3, 1997, has a monophonic guitar synth effect)
+% melodyne and other software solutions (polyphonic detection)
+
+\subsection{Target Audience (Personas)}
+% - "bedroom guitarist"
+% - recording studio
+% - live performer
+
+\section{Design of the Pedal}
+\subsection{Signal Flow}
+\subsection{Software System}
+\subsection{Embedded Platform}
+\subsection{Analog Circuits}
+\subsection{Physical Construction}
+
+\section{Testing of the Pedal}
+
+% Refer to assignment description:
+% Appendix A: Problem Formulation
+% Appendix B: Planning
+% Appendix C: Test Plan and Results
+% Appendix D: Review
+
+
+%%%%%% -- remnants of the previous draft, repurpose as needed ----- %%%%
+
+%\usepackage[margin=1in]{geometry}
+%usepackage{setspace}
+%\usepackage{graphicx}
+%\usepackage{float}
+%\usepackage{hyperref}
+%\setstretch{1.1}
+
+%%%\section{Embedded System}
+%%% The embedded system acts as the glue between our analog and digital subsystems. We selected the \textit{Daisy Seed}, built around the STM32H750 microcontroller, because it is designed specifically for low-latency audio applications.
+%\newpage
+%%%\subsection*{Signal Flow}
+%%%\begin{figure}[H]
+%%%    \centering
+%%%    \includegraphics[width=1\linewidth]{LUTPolyphonic.drawio pain2.PNG}
+%%%    \caption{Signal Flow Schematic}
+%%%    \label{fig:placeholder}
+%%%\end{figure}
+%%%\begin{itemize}
+
+%    \item The guitar signal first passes through a transparent preamp.
+%    \item The preamplified signal enters the onboard audio codec.
+%    \item The codec’s Analog-to-Digital Converter (ADC) converts the waveform into discrete digital samples.
+%    \item These samples are transferred to the STM32 via the Serial Audio Interface (SAI).
+%    \item Direct Memory Access (DMA) moves the audio data into memory without heavily loading the CPU.
+%    \item Our polyphonic detection and synthesis algorithms process the audio in software.
+%    \item The processed signal is sent back through the Digital-to-Analog Converter (DAC).
+%    \item The output is routed to the analog stage and then to the amplifier.
+
+%\end{itemize}
+
+%Audio is processed in small blocks to maintain our $<10\,\text{ms}$ latency target. Each stage in this pipeline is designed with real-time performance in mind.
+
+%\section{Software System}
+%\begin{figure}[H]
+%    \centering
+%    \includegraphics[width=1\linewidth]{LUTPolyphonic.drawio pain.PNG}
+%    \caption{Software Schematic}
+%    \label{fig:placeholder}
+%\end{figure}
+%The software performs the core digital logic of the synthesizer effect. Our primary constraints are maintaining latency below $10\,\text{ms}$ while operating within a $64\,\text{MB}$ RAM limit.
+
+%\subsection*{Processing Pipeline}
+
+%The workflow begins with the digitized guitar signal. From there, we run both a neural network (NN) and a frequency-domain algorithm in parallel using a shared $8\,\text{ms}$ rolling buffer.
+
+%\subsubsection*{Neural Network (NN)}
+
+%The neural network is responsible for:
+
+%\begin{itemize}
+%    \item Classifying which note is being played
+%    \item Identifying the string
+%    \item Detecting whether the note was freshly picked or is sustaining
+%\end{itemize}
+
+%\subsubsection*{FFT-Based Refinement}
+
+%A Fast Fourier Transform (FFT)-based polyphonic algorithm runs in parallel with the neural network. It:
+
+%\begin{itemize}
+%    \item Refines the final pitch estimate
+%    \item Tracks pitch bends in real time
+%\end{itemize}
+
+%The synthesizer combines:
+%\begin{itemize}
+%    \item Pick/Sustain output from the neural network
+%    \item Refined pitch output from the FFT
+%\end{itemize}
+
+%Together, these determine how we generate and shape the final synthesized sound.
+
+%\section{Analog System}
+
+%The pedal contains two primary analog circuits.
+
+%\subsection*{Transparent Preamp}
+
+%The preamp boosts the guitar signal to line level before feeding it into the Daisy Seed’s ADC. It is designed to be transparent so that it preserves the original tonal character of the instrument.
+
+%\subsection*{Overdrive Circuit}
+
+%The second analog stage is an overdrive circuit applied to the synthesized output from the DAC. This allows us to shape the tone of the synth in the analog domain before sending it to the user’s amplifier, pedal chain, or other compatible equipment. This stage also provides master volume control.
+
+%Our current prototype draws inspiration from the Tascam 424 preamp architecture and a simple Wampler-style overdrive circuit. For the final prototype, we are designing a fully custom overdrive circuit tailored specifically to our synthesizer output.
+
+\end{document}
