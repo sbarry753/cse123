@@ -876,25 +876,26 @@ class OnsetDataset(Dataset):
 # Model
 # ----------------------------
 class OnsetNet(nn.Module):
-    """
-    Tiny 1D conv with TWO heads:
-      - note_head: vocab_size outputs
-      - string_head: 6 outputs
-
-    Accepts variable input length due to AdaptiveAvgPool1d(1).
-    """
-    def __init__(self, note_vocab_size: int, width: int = 64, n_strings: int = 6):
+    def __init__(self, note_vocab_size: int, width: int = 128, n_strings: int = 6):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(1, width // 2, kernel_size=9, stride=2, padding=4, bias=False),
-            nn.BatchNorm1d(width // 2),
-            nn.ReLU(inplace=True),
-
-            nn.Conv1d(width // 2, width, kernel_size=5, stride=2, padding=2, bias=False),
+        self.feat = nn.Sequential(
+            nn.Conv1d(1, width, kernel_size=63, stride=2, padding=31, bias=False),
             nn.BatchNorm1d(width),
             nn.ReLU(inplace=True),
 
-            nn.Conv1d(width, width, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.Conv1d(width, width, kernel_size=31, stride=2, padding=15, dilation=1, bias=False),
+            nn.BatchNorm1d(width),
+            nn.ReLU(inplace=True),
+
+            nn.Conv1d(width, width, kernel_size=15, stride=1, padding=14, dilation=2, bias=False),
+            nn.BatchNorm1d(width),
+            nn.ReLU(inplace=True),
+
+            nn.Conv1d(width, width, kernel_size=15, stride=1, padding=28, dilation=4, bias=False),
+            nn.BatchNorm1d(width),
+            nn.ReLU(inplace=True),
+
+            nn.Conv1d(width, width, kernel_size=15, stride=1, padding=56, dilation=8, bias=False),
             nn.BatchNorm1d(width),
             nn.ReLU(inplace=True),
 
@@ -902,20 +903,12 @@ class OnsetNet(nn.Module):
         )
         self.note_head = nn.Linear(width, note_vocab_size)
         self.string_head = nn.Linear(width, n_strings)
-
-        self.note_vocab_size = note_vocab_size
         self.n_strings = n_strings
         self.width = width
 
-    def forward(self, x: torch.Tensor):
-        z = self.conv(x).squeeze(-1)  # (B, width)
-        note_logits = self.note_head(z)      # (B, V)
-        string_logits = self.string_head(z)  # (B, 6)
-        return note_logits, string_logits
-
-    def count_params(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
+    def forward(self, x):
+        z = self.feat(x).squeeze(-1)
+        return self.note_head(z), self.string_head(z)
 
 # ----------------------------
 # Export to C header
@@ -1107,7 +1100,7 @@ def train(args):
 
     model_note_vocab = base_vocab_size
     model = OnsetNet(note_vocab_size=model_note_vocab, width=args.width, n_strings=N_STRINGS).to(device)
-    print(f"[INFO] params={model.count_params():,} width={args.width} note_vocab={model_note_vocab}")
+    print(f"[INFO] params= width={args.width} note_vocab={model_note_vocab}")
 
     if stage2:
         pw = torch.full((base_vocab_size,), float(args.pos_weight), device=device)
@@ -1256,7 +1249,7 @@ def train(args):
                 y_string = y_string.to(device, non_blocking=True)
                 onset_idx = onset_idx.to(device, non_blocking=True)
 
-                if args.warmup_steps > 0:
+                if args.warmup_steps > 0 and global_step < args.warmup_steps:
                     maybe_linear_warmup_lr(opt, args.lr, global_step, args.warmup_steps)
 
                 opt.zero_grad(set_to_none=True)
