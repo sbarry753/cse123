@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-nn_fft_refine_live_synth_ring_to_wav.py
+nn_fft_refine.py
 
-Same idea as your script (parallel NN + always-on FFT on the SAME ring buffer),
-but instead of playing audio live with sounddevice, it renders the synth output
-and writes it to a WAV file incrementally.
+
 
 Also includes a much less jittery “pick” trigger:
 - Smooth picked_p (EMA)

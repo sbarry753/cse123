@@ -23,6 +23,7 @@ Collate pads x and stacks y_*.
 Stage 1 (default):
   - note head: CE
   - string head: CE ignore_index=-1
+  - optional auxiliary distance-aware note loss (Version A)
 
 Stage 2 (--stage2):
   - note head: BCE multi-label
@@ -37,6 +38,8 @@ Changes vs original:
   - --label_smoothing default raised to 0.08
   - --curriculum_epochs default raised to 60
   - --warmup_steps default raised to 500
+  - Version A: auxiliary expected-index distance loss for stage1
+    so near-note predictions are penalized less than far-note predictions
 
 Example:
 python train_twohead_guitar.py --dataset ./dataset --out stage1_merged \
@@ -53,7 +56,9 @@ python train_twohead_guitar.py --dataset ./dataset --out stage1_merged \
   --crop_keep_onset_prob 0.0 \
   --string_loss_w 0.5 \
   --label_smoothing 0.08 \
-  --warmup_steps 500
+  --warmup_steps 500 \
+  --note_dist_w 0.10 \
+  --note_dist_p 1.0
 """
 
 import os
@@ -62,7 +67,7 @@ import time
 import random
 import argparse
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
@@ -160,6 +165,32 @@ def maybe_linear_warmup_lr(opt: torch.optim.Optimizer, base_lr: float, step_idx:
     lr_now = base_lr * scale
     for pg in opt.param_groups:
         pg["lr"] = lr_now
+
+
+def expected_index_distance_loss(logits: torch.Tensor, targets: torch.Tensor, p: float = 1.0):
+    """
+    Version A:
+    Encourage predicted probability mass to sit near the true class index.
+
+    logits:  (B, C)
+    targets: (B,) long
+
+    p = 1.0 -> mean absolute expected-index distance
+    p = 2.0 -> mean squared expected-index distance
+
+    Assumes class ordering follows true pitch ordering.
+    """
+    probs = torch.softmax(logits, dim=1)  # (B, C)
+    class_idx = torch.arange(logits.shape[1], device=logits.device, dtype=probs.dtype).unsqueeze(0)  # (1, C)
+    pred_idx = (probs * class_idx).sum(dim=1)  # (B,)
+    tgt = targets.float()
+
+    if p == 1.0:
+        return torch.abs(pred_idx - tgt).mean()
+    elif p == 2.0:
+        return ((pred_idx - tgt) ** 2).mean()
+    else:
+        return (torch.abs(pred_idx - tgt) ** p).mean()
 
 
 def pad_collate_1d_with_onset(batch):
@@ -604,9 +635,8 @@ def load_clips(dataset_root: str) -> Tuple[List[ClipInfo], int, int, Dict[str, A
             source=source,
         ))
 
-    # Print source breakdown for diagnostics
     src_counts: Counter = Counter(c.source for c in clips)
-    print(f"[INFO] Dataset sources: { dict(src_counts) }")
+    print(f"[INFO] Dataset sources: {dict(src_counts)}")
 
     return clips, sr, vocab_size, meta
 
@@ -679,7 +709,6 @@ class OnsetDataset(Dataset):
         self.enable_gain = bool(enable_gain)
         self.enable_polarity = bool(enable_polarity)
 
-        # Domain-gap LP params (applied to DI clips only)
         self.di_lp_prob = float(di_lp_prob)
         self.di_lp_coef_min = float(di_lp_coef_min)
         self.di_lp_coef_max = float(di_lp_coef_max)
@@ -746,14 +775,8 @@ class OnsetDataset(Dataset):
         if self.enable_polarity and random.random() < 0.5:
             x = -x
 
-        # Source-aware domain gap closure:
-        # DI clips are native 48kHz with sharper transients.
-        # GuitarSet/IDMT were recorded at 44.1kHz and resampled up,
-        # giving them a mild HF rolloff. Apply a simple 1-pole LP to DI
-        # clips occasionally so the model sees both timbres from both sources.
         if source == "di" and self.di_lp_prob > 0 and random.random() < self.di_lp_prob:
             coef = random.uniform(self.di_lp_coef_min, self.di_lp_coef_max)
-            # IIR 1-pole LP: y[n] = (1-coef)*x[n] + coef*y[n-1]
             out = np.empty_like(x)
             prev = 0.0
             alpha = 1.0 - coef
@@ -793,13 +816,7 @@ class OnsetDataset(Dataset):
         return x[st: st + self.crop_W], st
 
     def __getitem__(self, idx: int):
-        # Use the sampler-provided index to pick which clip.
-        # WeightedRandomSampler gives us indices in [0, len(clips)-1],
-        # but virtual_len may be larger so we mod to stay in bounds.
-        ci = self.clips[idx % len(self.candidates)]
-        # candidates maps to valid clips; use mod on candidates list
         ci = self.clips[self.candidates[idx % len(self.candidates)]]
-
         y = self._load(ci.audio_abs, ci.sr)
 
         min_pos = int(self.onset_pos_min * self.base_W)
@@ -819,31 +836,25 @@ class OnsetDataset(Dataset):
 
         onset_offset_in_base = int(ci.onset_sample - start)
 
-        # NOTE label
         if self.stage2:
             y_note = np.array(ci.multi_hot, dtype=np.float32)
         else:
             y_note = self._multi_hot_to_single_index(ci.multi_hot)
 
-        # STRING label
         if (ci.clip_type in ("single", "note_repeat_segment")) and (0 <= int(ci.string_idx) < 6):
             y_string = int(ci.string_idx)
         else:
             y_string = STRING_IGNORE_INDEX
 
-        # Augment (pass source for domain-aware LP)
         x = x.astype(np.float32)
         x = self._augment(x, source=ci.source)
 
-        # Crop
         x, crop_start = self._maybe_crop(x, onset_offset_in_base=onset_offset_in_base)
 
-        # onset index in returned window (viz only)
         onset_in_return = int(onset_offset_in_base - crop_start)
         if onset_in_return < 0 or onset_in_return >= len(x):
             onset_in_return = -1
 
-        # Normalize
         x = self._rms_norm(x)
 
         if self.preemph_coef > 0:
@@ -1090,8 +1101,6 @@ def train(args):
     train_clips, val_clips = train_val_split(clips, args.val_ratio, args.seed)
     print(f"[INFO] train={len(train_clips)} val={len(val_clips)}")
 
-    # Build weighted sampler for balanced pitch-class distribution.
-    # n_samples = one full epoch worth of batches.
     n_train_samples = args.steps_per_epoch * args.batch
     train_sampler = make_weighted_sampler(train_clips, n_samples=n_train_samples)
     print(f"[INFO] WeightedRandomSampler: {n_train_samples} samples/epoch over {len(train_clips)} clips")
@@ -1171,7 +1180,7 @@ def train(args):
         gain_db_max=0.0,
         enable_gain=False,
         enable_polarity=False,
-        di_lp_prob=0.0,   # no augmentation on val
+        di_lp_prob=0.0,
         onset_pos_min=args.onset_pos_min,
         onset_pos_max=args.onset_pos_max,
         crop_keep_onset_prob=args.crop_keep_onset_prob,
@@ -1179,12 +1188,10 @@ def train(args):
         crop_onset_jitter_ms=args.crop_onset_jitter_ms,
     )
 
-    # Train loader uses WeightedRandomSampler (no shuffle).
-    # Val loader uses simple sequential sampling (no weighting needed for eval).
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch,
-        sampler=train_sampler,      # WeightedRandomSampler controls order
+        sampler=train_sampler,
         num_workers=args.workers,
         pin_memory=True,
         persistent_workers=(args.workers > 0),
@@ -1229,11 +1236,13 @@ def train(args):
         for ep in range(start_epoch, args.epochs + 1):
             apply_curriculum(train_ds, ep, args)
 
-            # Rebuild sampler each epoch so weights reflect current clip pool
-            # (clip pool doesn't change but this is a no-op and costs nothing)
             model.train()
             t0 = time.time()
             tr_loss = 0.0
+
+            tr_note_ce = 0.0
+            tr_note_dist = 0.0
+            tr_string_loss = 0.0
 
             viz_every = max(1, int(args.viz_every)) if viz is not None else 0
 
@@ -1258,9 +1267,17 @@ def train(args):
                     if stage2:
                         loss = note_loss_fn(note_logits, y_note)
                     else:
-                        note_loss = note_loss_fn(note_logits, y_note.view(-1))
+                        note_targets = y_note.view(-1)
+                        note_ce = note_loss_fn(note_logits, note_targets)
+                        note_dist = expected_index_distance_loss(
+                            note_logits, note_targets, p=args.note_dist_p
+                        )
                         string_loss = string_loss_fn(string_logits, y_string.view(-1))
-                        loss = note_loss + float(args.string_loss_w) * string_loss
+                        loss = (
+                            note_ce
+                            + float(args.note_dist_w) * note_dist
+                            + float(args.string_loss_w) * string_loss
+                        )
 
                 scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
@@ -1268,12 +1285,22 @@ def train(args):
                 scaler.update()
 
                 tr_loss += float(loss.item())
+                if not stage2:
+                    tr_note_ce += float(note_ce.item())
+                    tr_note_dist += float(note_dist.item())
+                    tr_string_loss += float(string_loss.item())
+
                 global_step += 1
 
                 if viz is not None and (step % viz_every == 0):
                     viz.update(x_batch=x, y_note=y_note, onset_idx=onset_idx, device=device, stage2=stage2)
 
             tr_loss /= args.steps_per_epoch
+            if not stage2:
+                tr_note_ce /= args.steps_per_epoch
+                tr_note_dist /= args.steps_per_epoch
+                tr_string_loss /= args.steps_per_epoch
+
             if scheduler is not None and args.scheduler != "none":
                 scheduler.step()
 
@@ -1282,6 +1309,10 @@ def train(args):
             # ------------------------
             model.eval()
             v_loss = 0.0
+            v_note_ce = 0.0
+            v_note_dist = 0.0
+            v_string_loss = 0.0
+
             all_note_logits, all_note_targets = [], []
             all_string_logits, all_string_targets = [], []
 
@@ -1300,16 +1331,35 @@ def train(args):
                         all_note_logits.append(note_logits.cpu())
                         all_note_targets.append(y_note.cpu())
                     else:
-                        note_loss = note_loss_fn(note_logits, y_note.view(-1))
+                        note_targets = y_note.view(-1)
+                        note_ce = note_loss_fn(note_logits, note_targets)
+                        note_dist = expected_index_distance_loss(
+                            note_logits, note_targets, p=args.note_dist_p
+                        )
                         string_loss = string_loss_fn(string_logits, y_string.view(-1))
-                        v_loss += float((note_loss + float(args.string_loss_w) * string_loss).item())
+
+                        total_v = (
+                            note_ce
+                            + float(args.note_dist_w) * note_dist
+                            + float(args.string_loss_w) * string_loss
+                        )
+
+                        v_loss += float(total_v.item())
+                        v_note_ce += float(note_ce.item())
+                        v_note_dist += float(note_dist.item())
+                        v_string_loss += float(string_loss.item())
 
                         all_note_logits.append(note_logits.cpu())
-                        all_note_targets.append(y_note.view(-1).cpu())
+                        all_note_targets.append(note_targets.cpu())
                         all_string_logits.append(string_logits.cpu())
                         all_string_targets.append(y_string.view(-1).cpu())
 
             v_loss /= args.val_steps
+            if not stage2:
+                v_note_ce /= args.val_steps
+                v_note_dist /= args.val_steps
+                v_string_loss /= args.val_steps
+
             all_note_logits = torch.cat(all_note_logits)
             all_note_targets = torch.cat(all_note_targets)
 
@@ -1324,6 +1374,7 @@ def train(args):
                     f"fixF1={f1_fix:.3f}@{args.thresh:.2f}"
                 )
                 score_for_best = best_f1
+                loss_breakdown = ""
                 str_metric = ""
             else:
                 probs = torch.softmax(all_note_logits, dim=1)
@@ -1332,8 +1383,22 @@ def train(args):
                     probs.topk(k=min(3, probs.shape[1]), dim=1).indices == all_note_targets.unsqueeze(1)
                 ).any(dim=1).float().mean().item()
                 mean_true_p = probs[torch.arange(probs.shape[0]), all_note_targets].mean().item()
-                metric_str = f"top1={top1:.3f} top3={top3:.3f} mean_true_p={mean_true_p:.3f}"
-                score_for_best = top1
+
+                pred_exp_idx = (probs * torch.arange(probs.shape[1], dtype=probs.dtype).unsqueeze(0)).sum(dim=1)
+                mean_abs_idx_err = torch.abs(pred_exp_idx - all_note_targets.float()).mean().item()
+
+                metric_str = (
+                    f"top1={top1:.3f} top3={top3:.3f} "
+                    f"mean_true_p={mean_true_p:.3f} mean_abs_idx_err={mean_abs_idx_err:.3f}"
+                )
+
+                score_for_best = 0.7 * top1 + 0.3 * top3
+
+                loss_breakdown = (
+                    f" note_ce={v_note_ce:.4f} note_dist={v_note_dist:.4f}"
+                    f"(w={args.note_dist_w:g},p={args.note_dist_p:g})"
+                    f" string_ce={v_string_loss:.4f}"
+                )
 
                 all_string_logits = torch.cat(all_string_logits) if all_string_logits else torch.empty(0)
                 all_string_targets = torch.cat(all_string_targets) if all_string_targets else torch.empty(0, dtype=torch.long)
@@ -1357,10 +1422,18 @@ def train(args):
                 f"anchor([{args.onset_pos_min:g},{args.onset_pos_max:g}] keep_crop_onset={args.crop_keep_onset_prob:g})"
             )
 
-            print(
-                f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} {metric_str}{str_metric} "
-                f"lr={lr_now:.2e} {aug_profile} {win_profile} t={dt:.1f}s"
-            )
+            if stage2:
+                print(
+                    f"[EP {ep:03d}] train={tr_loss:.4f} val={v_loss:.4f} {metric_str}{str_metric} "
+                    f"lr={lr_now:.2e} {aug_profile} {win_profile} t={dt:.1f}s"
+                )
+            else:
+                print(
+                    f"[EP {ep:03d}] train={tr_loss:.4f} "
+                    f"(note_ce={tr_note_ce:.4f} note_dist={tr_note_dist:.4f} string_ce={tr_string_loss:.4f}) "
+                    f"val={v_loss:.4f}{loss_breakdown} {metric_str}{str_metric} "
+                    f"lr={lr_now:.2e} {aug_profile} {win_profile} t={dt:.1f}s"
+                )
 
             ckpt = {
                 "epoch": ep,
@@ -1426,6 +1499,12 @@ def main():
     ap.add_argument("--clip_grad", type=float, default=1.0)
     ap.add_argument("--warmup_steps", type=int, default=500)
     ap.add_argument("--label_smoothing", type=float, default=0.08)
+
+    # Version A auxiliary note distance loss (stage1 only)
+    ap.add_argument("--note_dist_w", type=float, default=0.10,
+                    help="Weight for auxiliary expected-index distance loss in stage1")
+    ap.add_argument("--note_dist_p", type=float, default=1.0,
+                    help="Distance power: 1=L1, 2=L2")
 
     # Scheduler
     ap.add_argument("--scheduler", type=str, default="step", choices=["step", "cosine", "none"])
