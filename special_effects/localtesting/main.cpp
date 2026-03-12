@@ -7,6 +7,8 @@
 #include "wavefolding_effect.h"
 #include "agc.h"
 
+#define strike_detection 0
+
 int main(int argc, char* argv[]) {
     // We now expect 4 arguments: the program, the gain, the effect, and the file
     if (argc < 4) {
@@ -68,7 +70,12 @@ int main(int argc, char* argv[]) {
             }
             
             // 4. Pass the clean and shaped samples to the AGC to fix the VOLUME
-            audioFile.samples[channel][i] = agc.process(cleanSample, shapedSample);
+	    if (strike_detection) {
+		audioFile.samples[channel][i] = shapedSample;
+	    }
+	    else {
+                audioFile.samples[channel][i] = agc.process(cleanSample, shapedSample);
+	    }
         }
     }
 

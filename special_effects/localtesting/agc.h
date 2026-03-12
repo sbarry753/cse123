@@ -1,3 +1,6 @@
+#ifndef AGC_H
+#define AGC_H
+
 #include <cmath>
 
 class AutoGainControl {
@@ -33,4 +36,6 @@ public:
         return processedSample * makeupGain;
     }
 };
+
+#endif // AGC_H
 

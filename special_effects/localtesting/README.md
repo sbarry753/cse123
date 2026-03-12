@@ -14,6 +14,10 @@ Bool logic on unity-gain to prevent unnecessary attunation if not needed.
 
 When porting to daisy seed, use numerical/enum for analog inputs to special_effects
 
+Wavefolding may need to be optimized, using a while loop. However, it is predictible, short loop.
+
+Delay and reverb
+
 #Tests
 
 DryGuitar.wav : Duration, 1:24

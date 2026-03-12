@@ -9,7 +9,7 @@ using namespace daisy;
 DaisySeed hw;
 AutoGainControl agc[2]; // one per channel
 
-// This replaces your for loop — the hardware calls it automatically
+// This replaces your for loop the hardware calls it automatically
 void AudioCallback(AudioHandle::InputBuffer in,
                    AudioHandle::OutputBuffer out,
                    size_t size) {
@@ -21,7 +21,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         for (int ch = 0; ch < 2; ch++) {
             float cleanSample = in[ch][i];
             
-            // For now hardcode an effect — later a switch can read a physical switch pin
+            // For now hardcode an effect later a switch can read a physical switch pin
             float shapedSample = processDistortion(cleanSample, userGain);
             
             out[ch][i] = agc[ch].process(cleanSample, shapedSample);
