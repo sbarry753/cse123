@@ -11,8 +11,8 @@ BLOCK_SIZE = 128
 CONTEXT_SAMPLES = 4096
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CHECKPOINT = "checkpoints/live_timbre_epoch_007.pt"
-INPUT_WAV = "dataset_48k/input/plaz.wav"
+CHECKPOINT = "checkpoints/causal_autoenc_epoch_004.pt"
+INPUT_WAV = "dataset_48k/input/Guitar (1).wav"
 OUTPUT_WAV = "streamed_output.wav"
 
 
@@ -20,7 +20,7 @@ def load_audio_mono(path: str, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
     audio, sr = sf.read(path, always_2d=True)
     audio = audio.astype(np.float32)
     audio = audio.mean(axis=1)
-    audio = torch.from_numpy(audio).unsqueeze(0)
+    audio = torch.from_numpy(audio).unsqueeze(0)  # [1, T]
 
     if sr != sample_rate:
         audio = torchaudio.functional.resample(audio, sr, sample_rate)
@@ -29,72 +29,182 @@ def load_audio_mono(path: str, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
 
 
 class CausalConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation=1, bias=True):
+    def __init__(self, in_ch, out_ch, kernel_size, stride=1, dilation=1, bias=True):
         super().__init__()
         self.left_pad = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, dilation=dilation, bias=bias)
+        self.conv = nn.Conv1d(
+            in_ch,
+            out_ch,
+            kernel_size=kernel_size,
+            stride=stride,
+            dilation=dilation,
+            bias=bias,
+        )
 
     def forward(self, x):
         x = F.pad(x, (self.left_pad, 0))
         return self.conv(x)
 
 
-class GatedResidualBlock(nn.Module):
-    def __init__(self, channels, kernel_size=3, dilation=1):
+class CausalResBlock(nn.Module):
+    def __init__(self, channels, kernel_size=5, dilation=1):
         super().__init__()
-        self.filter_conv = CausalConv1d(channels, channels, kernel_size, dilation=dilation)
-        self.gate_conv = CausalConv1d(channels, channels, kernel_size, dilation=dilation)
-        self.res_conv = nn.Conv1d(channels, channels, kernel_size=1)
-        self.skip_conv = nn.Conv1d(channels, channels, kernel_size=1)
-        self.norm = nn.GroupNorm(1, channels)
+        self.conv1 = CausalConv1d(channels, channels, kernel_size=kernel_size, dilation=dilation)
+        self.conv2 = CausalConv1d(channels, channels, kernel_size=kernel_size, dilation=1)
 
     def forward(self, x):
-        h_f = self.filter_conv(x)
-        h_g = self.gate_conv(x)
-        z = torch.tanh(h_f) * torch.sigmoid(h_g)
-        z = self.norm(z)
-        residual = self.res_conv(z) + x
-        skip = self.skip_conv(z)
-        return residual, skip
+        z = F.leaky_relu(self.conv1(x), 0.2)
+        z = F.leaky_relu(self.conv2(z), 0.2)
+        return x + z
 
 
-class LiveTimbreNet(nn.Module):
-    def __init__(self, channels=64):
+class CausalEncoderStage(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=7, stride=2):
         super().__init__()
-        self.in_conv = CausalConv1d(1, channels, kernel_size=5, dilation=1)
-        dilations = [1, 2, 4, 8, 16, 32, 64, 128]
-        self.blocks = nn.ModuleList([GatedResidualBlock(channels, kernel_size=3, dilation=d) for d in dilations])
-        self.post_1 = nn.Conv1d(channels, channels, kernel_size=1)
-        self.post_2 = nn.Conv1d(channels, 1, kernel_size=1)
-        self.dry_gain = nn.Parameter(torch.tensor(0.15))
-        self.wet_gain = nn.Parameter(torch.tensor(1.0))
+        self.down = CausalConv1d(in_ch, out_ch, kernel_size=kernel_size, stride=stride)
+        self.res1 = CausalResBlock(out_ch, kernel_size=5, dilation=1)
+        self.res2 = CausalResBlock(out_ch, kernel_size=5, dilation=2)
 
     def forward(self, x):
-        dry = x[:, :, -BLOCK_SIZE:]
-        z = F.leaky_relu(self.in_conv(x), 0.2)
+        x = F.leaky_relu(self.down(x), 0.2)
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
 
-        skip_sum = 0.0
-        for block in self.blocks:
-            z, skip = block(z)
-            skip_sum = skip_sum + skip
 
-        z = F.leaky_relu(skip_sum, 0.2)
-        z = F.leaky_relu(self.post_1(z), 0.2)
-        wet = torch.tanh(self.post_2(z))[:, :, -BLOCK_SIZE:]
-        return self.dry_gain * dry + self.wet_gain * wet
+class CausalUpsampleStage(nn.Module):
+    def __init__(self, in_ch, out_ch, up_factor=2, kernel_size=5):
+        super().__init__()
+        self.up_factor = up_factor
+        self.proj = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+        self.smooth = CausalConv1d(out_ch, out_ch, kernel_size=kernel_size)
+        self.res1 = CausalResBlock(out_ch, kernel_size=5, dilation=1)
+        self.res2 = CausalResBlock(out_ch, kernel_size=5, dilation=2)
+
+    def forward(self, x):
+        x = self.proj(x)
+        x = x.repeat_interleave(self.up_factor, dim=-1)
+        x = F.leaky_relu(self.smooth(x), 0.2)
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
+
+
+class LatentProcessor(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.pre = nn.ModuleList([
+            CausalResBlock(channels, kernel_size=5, dilation=1),
+            CausalResBlock(channels, kernel_size=5, dilation=2),
+            CausalResBlock(channels, kernel_size=5, dilation=4),
+            CausalResBlock(channels, kernel_size=5, dilation=8),
+        ])
+        self.gru = nn.GRU(
+            input_size=channels,
+            hidden_size=channels,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.post = nn.ModuleList([
+            CausalResBlock(channels, kernel_size=5, dilation=1),
+            CausalResBlock(channels, kernel_size=5, dilation=2),
+            CausalResBlock(channels, kernel_size=5, dilation=4),
+        ])
+
+    def forward(self, x, h0=None):
+        # x: [B, C, T]
+        for blk in self.pre:
+            x = blk(x)
+
+        x_seq = x.transpose(1, 2)       # [B, T, C]
+        x_seq, hN = self.gru(x_seq, h0) # [B, T, C], [1, B, C]
+        x = x_seq.transpose(1, 2)       # [B, C, T]
+
+        for blk in self.post:
+            x = blk(x)
+
+        return x, hN
+
+
+class LiveCausalAutoencoder(nn.Module):
+    """
+    input  = [B, 1, CONTEXT + BLOCK]
+    output = [B, 1, BLOCK]
+    """
+
+    def __init__(self, base_ch=48):
+        super().__init__()
+
+        self.in_conv = CausalConv1d(1, base_ch, kernel_size=9)
+
+        self.enc1 = CausalEncoderStage(base_ch, base_ch * 2, kernel_size=7, stride=2)
+        self.enc2 = CausalEncoderStage(base_ch * 2, base_ch * 4, kernel_size=7, stride=2)
+
+        self.latent = LatentProcessor(base_ch * 4)
+
+        self.dec1 = CausalUpsampleStage(base_ch * 4, base_ch * 2, up_factor=2)
+        self.dec2 = CausalUpsampleStage(base_ch * 2, base_ch, up_factor=2)
+
+        self.skip1_proj = nn.Conv1d(base_ch * 2, base_ch * 2, kernel_size=1)
+        self.skip0_proj = nn.Conv1d(base_ch, base_ch, kernel_size=1)
+
+        self.out_mid = CausalConv1d(base_ch, base_ch, kernel_size=5)
+        self.out_conv = CausalConv1d(base_ch, 1, kernel_size=5)
+
+    def forward(self, x, h0=None, return_state=False):
+        x0 = F.leaky_relu(self.in_conv(x), 0.2)   # [B, base, T]
+        x1 = self.enc1(x0)                        # [B, 2base, ~T/2]
+        x2 = self.enc2(x1)                        # [B, 4base, ~T/4]
+
+        z, hN = self.latent(x2, h0=h0)
+
+        y = self.dec1(z)
+
+        if y.shape[-1] > x1.shape[-1]:
+            y = y[:, :, -x1.shape[-1]:]
+            x1_skip = x1
+        elif y.shape[-1] < x1.shape[-1]:
+            x1_skip = x1[:, :, -y.shape[-1]:]
+        else:
+            x1_skip = x1
+
+        y = y + self.skip1_proj(x1_skip)
+
+        y = self.dec2(y)
+
+        if y.shape[-1] > x0.shape[-1]:
+            y = y[:, :, -x0.shape[-1]:]
+            x0_skip = x0
+        elif y.shape[-1] < x0.shape[-1]:
+            x0_skip = x0[:, :, -y.shape[-1]:]
+        else:
+            x0_skip = x0
+
+        y = y + self.skip0_proj(x0_skip)
+
+        y = F.leaky_relu(self.out_mid(y), 0.2)
+        y = torch.tanh(self.out_conv(y))
+
+        out = y[:, :, -BLOCK_SIZE:]
+
+        if return_state:
+            return out, hN
+        return out
 
 
 @torch.no_grad()
 def run_streaming(model, waveform: torch.Tensor) -> torch.Tensor:
     model.eval()
 
+    # waveform: [1, T]
     x = waveform.clone()
-    x = F.pad(x, (CONTEXT_SAMPLES, 0))
+    x = F.pad(x, (CONTEXT_SAMPLES, 0))  # prepend silence for initial context
 
     usable_len = x.shape[1] - CONTEXT_SAMPLES
     num_blocks = (usable_len + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     outs = []
+    h = None
 
     for i in range(num_blocks):
         start = i * BLOCK_SIZE
@@ -105,17 +215,27 @@ def run_streaming(model, waveform: torch.Tensor) -> torch.Tensor:
         else:
             x_pad = x
 
-        window = x_pad[:, start:end].unsqueeze(0).to(DEVICE)  # [1,1,CONTEXT+BLOCK]
-        yb = model(window).cpu().squeeze(0)                   # [1,BLOCK]
-        outs.append(yb)
+        window = x_pad[:, start:end].unsqueeze(0).to(DEVICE)  # [1, 1, CONTEXT+BLOCK]
 
-    y = torch.cat(outs, dim=-1)
-    return y[:, :waveform.shape[1]]
+        yb, h = model(window, h0=h, return_state=True)        # yb: [1, 1, BLOCK]
+        h = h.detach()
+
+        outs.append(yb.cpu().squeeze(0))                      # [1, BLOCK]
+
+    y = torch.cat(outs, dim=-1)                               # [1, total_samples_rounded]
+    return y[:, :waveform.shape[1]]                           # trim to original length
 
 
 def main():
     ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
-    model = LiveTimbreNet().to(DEVICE)
+
+    base_ch = ckpt.get("base_channels", 48)
+    model_type = ckpt.get("model_type", "")
+
+    if model_type not in ("LiveCausalAutoencoder", ""):
+        print(f"Warning: checkpoint model_type is {model_type}")
+
+    model = LiveCausalAutoencoder(base_ch=base_ch).to(DEVICE)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
