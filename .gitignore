@@ -19,11 +19,5 @@ special_effects/test_files/comparison_graphs/
 NET - In Development/venv311/Lib/site-packages/pip-24.0.dist-info/METADATA
 /NET - In Development/venv311
 /NET - In Development/labels
-
-special_effects/NN_pod/audio
-special_effects/NN_pod/labels
-special_effects/NN_pod/manifest.jsonl
-special_effects/NN_pod/metadata.json
-
-onsetnet
-
+/NET - In Development/dataset
+/myenv
