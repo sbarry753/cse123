@@ -14,9 +14,9 @@ from torch.utils.data import Dataset, DataLoader
 # =========================================================
 # Config
 # =========================================================
-DATASET_DIR = "dataset"
+DATASET_DIR = "dataset_48k"
 INPUT_DIR = os.path.join(DATASET_DIR, "input")
-TARGET_DIR = os.path.join(DATASET_DIR, "target")
+TARGET_DIR = os.path.join("dataset_aligned", "target")
 CHECKPOINT_DIR = "checkpoints"
 
 SAMPLE_RATE = 48000
