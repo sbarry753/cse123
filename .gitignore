@@ -3,6 +3,9 @@
 .DS_Store
 **/.DS_Store
 
+# pycache
+*.pyc
+
 #ignore environment and build file
 .idea/
 .vscode/
