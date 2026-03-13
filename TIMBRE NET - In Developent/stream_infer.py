@@ -11,8 +11,8 @@ BLOCK_SIZE = 128
 CONTEXT_SAMPLES = 4096
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CHECKPOINT = "checkpoints/live_timbre_epoch_023.pt"
-INPUT_WAV = "dataset/input/plaz.wav"
+CHECKPOINT = "checkpoints/live_timbre_epoch_007.pt"
+INPUT_WAV = "dataset_48k/input/plaz.wav"
 OUTPUT_WAV = "streamed_output.wav"
 
 
