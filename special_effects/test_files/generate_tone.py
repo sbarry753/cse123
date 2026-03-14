@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.io import wavfile
 
+<<<<<<< HEAD
 # Match Daisy's exact audio settings
 sample_rate = 48000  # Daisy uses 48kHz, not 44100
 block_size = 48      # Try 4, 8, 16, 48 to test different block sizes
@@ -39,3 +40,23 @@ print(f"Created block of {block_size} samples at {sample_rate}Hz ({block_size / 
 #wavfile.write('/app/special_effects/test_files/PerfectTone.wav', sample_rate, audio_16bit)
 #
 #print("Created PerfectTone.wav!")
+=======
+# Audio settings
+sample_rate = 44100
+duration = 1.0 # 1 second long
+t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+
+# Generate a perfect 440 Hz smooth sine wave
+frequency = 440.0
+audio = np.sin(2 * np.pi * frequency * t)
+
+# Add a decay envelope so it fades out like a guitar string pluck
+envelope = np.exp(-4 * t)
+audio = audio * envelope
+
+# Convert to a standard 16-bit WAV file format
+audio_16bit = np.int16(audio * 32767)
+wavfile.write('/app/special_effects/test_files/PerfectTone.wav', sample_rate, audio_16bit)
+
+print("Created PerfectTone.wav!")
+>>>>>>> b786ae4c5ff541eba33bb3089403792ad699f197
