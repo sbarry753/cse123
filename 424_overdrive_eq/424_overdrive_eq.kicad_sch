@@ -1512,6 +1512,39 @@
 			(embedded_fonts no)
 		)
 	)
+	(text "03/13/2026\n"
+		(exclude_from_sim no)
+		(at 212.598 193.548 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+				(color 132 0 0 1)
+			)
+		)
+		(uuid "71fc82ed-a6f7-48e2-8628-5c10cdd125a5")
+	)
+	(text "424 PREAMP OVERDRIVE / EQ"
+		(exclude_from_sim no)
+		(at 201.422 189.738 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+				(color 132 0 0 1)
+			)
+		)
+		(uuid "aa9b7999-1383-4b0e-83cb-1709ad6b594b")
+	)
+	(text "Note: Adapted from AionFX 424 Tape Preamp circuit, itself adapted from the TASCAM 424 Portastudio"
+		(exclude_from_sim no)
+		(at 225.552 168.656 0)
+		(effects
+			(font
+				(size 1.016 1.016)
+				(color 132 0 0 1)
+			)
+		)
+		(uuid "bb6de497-7afc-4f90-8108-b932593b8641")
+	)
 	(junction
 		(at 82.55 67.31)
 		(diameter 0)
@@ -4754,28 +4787,28 @@
 			)
 		)
 		(pin "8"
-			(uuid "15347a16-574c-4090-9813-fcdc26d6e477")
+			(uuid "15347a16-574c-4090-9813-fcdc26d6e478")
 		)
 		(pin "3"
-			(uuid "5d96e7e6-83aa-4a6b-b51f-00fc7147b9d7")
+			(uuid "5d96e7e6-83aa-4a6b-b51f-00fc7147b9d8")
 		)
 		(pin "4"
-			(uuid "3f79a9b0-b009-498e-8812-5514882749f4")
+			(uuid "3f79a9b0-b009-498e-8812-5514882749f5")
 		)
 		(pin "1"
-			(uuid "f71dc23c-e6b5-4117-9967-b043971da9f8")
+			(uuid "f71dc23c-e6b5-4117-9967-b043971da9f9")
 		)
 		(pin "5"
-			(uuid "1134b46a-6677-40f9-8e9f-bf9da01b7aa0")
+			(uuid "1134b46a-6677-40f9-8e9f-bf9da01b7aa1")
 		)
 		(pin "2"
-			(uuid "d61091e2-27b3-4401-8c47-2690a65c9260")
+			(uuid "d61091e2-27b3-4401-8c47-2690a65c9261")
 		)
 		(pin "6"
-			(uuid "9609ad4b-4912-45cc-8459-e7163882ba48")
+			(uuid "9609ad4b-4912-45cc-8459-e7163882ba49")
 		)
 		(pin "7"
-			(uuid "0f062f2f-9901-4876-a2b2-8503a558b907")
+			(uuid "0f062f2f-9901-4876-a2b2-8503a558b908")
 		)
 		(instances
 			(project ""
