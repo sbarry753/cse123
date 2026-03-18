@@ -20,7 +20,7 @@ python realtime.py --model ./checkpoints/best_model.pt --input ./guitar.wav --pl
 python realtime.py --model ./checkpoints/best_model.pt --input ./guitar.wav --output ./piano_out.wav
 
 # WAV -> play while processing AND save
-python realtime.py --model ./checkpoints/best_model.pt --input ./guitar.wav --play --output ./piano_out.wav
+python realtime.py --model ./checkpoints/best_model.pt --input ./data/guitar/plaz.wav --play --output ./piano_out.wav
 
 export SD_ENABLE_ASIO=1
 """
