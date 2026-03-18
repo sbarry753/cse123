@@ -24,7 +24,6 @@ python realtime.py --model ./checkpoints/best_model.pt --input ./data/guitar/pla
 
 export SD_ENABLE_ASIO=1
 """
-
 import argparse
 import os
 import sys
@@ -40,25 +39,26 @@ from tqdm import tqdm
 from model import DDSPGuitarToPiano, SAMPLE_RATE, FRAME_SIZE, HOP_SIZE
 
 
-os.environ["SD_ENABLE_ASIO"] = "1"
-
 # ============================================================
 # CONFIG
 # ============================================================
-BLOCKSIZE = HOP_SIZE          # callback/output chunk size
-DEVICE_IN = "ASIO"
-DEVICE_OUT = "ASIO"           # set to output device index/name if needed
+BLOCKSIZE = HOP_SIZE
+DEVICE_IN = None
+DEVICE_OUT = None
 DTYPE = "float32"
 LATENCY = "low"
+
+# Denoiser / cleanup defaults
+DENOISE_STRENGTH = 0.12      # 0.0 -> off, try 0.08 to 0.18
+LOWPASS_HZ = 12000.0         # 0 or None -> off
+PRED_GAIN = 1.0              # scale model output before OLA, try 0.6 to 1.0
+SOFTLIMIT_DRIVE = 0.9        # lower if still crunchy
+NOISE_GATE_DB = -70.0        # mute near-total silence if desired
 
 
 # ============================================================
 # HELPERS
 # ============================================================
-def rms_db(x: np.ndarray, eps: float = 1e-8) -> float:
-    rms = np.sqrt(np.mean(x.astype(np.float32) ** 2) + eps)
-    return 20.0 * np.log10(rms + eps)
-
 def get_device(preference: str) -> torch.device:
     if preference == "auto":
         if torch.cuda.is_available():
@@ -123,8 +123,91 @@ def prepare_audio_file(input_path: str) -> np.ndarray:
     return audio.squeeze(0).numpy().astype(np.float32)
 
 
+def rms_db(x: np.ndarray, eps: float = 1e-8) -> float:
+    rms = np.sqrt(np.mean(np.square(x.astype(np.float32))) + eps)
+    return 20.0 * np.log10(rms + eps)
+
+
+def softlimit(x: np.ndarray, drive: float = 0.9) -> np.ndarray:
+    return np.tanh(drive * x).astype(np.float32)
+
+
 # ============================================================
-# OVERLAP-ADD ENGINE
+# LIGHTWEIGHT DENOISER / FILTERS
+# ============================================================
+class SpectralDenoiser:
+    """
+    Very lightweight single-frame spectral floor suppressor.
+
+    This is not a full neural denoiser; it just removes a low-level
+    spectral floor that often shows up as steady buzz / fizz.
+    """
+
+    def __init__(self, n_fft: int = HOP_SIZE, strength: float = DENOISE_STRENGTH):
+        self.n_fft = n_fft
+        self.strength = float(strength)
+        self.window = np.hanning(n_fft).astype(np.float32)
+
+    def process(self, audio: np.ndarray) -> np.ndarray:
+        if self.strength <= 0.0:
+            return audio
+
+        x = audio.astype(np.float32)
+        if len(x) != self.n_fft:
+            # simple safe path
+            x = x[:self.n_fft] if len(x) > self.n_fft else np.pad(x, (0, self.n_fft - len(x)))
+
+        spec = np.fft.rfft(x * self.window)
+        mag = np.abs(spec)
+        phase = np.angle(spec)
+
+        # noise floor estimate from low-percentile magnitude
+        floor = np.percentile(mag, 15.0)
+        cleaned_mag = np.maximum(mag - self.strength * floor, 0.0)
+
+        y = np.fft.irfft(cleaned_mag * np.exp(1j * phase), n=self.n_fft).astype(np.float32)
+
+        # compensate for window attenuation a bit
+        return y
+
+
+class OnePoleLowpass:
+    """
+    Cheap lowpass to shave off top-end fizz without much latency.
+    """
+
+    def __init__(self, cutoff_hz: float, sample_rate: float):
+        self.cutoff_hz = cutoff_hz
+        self.sample_rate = sample_rate
+        if cutoff_hz is None or cutoff_hz <= 0:
+            self.alpha = None
+        else:
+            dt = 1.0 / sample_rate
+            rc = 1.0 / (2.0 * np.pi * cutoff_hz)
+            self.alpha = dt / (rc + dt)
+        self.z = 0.0
+
+    def reset(self):
+        self.z = 0.0
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if self.alpha is None:
+            return x
+
+        y = np.empty_like(x, dtype=np.float32)
+        z = self.z
+        a = self.alpha
+
+        for i, xi in enumerate(x):
+            z = z + a * (float(xi) - z)
+            y[i] = z
+
+        self.z = z
+        return y
+
+
+# ============================================================
+# NORMALIZED OVERLAP-ADD ENGINE
 # ============================================================
 class OverlapAddEngine:
     """
@@ -133,20 +216,28 @@ class OverlapAddEngine:
     For each HOP_SIZE input chunk:
       - shift new samples into input ring
       - run model on full FRAME_SIZE window
-      - overlap-add full predicted frame into output ring
+      - apply synthesis window
+      - normalized overlap-add into output ring
       - emit next HOP_SIZE samples
     """
 
-    def __init__(self, model, device: torch.device):
+    def __init__(self, model, device: torch.device, pred_gain: float = PRED_GAIN):
         self.model = model
         self.device = device
+        self.pred_gain = float(pred_gain)
+
         self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
         self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.norm_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
         self.buf = torch.zeros(1, FRAME_SIZE, device=device)
+
+        # Hann synthesis window for outer OLA
+        self.ola_window = np.hanning(FRAME_SIZE).astype(np.float32)
 
     def reset(self):
         self.input_ring.fill(0.0)
         self.output_ring.fill(0.0)
+        self.norm_ring.fill(0.0)
         if hasattr(self.model, "reset_phase"):
             self.model.reset_phase()
 
@@ -160,18 +251,60 @@ class OverlapAddEngine:
 
         # Model predicts full FRAME_SIZE window
         pred_frame = _infer(self.model, self.buf, self.input_ring.copy())
+        pred_frame *= self.pred_gain
 
-        # Overlap-add prediction
-        self.output_ring += pred_frame
+        # Apply outer synthesis window before OLA
+        windowed = pred_frame * self.ola_window
 
-        # Emit earliest hop
-        out_hop = self.output_ring[:HOP_SIZE].copy()
+        # Accumulate signal + normalization
+        self.output_ring += windowed
+        self.norm_ring += self.ola_window
 
-        # Shift output ring left by one hop
+        # Emit earliest hop, normalized
+        den = np.maximum(self.norm_ring[:HOP_SIZE], 1e-6)
+        out_hop = self.output_ring[:HOP_SIZE].copy() / den
+
+        # Shift rings left by one hop
         self.output_ring[:-HOP_SIZE] = self.output_ring[HOP_SIZE:]
         self.output_ring[-HOP_SIZE:] = 0.0
 
-        return out_hop
+        self.norm_ring[:-HOP_SIZE] = self.norm_ring[HOP_SIZE:]
+        self.norm_ring[-HOP_SIZE:] = 0.0
+
+        return out_hop.astype(np.float32)
+
+
+# ============================================================
+# OUTPUT CLEANUP CHAIN
+# ============================================================
+class OutputCleanup:
+    def __init__(
+        self,
+        denoise_strength: float = DENOISE_STRENGTH,
+        lowpass_hz: float = LOWPASS_HZ,
+        sample_rate: float = SAMPLE_RATE,
+        softlimit_drive: float = SOFTLIMIT_DRIVE,
+        gate_db: float = NOISE_GATE_DB,
+    ):
+        self.denoiser = SpectralDenoiser(n_fft=HOP_SIZE, strength=denoise_strength)
+        self.lowpass = OnePoleLowpass(lowpass_hz, sample_rate)
+        self.softlimit_drive = float(softlimit_drive)
+        self.gate_db = float(gate_db)
+
+    def reset(self):
+        self.lowpass.reset()
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        y = x.astype(np.float32)
+
+        # tiny noise gate for near-silence only
+        if rms_db(y) < self.gate_db:
+            return np.zeros_like(y, dtype=np.float32)
+
+        y = self.denoiser.process(y)
+        y = self.lowpass.process(y)
+        y = softlimit(y, drive=self.softlimit_drive)
+        return y.astype(np.float32)
 
 
 # ============================================================
@@ -202,8 +335,10 @@ def process_wav(
         audio_np = np.concatenate([audio_np, np.zeros(pad, dtype=np.float32)])
 
     n_steps = len(audio_np) // HOP_SIZE
-    engine = OverlapAddEngine(model, device)
+    engine = OverlapAddEngine(model, device, pred_gain=PRED_GAIN)
+    cleanup = OutputCleanup()
     engine.reset()
+    cleanup.reset()
 
     collected = np.zeros_like(audio_np) if output_path is not None else None
     lats = []
@@ -233,7 +368,9 @@ def process_wav(
             lats.append((time.perf_counter() - t0) * 1000.0)
 
             mixed = wet * out_hop + (1.0 - wet) * in_hop
-            mixed = np.clip(mixed * volume, -1.0, 1.0).astype(np.float32)
+            mixed = (mixed * volume).astype(np.float32)
+            mixed = cleanup.process(mixed)
+            mixed = np.clip(mixed, -1.0, 1.0).astype(np.float32)
 
             if collected is not None:
                 collected[s:e] = mixed
@@ -241,16 +378,17 @@ def process_wav(
             if stream is not None:
                 stream.write(mixed.reshape(-1, 1))
 
-        # Flush the tail so saved file captures final overlap-add decay
+        # Flush tail
         if collected is not None:
             tail_hops = FRAME_SIZE // HOP_SIZE
-            tail_start = len(audio_np)
             tail_out = []
 
             for _ in range(tail_hops):
                 zero_hop = np.zeros(HOP_SIZE, dtype=np.float32)
                 out_hop = engine.process_hop(zero_hop)
-                mixed = np.clip((wet * out_hop) * volume, -1.0, 1.0).astype(np.float32)
+                mixed = (wet * out_hop * volume).astype(np.float32)
+                mixed = cleanup.process(mixed)
+                mixed = np.clip(mixed, -1.0, 1.0).astype(np.float32)
                 tail_out.append(mixed)
 
                 if stream is not None:
@@ -298,8 +436,10 @@ class RealTimePipeline:
         self._lats = []
         self._frames = 0
 
-        self.engine = OverlapAddEngine(self.model, self.device)
+        self.engine = OverlapAddEngine(self.model, self.device, pred_gain=PRED_GAIN)
+        self.cleanup = OutputCleanup()
         self.engine.reset()
+        self.cleanup.reset()
 
         print(
             f"Window: {FRAME_SIZE} samples ({1000 * FRAME_SIZE / SAMPLE_RATE:.1f} ms) | "
@@ -316,7 +456,9 @@ class RealTimePipeline:
         out_hop = self.engine.process_hop(in_hop)
 
         mixed = self.wet_mix * out_hop + (1.0 - self.wet_mix) * in_hop
-        outdata[:, 0] = np.clip(mixed * self.volume, -1.0, 1.0)
+        mixed = (mixed * self.volume).astype(np.float32)
+        mixed = self.cleanup.process(mixed)
+        outdata[:, 0] = np.clip(mixed, -1.0, 1.0)
 
         self._frames += 1
         if len(self._lats) < 500:
