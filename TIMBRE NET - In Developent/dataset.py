@@ -325,7 +325,7 @@ def make_dataloaders(
     max_shift_ms: float = 120.0,
     min_rms: float = 0.002,
     keep_silence_prob: float = 1.0,
-    seed: int = 32,
+    seed: int = 22,
 ):
     """
     Split by clip stem, not by frame, so validation is honest.
