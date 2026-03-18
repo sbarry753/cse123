@@ -8,19 +8,21 @@ Supports:
 Examples
 --------
 # List audio devices
-python realtime.py --model ./checkpoints/model_scripted.pt --list-devices
+python realtime.py --model ./checkpoints/best_model.pt --list-devices
 
 # Live input mode
-python realtime.py --model ./checkpoints/model_scripted.pt
+python realtime.py --model ./checkpoints/best_model.pt
 
 # WAV -> play while processing
-python realtime.py --model ./checkpoints/model_scripted.pt --input ./guitar.wav --play
+python realtime.py --model ./checkpoints/best_model.pt --input ./guitar.wav --play
 
 # WAV -> save processed file
-python realtime.py --model ./checkpoints/model_scripted.pt --input ./guitar.wav --output ./piano_out.wav
+python realtime.py --model ./checkpoints/best_model.pt --input ./guitar.wav --output ./piano_out.wav
 
 # WAV -> play while processing AND save
-python realtime.py --model ./checkpoints/model_best.pt --input ./guitar.wav --play --output ./piano_out.wav
+python realtime.py --model ./checkpoints/best_model.pt --input ./guitar.wav --play --output ./piano_out.wav
+
+export SD_ENABLE_ASIO=1
 """
 
 import argparse
@@ -53,6 +55,10 @@ LATENCY = "low"
 # ============================================================
 # HELPERS
 # ============================================================
+def rms_db(x: np.ndarray, eps: float = 1e-8) -> float:
+    rms = np.sqrt(np.mean(x.astype(np.float32) ** 2) + eps)
+    return 20.0 * np.log10(rms + eps)
+
 def get_device(preference: str) -> torch.device:
     if preference == "auto":
         if torch.cuda.is_available():
