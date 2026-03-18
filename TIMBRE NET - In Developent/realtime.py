@@ -20,7 +20,7 @@ python realtime.py --model ./checkpoints/model_scripted.pt --input ./guitar.wav 
 python realtime.py --model ./checkpoints/model_scripted.pt --input ./guitar.wav --output ./piano_out.wav
 
 # WAV -> play while processing AND save
-python realtime.py --model ./checkpoints/model_scripted.pt --input ./guitar.wav --play --output ./piano_out.wav
+python realtime.py --model ./checkpoints/model_best.pt --input ./guitar.wav --play --output ./piano_out.wav
 """
 
 import argparse
@@ -38,12 +38,14 @@ from tqdm import tqdm
 from model import DDSPGuitarToPiano, SAMPLE_RATE, FRAME_SIZE, HOP_SIZE
 
 
+os.environ["SD_ENABLE_ASIO"] = "1"
+
 # ============================================================
 # CONFIG
 # ============================================================
 BLOCKSIZE = HOP_SIZE          # callback/output chunk size
-DEVICE_IN = None              # set to input device index/name if needed
-DEVICE_OUT = 3             # set to output device index/name if needed
+DEVICE_IN = "ASIO"
+DEVICE_OUT = "ASIO"           # set to output device index/name if needed
 DTYPE = "float32"
 LATENCY = "low"
 
