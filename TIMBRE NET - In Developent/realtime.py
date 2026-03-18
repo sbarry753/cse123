@@ -1,16 +1,26 @@
 """
-Real-time / WAV-file polyphonic Guitar -> Piano timbre transfer
+realtime.py — Polyphonic Guitar -> Piano
+Supports:
+  1) live mic/input -> live output
+  2) WAV file -> live playback while processing
+  3) WAV file -> saved output file
 
-Important:
-This version uses overlap-add.
-Input callback block size = HOP_SIZE
-Model window size        = FRAME_SIZE
+Examples
+--------
+# List audio devices
+python realtime.py --model ./checkpoints/model_scripted.pt --list-devices
 
-So every callback:
-- append HOP_SIZE input samples to a rolling FRAME_SIZE buffer
-- run model on the whole FRAME_SIZE window
-- overlap-add the FRAME_SIZE output into an output ring
-- emit the next HOP_SIZE samples
+# Live input mode
+python realtime.py --model ./checkpoints/model_scripted.pt
+
+# WAV -> play while processing
+python realtime.py --model ./checkpoints/model_scripted.pt --input ./guitar.wav --play
+
+# WAV -> save processed file
+python realtime.py --model ./checkpoints/model_scripted.pt --input ./guitar.wav --output ./piano_out.wav
+
+# WAV -> play while processing AND save
+python realtime.py --model ./checkpoints/model_scripted.pt --input ./guitar.wav --play --output ./piano_out.wav
 """
 
 import argparse
@@ -28,13 +38,19 @@ from tqdm import tqdm
 from model import DDSPGuitarToPiano, SAMPLE_RATE, FRAME_SIZE, HOP_SIZE
 
 
-BLOCKSIZE = HOP_SIZE
-DEVICE_IN = None
-DEVICE_OUT = None
+# ============================================================
+# CONFIG
+# ============================================================
+BLOCKSIZE = HOP_SIZE          # callback/output chunk size
+DEVICE_IN = None              # set to input device index/name if needed
+DEVICE_OUT = 3             # set to output device index/name if needed
 DTYPE = "float32"
 LATENCY = "low"
 
 
+# ============================================================
+# HELPERS
+# ============================================================
 def get_device(preference: str) -> torch.device:
     if preference == "auto":
         if torch.cuda.is_available():
@@ -64,84 +80,204 @@ def warmup(model, device, n_iters=10):
     print(f"Warming up ({n_iters} iters)...", end="", flush=True)
     dummy = torch.randn(1, FRAME_SIZE, device=device)
     lats = []
+
     with torch.no_grad():
         for _ in range(n_iters):
             t0 = time.perf_counter()
-            _ = model.infer_frame(dummy) if hasattr(model, "infer_frame") else model(dummy)[0]
-            lats.append((time.perf_counter() - t0) * 1000)
+            if hasattr(model, "infer_frame"):
+                _ = model.infer_frame(dummy)
+            else:
+                _ = model(dummy)[0]
+            lats.append((time.perf_counter() - t0) * 1000.0)
+
     avg = float(np.mean(lats[max(0, n_iters // 2):]))
-    print(f" done. avg: {avg:.2f}ms")
+    print(f" done. avg: {avg:.2f} ms")
     return avg
 
 
-def _infer(model, buf_tensor, frame_np):
+def _infer(model, buf_tensor, frame_np: np.ndarray) -> np.ndarray:
     buf_tensor[0].copy_(torch.from_numpy(frame_np).to(buf_tensor.device), non_blocking=True)
     with torch.no_grad():
         pred = model.infer_frame(buf_tensor) if hasattr(model, "infer_frame") else model(buf_tensor)[0]
-    return pred[0].cpu().numpy()
+    return pred[0].detach().cpu().numpy().astype(np.float32)
 
 
-def process_wav(model_path, input_path, output_path, wet, volume, device_str):
-    device = get_device(device_str)
-    print(f"Device : {device}")
-    model = load_model(model_path, device)
-    warmup(model, device)
-
+def prepare_audio_file(input_path: str) -> np.ndarray:
     audio, sr = torchaudio.load(input_path)
+
     if audio.shape[0] > 1:
         audio = audio.mean(0, keepdim=True)
+
     if sr != SAMPLE_RATE:
         print(f"Resampling {sr} -> {SAMPLE_RATE} Hz...")
         audio = torchaudio.functional.resample(audio, sr, SAMPLE_RATE)
 
-    audio_np = audio.squeeze(0).numpy().astype(np.float32)
-    orig_len = len(audio_np)
+    return audio.squeeze(0).numpy().astype(np.float32)
 
-    pad = (BLOCKSIZE - orig_len % BLOCKSIZE) % BLOCKSIZE
+
+# ============================================================
+# OVERLAP-ADD ENGINE
+# ============================================================
+class OverlapAddEngine:
+    """
+    Maintains rolling input/output buffers.
+
+    For each HOP_SIZE input chunk:
+      - shift new samples into input ring
+      - run model on full FRAME_SIZE window
+      - overlap-add full predicted frame into output ring
+      - emit next HOP_SIZE samples
+    """
+
+    def __init__(self, model, device: torch.device):
+        self.model = model
+        self.device = device
+        self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.buf = torch.zeros(1, FRAME_SIZE, device=device)
+
+    def reset(self):
+        self.input_ring.fill(0.0)
+        self.output_ring.fill(0.0)
+        if hasattr(self.model, "reset_phase"):
+            self.model.reset_phase()
+
+    def process_hop(self, in_hop: np.ndarray) -> np.ndarray:
+        if len(in_hop) != HOP_SIZE:
+            raise ValueError(f"Expected hop of length {HOP_SIZE}, got {len(in_hop)}")
+
+        # Shift in new input
+        self.input_ring[:-HOP_SIZE] = self.input_ring[HOP_SIZE:]
+        self.input_ring[-HOP_SIZE:] = in_hop
+
+        # Model predicts full FRAME_SIZE window
+        pred_frame = _infer(self.model, self.buf, self.input_ring.copy())
+
+        # Overlap-add prediction
+        self.output_ring += pred_frame
+
+        # Emit earliest hop
+        out_hop = self.output_ring[:HOP_SIZE].copy()
+
+        # Shift output ring left by one hop
+        self.output_ring[:-HOP_SIZE] = self.output_ring[HOP_SIZE:]
+        self.output_ring[-HOP_SIZE:] = 0.0
+
+        return out_hop
+
+
+# ============================================================
+# WAV MODE
+# ============================================================
+def process_wav(
+    model_path: str,
+    input_path: str,
+    output_path: str | None,
+    wet: float,
+    volume: float,
+    device_str: str,
+    play: bool,
+):
+    device = get_device(device_str)
+    print(f"Device: {device}")
+
+    model = load_model(model_path, device)
+    warmup(model, device)
+
+    audio_np = prepare_audio_file(input_path)
+    orig_len = len(audio_np)
+    duration = orig_len / SAMPLE_RATE
+    print(f"Input: {input_path} ({duration:.2f}s, {orig_len:,} samples)")
+
+    pad = (HOP_SIZE - (orig_len % HOP_SIZE)) % HOP_SIZE
     if pad:
         audio_np = np.concatenate([audio_np, np.zeros(pad, dtype=np.float32)])
 
-    n_steps = len(audio_np) // BLOCKSIZE
+    n_steps = len(audio_np) // HOP_SIZE
+    engine = OverlapAddEngine(model, device)
+    engine.reset()
 
-    input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
-    output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
-    out_full = np.zeros_like(audio_np)
-
-    buf = torch.zeros(1, FRAME_SIZE, device=device)
+    collected = np.zeros_like(audio_np) if output_path is not None else None
     lats = []
 
+    stream = None
+    if play:
+        stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=HOP_SIZE,
+            device=DEVICE_OUT,
+            channels=1,
+            dtype=DTYPE,
+            latency=LATENCY,
+        )
+        stream.start()
+        print("Playing output while processing...")
+
     print(f"Processing {n_steps:,} hops...")
-    for i in tqdm(range(n_steps), unit="hop", ncols=72):
-        s = i * BLOCKSIZE
-        e = s + BLOCKSIZE
+    try:
+        for i in tqdm(range(n_steps), unit="hop", ncols=72):
+            s = i * HOP_SIZE
+            e = s + HOP_SIZE
+            in_hop = audio_np[s:e]
 
-        in_hop = audio_np[s:e]
+            t0 = time.perf_counter()
+            out_hop = engine.process_hop(in_hop)
+            lats.append((time.perf_counter() - t0) * 1000.0)
 
-        input_ring[:-BLOCKSIZE] = input_ring[BLOCKSIZE:]
-        input_ring[-BLOCKSIZE:] = in_hop
+            mixed = wet * out_hop + (1.0 - wet) * in_hop
+            mixed = np.clip(mixed * volume, -1.0, 1.0).astype(np.float32)
 
-        t0 = time.perf_counter()
-        pred_frame = _infer(model, buf, input_ring.copy())
-        lats.append((time.perf_counter() - t0) * 1000)
+            if collected is not None:
+                collected[s:e] = mixed
 
-        output_ring += pred_frame.astype(np.float32)
+            if stream is not None:
+                stream.write(mixed.reshape(-1, 1))
 
-        out_hop = output_ring[:BLOCKSIZE].copy()
-        output_ring[:-BLOCKSIZE] = output_ring[BLOCKSIZE:]
-        output_ring[-BLOCKSIZE:] = 0.0
+        # Flush the tail so saved file captures final overlap-add decay
+        if collected is not None:
+            tail_hops = FRAME_SIZE // HOP_SIZE
+            tail_start = len(audio_np)
+            tail_out = []
 
-        dry = in_hop
-        mixed = wet * out_hop + (1.0 - wet) * dry
-        out_full[s:e] = np.clip(mixed * volume, -1.0, 1.0)
+            for _ in range(tail_hops):
+                zero_hop = np.zeros(HOP_SIZE, dtype=np.float32)
+                out_hop = engine.process_hop(zero_hop)
+                mixed = np.clip((wet * out_hop) * volume, -1.0, 1.0).astype(np.float32)
+                tail_out.append(mixed)
 
-    out_full = out_full[:orig_len]
-    torchaudio.save(output_path, torch.from_numpy(out_full).unsqueeze(0), SAMPLE_RATE)
+                if stream is not None:
+                    stream.write(mixed.reshape(-1, 1))
 
-    lats = np.array(lats)
-    print(f"\nSaved to: {output_path}")
-    print(f"Latency avg: {lats.mean():.2f}ms | p95: {np.percentile(lats,95):.2f}ms | max: {lats.max():.2f}ms")
+            if tail_out:
+                tail_cat = np.concatenate(tail_out, axis=0)
+                collected = np.concatenate([collected, tail_cat], axis=0)
+
+    finally:
+        if stream is not None:
+            stream.stop()
+            stream.close()
+
+    if collected is not None and output_path is not None:
+        collected = collected[:orig_len]
+        torchaudio.save(
+            output_path,
+            torch.from_numpy(collected).unsqueeze(0),
+            SAMPLE_RATE,
+        )
+        print(f"Saved to: {output_path}")
+
+    lats = np.array(lats, dtype=np.float32)
+    if len(lats):
+        print(
+            f"Latency avg: {lats.mean():.2f} ms | "
+            f"p95: {np.percentile(lats, 95):.2f} ms | "
+            f"max: {lats.max():.2f} ms"
+        )
 
 
+# ============================================================
+# LIVE MIC MODE
+# ============================================================
 class RealTimePipeline:
     def __init__(self, model_path: str, device_str: str = "auto"):
         self.device = get_device(device_str)
@@ -154,14 +290,12 @@ class RealTimePipeline:
         self._lats = []
         self._frames = 0
 
-        self._buf = torch.zeros(1, FRAME_SIZE, device=self.device)
-
-        self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
-        self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.engine = OverlapAddEngine(self.model, self.device)
+        self.engine.reset()
 
         print(
-            f"Window: {FRAME_SIZE} samples ({1000*FRAME_SIZE/SAMPLE_RATE:.1f}ms) | "
-            f"Hop: {BLOCKSIZE} samples ({1000*BLOCKSIZE/SAMPLE_RATE:.1f}ms)"
+            f"Window: {FRAME_SIZE} samples ({1000 * FRAME_SIZE / SAMPLE_RATE:.1f} ms) | "
+            f"Hop: {HOP_SIZE} samples ({1000 * HOP_SIZE / SAMPLE_RATE:.1f} ms)"
         )
 
     def audio_callback(self, indata, outdata, frames, time_info, status):
@@ -171,23 +305,14 @@ class RealTimePipeline:
         t0 = time.perf_counter()
 
         in_hop = indata[:, 0].astype(np.float32)
-
-        self.input_ring[:-BLOCKSIZE] = self.input_ring[BLOCKSIZE:]
-        self.input_ring[-BLOCKSIZE:] = in_hop
-
-        pred_frame = _infer(self.model, self._buf, self.input_ring.copy())
-        self.output_ring += pred_frame.astype(np.float32)
-
-        out_hop = self.output_ring[:BLOCKSIZE].copy()
-        self.output_ring[:-BLOCKSIZE] = self.output_ring[BLOCKSIZE:]
-        self.output_ring[-BLOCKSIZE:] = 0.0
+        out_hop = self.engine.process_hop(in_hop)
 
         mixed = self.wet_mix * out_hop + (1.0 - self.wet_mix) * in_hop
         outdata[:, 0] = np.clip(mixed * self.volume, -1.0, 1.0)
 
         self._frames += 1
         if len(self._lats) < 500:
-            self._lats.append((time.perf_counter() - t0) * 1000)
+            self._lats.append((time.perf_counter() - t0) * 1000.0)
 
     def run(self):
         warmup(self.model, self.device)
@@ -220,10 +345,14 @@ class RealTimePipeline:
         finally:
             self.running = False
             if self._lats:
-                lats = np.array(self._lats)
-                print(f"\n--- Stats ------------------------------------")
+                lats = np.array(self._lats, dtype=np.float32)
+                print("\n--- Stats ------------------------------------")
                 print(f"Frames : {self._frames:,}")
-                print(f"avg: {lats.mean():.2f}ms  p95: {np.percentile(lats,95):.2f}ms  max: {lats.max():.2f}ms")
+                print(
+                    f"avg: {lats.mean():.2f} ms  "
+                    f"p95: {np.percentile(lats,95):.2f} ms  "
+                    f"max: {lats.max():.2f} ms"
+                )
                 print("----------------------------------------------")
 
     def _handle(self, cmd):
@@ -242,11 +371,15 @@ class RealTimePipeline:
             print(f"  Unknown: '{cmd}'")
 
 
+# ============================================================
+# MAIN
+# ============================================================
 def main():
-    p = argparse.ArgumentParser(description="Polyphonic Guitar->Piano | live mic or WAV file")
+    p = argparse.ArgumentParser(description="Polyphonic Guitar->Piano | live mic or WAV")
     p.add_argument("--model", required=True, help="Model checkpoint (.pt)")
-    p.add_argument("--input", default=None, help="[WAV mode] Input guitar WAV")
-    p.add_argument("--output", default=None, help="[WAV mode] Output path")
+    p.add_argument("--input", default=None, help="[WAV mode] Input WAV file")
+    p.add_argument("--output", default=None, help="[WAV mode] Output WAV file")
+    p.add_argument("--play", action="store_true", help="[WAV mode] Play output while processing")
     p.add_argument("--wet", type=float, default=1.0, help="Wet mix 0.0-1.0")
     p.add_argument("--volume", type=float, default=1.0, help="Output volume multiplier")
     p.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
@@ -261,10 +394,20 @@ def main():
         if not os.path.isfile(args.input):
             print(f"Error: file not found: {args.input}")
             sys.exit(1)
-        if args.output is None:
+
+        if args.output is None and not args.play:
             stem = Path(args.input).stem
             args.output = str(Path(args.input).parent / f"{stem}_piano.wav")
-        process_wav(args.model, args.input, args.output, args.wet, args.volume, args.device)
+
+        process_wav(
+            model_path=args.model,
+            input_path=args.input,
+            output_path=args.output,
+            wet=args.wet,
+            volume=args.volume,
+            device_str=args.device,
+            play=args.play,
+        )
     else:
         pipe = RealTimePipeline(args.model, args.device)
         pipe.wet_mix = args.wet
