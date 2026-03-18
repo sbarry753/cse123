@@ -5,6 +5,7 @@ Emphasis:
 - multi-scale spectral matching
 - waveform stability
 - onset / transient matching for pick -> hammer behavior
+- brighter attack matching to push guitar closer to piano
 """
 
 import torch
@@ -118,13 +119,30 @@ class OnsetLoss(nn.Module):
         return self.diff_weight * diff_loss + self.envelope_weight * env_loss
 
 
+class BrightAttackLoss(nn.Module):
+    """
+    Emphasizes high-frequency / attack-region agreement.
+    Very useful for making pick attack feel more hammer-like.
+    """
+
+    def __init__(self, preemphasis: float = 0.95):
+        super().__init__()
+        self.preemphasis = preemphasis
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_hp = pred[:, 1:] - self.preemphasis * pred[:, :-1]
+        target_hp = target[:, 1:] - self.preemphasis * target[:, :-1]
+        return F.l1_loss(pred_hp, target_hp)
+
+
 class CombinedLoss(nn.Module):
     def __init__(
         self,
         spectral_weight=1.0,
-        waveform_weight=0.25,
-        envelope_weight=0.10,
-        onset_weight=0.35,
+        waveform_weight=0.15,
+        envelope_weight=0.15,
+        onset_weight=0.60,
+        bright_weight=0.20,
     ):
         super().__init__()
         self.spectral_loss = MultiScaleSpectralLoss()
@@ -132,7 +150,10 @@ class CombinedLoss(nn.Module):
         self.waveform_weight = waveform_weight
         self.envelope_weight = envelope_weight
         self.onset_weight = onset_weight
+        self.bright_weight = bright_weight
+
         self.onset_loss = OnsetLoss()
+        self.bright_attack_loss = BrightAttackLoss()
 
     def _smooth_rms(self, audio, window=128):
         audio_sq = audio ** 2
@@ -153,10 +174,12 @@ class CombinedLoss(nn.Module):
         env_loss = F.l1_loss(pred_rms, target_rms)
 
         onset_loss = self.onset_loss(pred, target)
+        bright_loss = self.bright_attack_loss(pred, target)
 
         return (
             self.spectral_weight * spec_loss
             + self.waveform_weight * wave_loss
             + self.envelope_weight * env_loss
             + self.onset_weight * onset_loss
+            + self.bright_weight * bright_loss
         )

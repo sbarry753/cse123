@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 # ============================================================
 # Polyphonic real-time guitar -> piano timbre transfer
-# Spectral U-Net + transient shaper
+# Spectral U-Net + transient shaper + resonance block
 # No pitch detection
 # ============================================================
 
@@ -66,7 +66,7 @@ class SpectralUNet(nn.Module):
     Output: multiplicative mask + additive residual in log-mag domain
     """
 
-    def __init__(self, base_ch: int = 24):
+    def __init__(self, base_ch: int = 32):
         super().__init__()
         self.enc1 = ConvBlock2d(1, base_ch)
         self.enc2 = ConvBlock2d(base_ch, base_ch * 2, stride=(2, 2))
@@ -102,7 +102,7 @@ class TransientShaper(nn.Module):
     Learns onset reshaping so pick transients become more hammer-like.
     """
 
-    def __init__(self, channels: int = 32):
+    def __init__(self, channels: int = 48):
         super().__init__()
         self.delta_net = nn.Sequential(
             nn.Conv1d(1, channels, kernel_size=9, padding=4),
@@ -114,17 +114,54 @@ class TransientShaper(nn.Module):
             nn.Conv1d(channels, 1, kernel_size=1),
         )
         self.gate_net = nn.Sequential(
-            nn.Conv1d(1, 8, kernel_size=7, padding=3),
+            nn.Conv1d(1, 16, kernel_size=7, padding=3),
+            nn.GELU(),
+            nn.Conv1d(16, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = audio.unsqueeze(1)
+        delta = self.delta_net(x)
+        gate = self.gate_net(torch.abs(x))
+
+        # stronger transient shaping than before
+        y = x + 0.40 * gate * delta
+        return y.squeeze(1), gate.squeeze(1)
+
+
+class ResonanceBlock(nn.Module):
+    """
+    Short learned resonant response to add piano-body ring/bloom.
+    """
+
+    def __init__(self, hidden: int = 24):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(1, hidden, kernel_size=33, padding=16),
+            nn.GELU(),
+            nn.Conv1d(hidden, hidden, kernel_size=65, padding=32),
+            nn.GELU(),
+            nn.Conv1d(hidden, 1, kernel_size=33, padding=16),
+        )
+        self.gate = nn.Sequential(
+            nn.Conv1d(1, 8, kernel_size=9, padding=4),
             nn.GELU(),
             nn.Conv1d(8, 1, kernel_size=1),
             nn.Sigmoid(),
         )
 
-    def forward(self, audio: torch.Tensor) -> torch.Tensor:
+    def forward(self, audio: torch.Tensor, excite: torch.Tensor | None = None) -> torch.Tensor:
         x = audio.unsqueeze(1)
-        delta = self.delta_net(x)
-        gate = self.gate_net(torch.abs(x))
-        y = x + 0.30 * gate * delta
+        res = self.net(x)
+
+        if excite is None:
+            g = self.gate(torch.abs(x))
+        else:
+            g = self.gate(excite.unsqueeze(1))
+
+        # subtle body resonance
+        y = x + 0.18 * g * res
         return y.squeeze(1)
 
 
@@ -145,8 +182,9 @@ class PolyphonicGuitarToPiano(nn.Module):
         self.hop_size = hop_size
         self.hidden_size = hidden_size
 
-        self.unet = SpectralUNet(base_ch=24)
-        self.transient = TransientShaper(channels=32)
+        self.unet = SpectralUNet(base_ch=32)
+        self.transient = TransientShaper(channels=48)
+        self.resonance = ResonanceBlock(hidden=24)
 
         self.register_buffer("window", torch.hann_window(frame_size))
 
@@ -187,16 +225,24 @@ class PolyphonicGuitarToPiano(nn.Module):
 
         mask, residual = self.unet(log_mag)
         out_log_mag = log_mag * mask + residual
+
+        # clamp helps keep extreme spectral explosions down
+        out_log_mag = torch.clamp(out_log_mag, min=-12.0, max=8.0)
         out_mag = torch.exp(out_log_mag.squeeze(1))
 
         # Reuse input phase for low-latency polyphonic consistency
         out_spec = torch.polar(out_mag, phase)
 
         audio_out = self._istft(out_spec, length=length)
-        audio_out = self.transient(audio_out)
 
-        # Small dry blend helps keep articulation stable
-        audio_out = 0.9 * torch.tanh(audio_out) + 0.1 * audio_frame
+        # hammer-like attack shaping
+        audio_out, transient_gate = self.transient(audio_out)
+
+        # piano body / bloom
+        audio_out = self.resonance(audio_out, excite=transient_gate)
+
+        # less dry blend than before so more guitar identity is removed
+        audio_out = 0.97 * torch.tanh(audio_out) + 0.03 * audio_frame
 
         features = {
             "input_mag": mag,
@@ -205,6 +251,7 @@ class PolyphonicGuitarToPiano(nn.Module):
         params = {
             "mask": mask.squeeze(1),
             "residual": residual.squeeze(1),
+            "transient_gate": transient_gate,
         }
         return audio_out, features, params
 
@@ -219,5 +266,4 @@ class PolyphonicGuitarToPiano(nn.Module):
         return out
 
 
-# Backward-compatible name for old imports
 DDSPGuitarToPiano = PolyphonicGuitarToPiano

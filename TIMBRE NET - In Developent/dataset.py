@@ -1,11 +1,14 @@
 """
-Paired Guitar / Piano Dataset for polyphonic direct timbre transfer
+dataset.py — Paired Guitar / Piano Dataset with auto-alignment
 
-Changes vs the original:
-- uses longer overlapping windows for STFT models
-- still auto-aligns clips by envelope correlation
-- still trims shared silence
-- still splits by clip, not frame
+Changes:
+- gain jitter applies ONLY to guitar input
+- keeps silent / near-silent frames so the model can learn silence
+- still estimates small timing lag between guitar and piano per clip
+- still trims/pads after alignment
+- still uses overlapping frames
+- still splits by CLIP, not by frame
+- augmentation remains train-only
 """
 
 from __future__ import annotations
@@ -46,6 +49,10 @@ def _trim_shared_silence(
     piano: torch.Tensor,
     threshold: float = 1e-3,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Trim leading/trailing regions where BOTH signals are basically silent.
+    Keeps note tails if either side still has energy.
+    """
     energy = torch.maximum(guitar.abs(), piano.abs())
     idx = torch.nonzero(energy > threshold, as_tuple=False).flatten()
 
@@ -57,7 +64,10 @@ def _trim_shared_silence(
     return guitar[start:end], piano[start:end]
 
 
-def _frame_rms(x: torch.Tensor, win: int = 2048, hop: int = 256) -> torch.Tensor:
+def _frame_rms(x: torch.Tensor, win: int = 1024, hop: int = 256) -> torch.Tensor:
+    """
+    Cheap amplitude envelope for alignment.
+    """
     if x.numel() < win:
         x = F.pad(x, (0, win - x.numel()))
 
@@ -72,13 +82,21 @@ def _estimate_lag_samples(
     sample_rate: int,
     max_shift_ms: float = 120.0,
 ) -> int:
-    g_env = _frame_rms(guitar)
-    p_env = _frame_rms(piano)
+    """
+    Estimate lag using cross-correlation of RMS envelopes.
+
+    Positive lag means piano starts later than guitar
+    and piano should be shifted LEFT by that many samples.
+    """
+    env_win = 1024
+    env_hop = 256
+
+    g_env = _frame_rms(guitar, env_win, env_hop)
+    p_env = _frame_rms(piano, env_win, env_hop)
 
     g_env = g_env - g_env.mean()
     p_env = p_env - p_env.mean()
 
-    env_hop = 256
     max_shift_samples = int(sample_rate * max_shift_ms / 1000.0)
     max_shift_frames = max(1, max_shift_samples // env_hop)
 
@@ -116,6 +134,10 @@ def _apply_lag(
     piano: torch.Tensor,
     lag_samples: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Positive lag => piano is delayed, so trim piano front.
+    Negative lag => guitar is delayed, so trim guitar front.
+    """
     if lag_samples > 0:
         piano = piano[lag_samples:]
     elif lag_samples < 0:
@@ -130,8 +152,19 @@ def _chunk_audio(
     piano: torch.Tensor,
     frame_size: int,
     hop_size: int,
-    min_rms: float = 0.008,
+    min_rms: float = 0.002,
+    keep_silence_prob: float = 1.0,
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Overlapping framed pairs.
+
+    Keeps silent / near-silent regions so the model can learn:
+      quiet guitar -> quiet piano
+      silence -> silence
+
+    If you ever want to thin quiet frames later, set
+    keep_silence_prob to something below 1.0.
+    """
     n = min(len(guitar), len(piano))
     guitar = guitar[:n]
     piano = piano[:n]
@@ -148,7 +181,8 @@ def _chunk_audio(
         p_rms = torch.sqrt((p ** 2).mean() + 1e-8).item()
 
         if max(g_rms, p_rms) < min_rms:
-            continue
+            if random.random() > keep_silence_prob:
+                continue
 
         pairs.append((g, p))
 
@@ -156,6 +190,10 @@ def _chunk_audio(
 
 
 class GuitarPianoDataset(Dataset):
+    """
+    Loads matched guitar/piano pairs and returns aligned frame pairs.
+    """
+
     def __init__(
         self,
         data_dir: str,
@@ -165,15 +203,17 @@ class GuitarPianoDataset(Dataset):
         hop_size: int | None = None,
         augment: bool = True,
         max_shift_ms: float = 120.0,
-        min_rms: float = 0.008,
+        min_rms: float = 0.002,
+        keep_silence_prob: float = 1.0,
     ):
         self.data_dir = Path(data_dir)
         self.sample_rate = sample_rate
         self.frame_size = frame_size
-        self.hop_size = hop_size if hop_size is not None else HOP_SIZE
+        self.hop_size = hop_size if hop_size is not None else max(1, frame_size // 4)
         self.augment = augment
         self.max_shift_ms = max_shift_ms
         self.min_rms = min_rms
+        self.keep_silence_prob = keep_silence_prob
 
         guitar_dir = self.data_dir / "guitar"
         piano_dir = self.data_dir / "piano"
@@ -192,8 +232,7 @@ class GuitarPianoDataset(Dataset):
 
         common = sorted(set(guitar_map) & set(piano_map))
         if stems is not None:
-            stem_set = set(stems)
-            common = [s for s in common if s in stem_set]
+            common = [s for s in common if s in set(stems)]
 
         if not common:
             raise ValueError("No matching guitar/piano file pairs found.")
@@ -204,6 +243,7 @@ class GuitarPianoDataset(Dataset):
         for stem in common:
             g_path = guitar_map[stem]
             p_path = piano_map[stem]
+
             clip_pairs = self._load_pair(g_path, p_path)
             self.frames.extend(clip_pairs)
 
@@ -223,6 +263,7 @@ class GuitarPianoDataset(Dataset):
         guitar, piano = _apply_lag(guitar, piano, lag)
         guitar, piano = _trim_shared_silence(guitar, piano, threshold=1e-3)
 
+        # Re-normalize after trimming/alignment
         g_peak = guitar.abs().max()
         p_peak = piano.abs().max()
         if g_peak > 0:
@@ -241,6 +282,7 @@ class GuitarPianoDataset(Dataset):
             frame_size=self.frame_size,
             hop_size=self.hop_size,
             min_rms=self.min_rms,
+            keep_silence_prob=self.keep_silence_prob,
         )
 
     def __len__(self):
@@ -249,19 +291,24 @@ class GuitarPianoDataset(Dataset):
     def __getitem__(self, idx):
         guitar_frame, piano_frame = self.frames[idx]
 
+        # clone so augmentation never mutates stored tensors
         guitar_frame = guitar_frame.clone()
         piano_frame = piano_frame.clone()
 
         if self.augment:
-            gain = 10 ** random.uniform(-0.15, 0.15)
+            # Gain jitter ONLY on guitar input.
+            # Do not scale the piano target.
+            gain = 10 ** random.uniform(-0.2, 0.2)
             guitar_frame *= gain
-            piano_frame *= gain
 
-            guitar_frame += 0.0005 * torch.randn_like(guitar_frame)
+            # Tiny input noise only on guitar to improve robustness
+            guitar_frame += 0.0002 * torch.randn_like(guitar_frame)
 
+            # Remove tiny DC offsets
             guitar_frame = guitar_frame - guitar_frame.mean()
             piano_frame = piano_frame - piano_frame.mean()
 
+            # Clamp
             guitar_frame = torch.clamp(guitar_frame, -1.0, 1.0)
             piano_frame = torch.clamp(piano_frame, -1.0, 1.0)
 
@@ -270,15 +317,19 @@ class GuitarPianoDataset(Dataset):
 
 def make_dataloaders(
     data_dir: str,
-    batch_size: int = 16,
+    batch_size: int = 64,
     val_split: float = 0.1,
     sample_rate: int = SAMPLE_RATE,
     frame_size: int = FRAME_SIZE,
     hop_size: int | None = None,
     max_shift_ms: float = 120.0,
-    min_rms: float = 0.008,
+    min_rms: float = 0.002,
+    keep_silence_prob: float = 1.0,
     seed: int = 22,
 ):
+    """
+    Split by clip stem, not by frame, so validation is honest.
+    """
     data_dir = Path(data_dir)
     guitar_dir = data_dir / "guitar"
     piano_dir = data_dir / "piano"
@@ -305,10 +356,11 @@ def make_dataloaders(
         stems=train_stems,
         sample_rate=sample_rate,
         frame_size=frame_size,
-        hop_size=hop_size if hop_size is not None else HOP_SIZE,
+        hop_size=hop_size,
         augment=True,
         max_shift_ms=max_shift_ms,
         min_rms=min_rms,
+        keep_silence_prob=keep_silence_prob,
     )
 
     val_set = GuitarPianoDataset(
@@ -316,10 +368,11 @@ def make_dataloaders(
         stems=val_stems,
         sample_rate=sample_rate,
         frame_size=frame_size,
-        hop_size=hop_size if hop_size is not None else HOP_SIZE,
+        hop_size=hop_size,
         augment=False,
         max_shift_ms=max_shift_ms,
         min_rms=min_rms,
+        keep_silence_prob=keep_silence_prob,
     ) if len(val_stems) > 0 else None
 
     train_loader = DataLoader(
@@ -333,7 +386,7 @@ def make_dataloaders(
 
     val_loader = DataLoader(
         val_set,
-        batch_size=max(1, batch_size),
+        batch_size=batch_size * 2,
         shuffle=False,
         num_workers=0,
         pin_memory=True,
