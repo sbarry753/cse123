@@ -1,11 +1,13 @@
 """
 Losses for polyphonic direct timbre transfer
 
-Emphasis:
+Updated emphasis:
 - multi-scale spectral matching
+- exact-bin linear STFT matching for upper harmonics
+- mel spectral matching for broad timbre
+- stronger high-frequency weighting
 - waveform stability
 - onset / transient matching for pick -> hammer behavior
-- brighter attack matching to push guitar closer to piano
 """
 
 import torch
@@ -17,16 +19,22 @@ import numpy as np
 class MultiScaleSpectralLoss(nn.Module):
     def __init__(
         self,
-        fft_sizes=(256, 512, 1024, 2048),
+        fft_sizes=(256, 512, 1024, 2048, 4096),
         hop_fractions=0.25,
-        n_mels=80,
+        n_mels=96,
         sample_rate=48000,
+        hf_emphasis=4.0,
+        mel_mix=0.40,
+        lin_mix=0.60,
     ):
         super().__init__()
         self.fft_sizes = fft_sizes
         self.hop_frac = hop_fractions
         self.n_mels = n_mels
         self.sample_rate = sample_rate
+        self.hf_emphasis = hf_emphasis
+        self.mel_mix = mel_mix
+        self.lin_mix = lin_mix
 
         for fft_size in fft_sizes:
             fb = self._mel_filterbank(n_mels, fft_size, sample_rate)
@@ -37,35 +45,67 @@ class MultiScaleSpectralLoss(nn.Module):
 
         for fft_size in self.fft_sizes:
             hop_size = max(1, int(fft_size * self.hop_frac))
-            window = torch.hann_window(fft_size, device=pred.device)
-            mel_fb = getattr(self, f"mel_fb_{fft_size}")
+            window = torch.hann_window(fft_size, device=pred.device, dtype=pred.dtype)
+            mel_fb = getattr(self, f"mel_fb_{fft_size}").to(device=pred.device, dtype=pred.dtype)
 
-            pred_spec = self._log_mel_spec(pred, fft_size, hop_size, window, mel_fb)
-            target_spec = self._log_mel_spec(target, fft_size, hop_size, window, mel_fb)
+            pred_stft = torch.stft(
+                F.pad(pred.float(), (fft_size // 2, fft_size // 2)),
+                n_fft=fft_size,
+                hop_length=hop_size,
+                win_length=fft_size,
+                window=window,
+                return_complex=True,
+            )
+            target_stft = torch.stft(
+                F.pad(target.float(), (fft_size // 2, fft_size // 2)),
+                n_fft=fft_size,
+                hop_length=hop_size,
+                win_length=fft_size,
+                window=window,
+                return_complex=True,
+            )
 
-            total_loss = total_loss + F.l1_loss(pred_spec, target_spec)
+            pred_mag = torch.abs(pred_stft)
+            target_mag = torch.abs(target_stft)
+
+            pred_log_mag = torch.log(pred_mag + 1e-7)
+            target_log_mag = torch.log(target_mag + 1e-7)
+
+            n_freq = pred_log_mag.shape[1]
+            freq_weights = torch.linspace(
+                1.0,
+                self.hf_emphasis,
+                n_freq,
+                device=pred.device,
+                dtype=pred.dtype,
+            ).view(1, n_freq, 1)
+
+            # exact-bin spectral match: helps upper harmonics a lot
+            lin_loss = F.l1_loss(pred_log_mag * freq_weights, target_log_mag * freq_weights)
+
+            pred_power = pred_stft.real ** 2 + pred_stft.imag ** 2
+            target_power = target_stft.real ** 2 + target_stft.imag ** 2
+
+            pred_mel = torch.einsum("mf,bft->bmt", mel_fb, pred_power)
+            target_mel = torch.einsum("mf,bft->bmt", mel_fb, target_power)
+
+            pred_log_mel = torch.log(pred_mel + 1e-7)
+            target_log_mel = torch.log(target_mel + 1e-7)
+
+            n_mels = pred_log_mel.shape[1]
+            mel_weights = torch.linspace(
+                1.0,
+                self.hf_emphasis,
+                n_mels,
+                device=pred.device,
+                dtype=pred.dtype,
+            ).view(1, n_mels, 1)
+
+            mel_loss = F.l1_loss(pred_log_mel * mel_weights, target_log_mel * mel_weights)
+
+            total_loss = total_loss + self.lin_mix * lin_loss + self.mel_mix * mel_loss
 
         return total_loss / len(self.fft_sizes)
-
-    def _log_mel_spec(self, audio, fft_size, hop_size, window, mel_fb):
-        audio = audio.float()
-        window = window.float()
-
-        pad = fft_size // 2
-        audio_padded = F.pad(audio, (pad, pad))
-
-        stft = torch.stft(
-            audio_padded,
-            n_fft=fft_size,
-            hop_length=hop_size,
-            win_length=fft_size,
-            window=window,
-            return_complex=True,
-        )
-        power = stft.real ** 2 + stft.imag ** 2
-
-        mel = torch.einsum("mf,bft->bmt", mel_fb, power)
-        return torch.log(mel + 1e-7)
 
     def _mel_filterbank(self, n_mels, n_fft, sample_rate):
         freqs = np.linspace(0, sample_rate / 2, n_fft // 2 + 1)
@@ -119,30 +159,13 @@ class OnsetLoss(nn.Module):
         return self.diff_weight * diff_loss + self.envelope_weight * env_loss
 
 
-class BrightAttackLoss(nn.Module):
-    """
-    Emphasizes high-frequency / attack-region agreement.
-    Very useful for making pick attack feel more hammer-like.
-    """
-
-    def __init__(self, preemphasis: float = 0.95):
-        super().__init__()
-        self.preemphasis = preemphasis
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred_hp = pred[:, 1:] - self.preemphasis * pred[:, :-1]
-        target_hp = target[:, 1:] - self.preemphasis * target[:, :-1]
-        return F.l1_loss(pred_hp, target_hp)
-
-
 class CombinedLoss(nn.Module):
     def __init__(
         self,
         spectral_weight=1.0,
-        waveform_weight=0.15,
-        envelope_weight=0.15,
-        onset_weight=0.60,
-        bright_weight=0.20,
+        waveform_weight=0.20,
+        envelope_weight=0.10,
+        onset_weight=0.30,
     ):
         super().__init__()
         self.spectral_loss = MultiScaleSpectralLoss()
@@ -150,10 +173,7 @@ class CombinedLoss(nn.Module):
         self.waveform_weight = waveform_weight
         self.envelope_weight = envelope_weight
         self.onset_weight = onset_weight
-        self.bright_weight = bright_weight
-
         self.onset_loss = OnsetLoss()
-        self.bright_attack_loss = BrightAttackLoss()
 
     def _smooth_rms(self, audio, window=128):
         audio_sq = audio ** 2
@@ -174,12 +194,10 @@ class CombinedLoss(nn.Module):
         env_loss = F.l1_loss(pred_rms, target_rms)
 
         onset_loss = self.onset_loss(pred, target)
-        bright_loss = self.bright_attack_loss(pred, target)
 
         return (
             self.spectral_weight * spec_loss
             + self.waveform_weight * wave_loss
             + self.envelope_weight * env_loss
             + self.onset_weight * onset_loss
-            + self.bright_weight * bright_loss
         )
