@@ -64,7 +64,7 @@ It is intended to:
 - provide a MIDI-style or note-based representation
 - operate under strict latency constraints suitable for embedded systems
 
-#### Audio Demo – First NN
+#### Audio Demo – First NN. Click images to view video.
 [![First NN Input](https://img.youtube.com/vi/imzRmc-EM3o/0.jpg)](https://www.youtube.com/watch?v=imzRmc-EM3o)
 
 **After (first NN output / note-detection-driven result):**
@@ -85,7 +85,7 @@ It is intended to:
 - run in a streaming low-latency pipeline
 - support eventual embedded deployment
 
-#### Video Demo – Second NN
+#### Video Demo – Second NN. Click images to view video.
 
 [![Second NN Out](https://img.youtube.com/vi/lIXTaDWCdeU/0.jpg)](https://www.youtube.com/watch?v=lIXTaDWCdeU)
 
