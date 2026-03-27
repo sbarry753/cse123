@@ -39,7 +39,7 @@ This is the full signal path of the pedal, from instrument input through convers
 
 This diagram shows the higher-level pedal architecture and how the DSP / neural / synthesis stages connect together.
 
-![Overall Schematic](Documentation/images/schematic.png)
+![Overall Schematic](Documentation/images/schematic.PNG)
 
 ---
 
@@ -69,20 +69,20 @@ It is intended to:
 ### Audio Demo – Timbre Transfer
 
 <video controls width="800">
-  <source src="./Documentation/Videos/RawGuitar.mp4" type="video/mp4">
+  <source src="Documentation/Videos/RawGuitar.mp4" type="video/mp4">
   Your browser does not support the video tag.
 </video>
 **After (first NN output / note-detection-driven result):**
 
 <video controls width="800">
-  <source src="./Documentation/Videos/OutPut.mp4" type="video/mp4">
+  <source src="Documentation/Videos/OutPut.mp4" type="video/mp4">
   Your browser does not support the video tag.
 </video>
 
 > If GitHub does not render the audio player in your view, you can still click the files directly:
 >
-> - [First NN Before WAV](./Documentation/Videos/RawGuitar.mp4v)
-> - [First NN After WAV](./Documentation/Videos/OutPut.mp4)
+> - [First NN Before WAV](Documentation/Videos/RawGuitar.mp4v)
+> - [First NN After WAV](Documentation/Videos/OutPut.mp4)
 ---
 ### 2. Second Neural Network – Timbre Transfer
 
