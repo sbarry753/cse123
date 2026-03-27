@@ -66,11 +66,10 @@ It is intended to:
 
 #### Audio Demo – First NN
 [![First NN Input](https://img.youtube.com/vi/imzRmc-EM3o/0.jpg)](https://www.youtube.com/watch?v=imzRmc-EM3o)
+
 **After (first NN output / note-detection-driven result):**
 
 [![First NN MIDI Out](https://img.youtube.com/vi/rfo7ya5QwPA/0.jpg)](https://www.youtube.com/watch?v=rfo7ya5QwPA)
-
-### Audio Demo – Timbre Transfer
 
 
 ### 2. Second Neural Network – Timbre Transfer
