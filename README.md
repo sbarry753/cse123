@@ -1,179 +1,211 @@
-# LUT Guitar Synth Pedal (Polyphonic)
+# GuSynth – Ultra-Low-Latency Polyphonic Guitar Synth Pedal
+![Aesthetic Prototype](Documentation/images/pedalboxenclosureV2.png)
+GuSynth is a research + hardware project building a **real-time polyphonic guitar synth pedal** capable of transforming a guitar into other instruments with **ultra-low latency**.
 
-A research and hardware project building a **polyphonic guitar synth pedal** using a **harmonic fingerprint lookup table (LUT)** for note and chord detection.
+The project combines:
 
-Instead of traditional waveform resynthesis or naive pitch tracking, this system performs:
+- **Transient-guided neural note detection**
+- **Polyphonic inference for guitar input**
+- **Direct neural timbre transfer**
+- **Embedded deployment on microcontroller hardware**
+- **Analog tone shaping and post-processing**
 
-- **Monophonic note detection** via harmonic template matching  
-- **Polyphonic chord detection** using the template matching to help optimize NNLS or FFT
-- **Strike detection** to separate attacks from sustain for better tracking  
+The goal is a **standalone guitar pedal** that lets a guitarist play naturally while hearing the output as another instrument.
 
-The long-term goal is a standalone hardware pedal combining:
+---
 
-- Real-time digital note/chord detection
-- Synth/sample playback engine
-- Analog preamp + overdrive section
-- Flexible routing between clean, driven, and synthesized signals
+## Overview
+
+Most pitch detection and guitar synthesis systems rely on longer analysis windows, which adds noticeable delay. GuSynth instead focuses on extracting useful information from the **earliest part of the note**, especially the pick attack, so the system can react quickly enough for live performance.
+
+The project currently explores two connected ML stages:
+
+1. **First neural network:** fast polyphonic note detection from very short windows
+2. **Second neural network:** direct timbre transfer from guitar to another instrument
+
+A harmonic LUT-based pipeline and analog processing stages support the overall system.
+
+---
+
+## Signal Path
+
+This is the full signal path of the pedal, from instrument input through conversion, inference/synthesis, and output shaping.
+
+![Signal Path](Documentation/images/signal-path.png)
+
+---
+
+## Overall Pedal / System Schematic
+
+This diagram shows the higher-level pedal architecture and how the DSP / neural / synthesis stages connect together.
+
+![Overall Schematic](Documentation/images/schematic.drawio.png)
+
+---
+
+## 424 / Analog Circuit Reference
+
+This section documents one of the analog reference directions used in the project for tone shaping / overdrive exploration.
+
+![424 Schematic](Documentation/images/424_schematic.png)
+
+---
+
+## Core System Architecture
+
+### 1. First Neural Network – Polyphonic Note Detection
+
+The first model is designed to recognize notes from **very short guitar input windows**, with a strong focus on the **transient / pick attack** region.
+
+It is intended to:
+
+- detect note activity quickly
+- work under polyphonic conditions
+- provide a MIDI-style or note-based representation
+- operate under strict latency constraints suitable for embedded systems
+
+#### Audio Demo – First NN
+
+### Audio Demo – Timbre Transfer
+
+<audio controls>
+  <source src="./TIMBRE NET - In Developent/data/guitar/plaz.wav" type="audio/wav">
+  Your browser does not support the audio element.
+</audio>
+
+**After (first NN output / note-detection-driven result):**
+
+<audio controls>
+  <source src="./TIMBRE NET - In Developent/data/piano/plaz.wav" type="audio/wav">
+  Your browser does not support the audio element.
+</audio>
+
+> If GitHub does not render the audio player in your view, you can still click the files directly:
+>
+> - [Listen to guitar input](./TIMBRE%20NET%20-%20In%20Developent/data/guitar/plaz.wav)
+> - [Listen to transformed output](./TIMBRE%20NET%20-%20In%20Developent/data/piano/plaz.wav)
+---
+### 2. Second Neural Network – Timbre Transfer
+
+The second model takes guitar input and transforms it toward the sound of another instrument.
+
+Current work is focused on **guitar → piano-style transfer**, with the long-term goal of supporting more instruments and cleaner real-time conversion.
+
+It is intended to:
+
+- preserve performance timing and expression
+- reshape the raw guitar waveform into a target timbre
+- run in a streaming low-latency pipeline
+- support eventual embedded deployment
+
+#### Video Demo – Second NN
+
+<video controls width="800">
+  <source src="Documentation/video/second_nn_demo.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+
+> Direct link: [Second NN Demo Video](Documentation/video/second_nn_demo.mp4)
+
+---
+
+## Harmonic LUT Support Pipeline
+
+Alongside the neural models, the project includes a harmonic fingerprint LUT approach used for analysis and refinement.
+
+This system helps by:
+
+- storing harmonic note templates
+- comparing incoming spectra to expected note structure
+- refining note hypotheses
+- supporting interpretable DSP-guided analysis
+
+Rather than treating the project as purely neural or purely classical DSP, GuSynth explores a **hybrid approach**.
+
+---
+
+## Embedded Hardware Target
+
+The long-term target is a compact embedded pedal platform.
+
+### Current embedded direction
+
+- **Daisy Seed / Cortex-M7 class hardware**
+- **48 kHz real-time audio**
+- small-window streaming inference
+- ADC / DAC audio pipeline
+- analog front-end and output shaping
+
+### Embedded constraints
+
+- low total latency
+- predictable real-time processing
+- limited memory / compute budget
+- models must be compact enough for sustained streaming
+
+---
+
+## Analog Processing
+
+The pedal is not only digital / ML based. Analog stages are also important for:
+
+- input conditioning
+- gain staging
+- distortion / overdrive
+- EQ shaping
+- reducing unpleasant artifacts in synthesized output
+
+This is especially useful when blending guitar and synthetic instrument textures.
 
 ---
 
 ## Project Status
 
-- **Python LUT prototype active** - note + chord detection working offline
-- **Strike detection system in development**
-- **Daisy Seed hardware prototype in progress**
-- **JUCE project scaffolded for desktop/VST testing**
-- **Analog front-end planned and partially prototyped**
-
----
-
-## System Overview
-
-### Pedal Concept
-
-![Pedal concept](Documentation/images/Guitar%20Pedal.drawio.png)
-
-### Detection + Synthesis Flow
-
-![LUT polyphonic flow](Documentation/images/LUTPolyphonic.drawio%20(1).png)
-
----
-
-## Core Detection Approach
-
-### Harmonic Fingerprint LUT
-
-Single-note recordings are analyzed and stored as harmonic “fingerprints.”  
-Each note in the LUT contains multiple takes for robustness.
-
-During detection, the system:
-
-1. Assumes each possible note
-2. Extracts harmonic features under that assumption
-3. Scores against stored templates
-4. Selects the best match
-
-This avoids fragile single-f0 estimation and improves stability across strings and playing styles.
-
----
-
-### Polyphonic (Chord) Detection
-
-Chord detection does **not** use chord templates.
-
-Instead:
-
-- Single-note templates are converted into spectral templates
-- The live spectrum is modeled as a **nonnegative mixture**
-- NNLS determines which notes are present
-- Results are pruned and thresholded
-
-This allows detection of multiple simultaneous strings without pre-defining chord shapes.
-
----
-
-### Strike Detection
-
-Accurate detection requires separating:
-
-- **Attack transients (strike)**
-- **Sustained harmonic content**
-
-Strike detection helps:
-- Trigger new synth events cleanly
-- Avoid re-triggering during sustain
-- Improve chord onset recognition
-
-This subsystem is currently under active development for real-time hardware use.
-
----
-
-## Analog Front-End (Planned)
-
-The final pedal will include a dedicated **analog input and overdrive section**.
-
-### Clean Preamp (Line-Level Conditioning)
-
-The microcontroller expects a stable line-level signal.  
-A clean preamp stage is required to:
-
-- Properly buffer guitar pickups
-- Provide adjustable gain
-- Condition signal before ADC
-
-A functional prototype based on a CMOY-style op-amp design already exists and will be adapted for guitar-level input:
-
-https://tangentsoft.com/audio/cmoy/
-
-This will likely be redesigned onto a custom PCB.
-
----
-
-### Analog Overdrive
-
-Two overdrive-style circuits are being explored:
-
-- A classic op-amp soft-clipping design (Wampler reference topology)  
-  https://www.wamplerpedals.com/blog/latest-news/2020/05/how-to-design-a-basic-overdrive-pedal-circuit/
-
-- A preamp-style overdrive inspired by the Tascam 424  
-  https://aionfx.com/app/files/docs/424_preamp_documentation.pdf
-
-The final hardware pedal will include an analog drive stage for:
-
-- Traditional guitar overdrive tones
-- Synth-through-drive textures
-- Flexible signal routing options
-
----
-
-## Analog Preprocessing & Detection Accuracy
-
-There is ongoing investigation into whether analog preprocessing can improve polyphonic detection accuracy. Possible areas:
-
-- Adjustable input gain
-- Mild high-pass filtering
-- Dynamic range conditioning
-- Controlled saturation before ADC
-
-A clean, well-scaled input signal is critical for stable harmonic fingerprint matching.
+- ✅ First neural network prototype for transient-guided note detection
+- ✅ Second neural network prototype for timbre transfer
+- ✅ Harmonic LUT research pipeline
+- ✅ System-level pedal architecture defined
+- ⚠️ Embedded optimization still in progress
+- ⚠️ More training data and refinement needed for cleaner output quality
 
 ---
 
 ## Repository Layout
 
-- `LUT - In Development/`  
-  Python prototype for LUT building and note/chord detection
+- `Documentation/images/`  
+  Diagrams, schematics, and system figures
 
-- `JUCE - In Development/`  
-  Desktop/VST prototyping environment (skeleton)
+- `Documentation/audio/`  
+  WAV demos for model outputs
+
+- `Documentation/video/`  
+  Video demonstrations of the system
+
+- `LUT - In Development/`  
+  Harmonic fingerprint / template detection work
 
 - `DAISY - In Development/`  
-  Hardware prototype (Daisy Seed + Audio Shield)
+  Embedded hardware and firmware work
 
-- `Documentation/`  
-  Diagrams, status reports, and supporting materials
-
----
-
-## Status Reports
-
-### Latest
-[Status Report 3](Documentation/status_reports/status_report_3)
-
-### Archive
-- [Status Report 2](Documentation/status_reports/status_report_2)
-- [Status Report 1](Documentation/status_reports/status_report_1)
+- `JUCE - In Development/`  
+  Desktop or plugin prototyping
 
 ---
 
 ## Long-Term Goal
 
-A standalone polyphonic guitar synth pedal combining:
+A standalone guitar pedal that:
 
-- Harmonic fingerprint note/chord detection
-- Real-time synthesis
-- Analog drive and tone shaping
-- Hardware-friendly DSP
-- Expandable routing architecture
+- detects polyphonic playing with minimal delay
+- converts guitar into the sound of other instruments
+- runs on embedded hardware
+- combines neural models, DSP, and analog circuitry
+- remains responsive enough for real live performance
 
+---
+
+## Summary
+
+GuSynth is a hybrid guitar-synthesis system exploring how far real-time note inference and timbre transfer can be pushed under embedded, performance-critical latency constraints.
+
+It is not just a guitar effect — it is an attempt to turn the guitar into a **real-time expressive controller for other instruments**.
