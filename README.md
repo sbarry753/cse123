@@ -87,14 +87,7 @@ It is intended to:
 
 #### Video Demo – Second NN
 
-<video controls width="800">
-  <source src="Documentation/video/second_nn_demo.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
-
-> Direct link: [Second NN Demo Video](Documentation/video/second_nn_demo.mp4)
-
----
+[![Second NN Out](https://img.youtube.com/vi/lIXTaDWCdeU/0.jpg)](https://www.youtube.com/watch?v=lIXTaDWCdeU)
 
 ## Harmonic LUT Support Pipeline
 
