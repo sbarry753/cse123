@@ -65,25 +65,14 @@ It is intended to:
 - operate under strict latency constraints suitable for embedded systems
 
 #### Audio Demo – First NN
+[![First NN Input](https://img.youtube.com/vi/imzRmc-EM3o/0.jpg)](https://www.youtube.com/watch?v=imzRmc-EM3o)
+**After (first NN output / note-detection-driven result):**
+
+[![First NN MIDI Out](https://img.youtube.com/vi/rfo7ya5QwPA/0.jpg)](https://www.youtube.com/watch?v=rfo7ya5QwPA)
 
 ### Audio Demo – Timbre Transfer
 
-<video controls width="800">
-  <source src="./Documentation/Videos/RawGuitar.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
-**After (first NN output / note-detection-driven result):**
 
-<video controls width="800">
-  <source src="./Documentation/Videos/OutPut.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
-
-> If GitHub does not render the audio player in your view, you can still click the files directly:
->
-> - [First NN Before WAV](./Documentation/Videos/RawGuitar.mp4v)
-> - [First NN After WAV](./Documentation/Videos/OutPut.mp4)
----
 ### 2. Second Neural Network – Timbre Transfer
 
 The second model takes guitar input and transforms it toward the sound of another instrument.
