@@ -39,7 +39,7 @@ This is the full signal path of the pedal, from instrument input through convers
 
 This diagram shows the higher-level pedal architecture and how the DSP / neural / synthesis stages connect together.
 
-![Overall Schematic](Documentation/images/schematic.png)
+![Overall Schematic](Documentation/images/schematic.PNG)
 
 ---
 
