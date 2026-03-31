@@ -29,3 +29,7 @@ NET - In Development/venv311/Lib/site-packages/pip-24.0.dist-info/METADATA
 /TIMBRE NET - In Developent/checkpoints_resynth
 /TIMBRE NET - In Developent/checkpoints
 /TIMBRE NET - In Developent/data/.g2p_temporal_cache
+
+audio/
+*.json*
+onsetnet

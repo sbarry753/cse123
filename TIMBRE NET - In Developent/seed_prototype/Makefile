@@ -1,0 +1,13 @@
+# Project Name
+TARGET = nn_daisy
+
+# Sources
+CPP_SOURCES = main.cpp
+
+# Put the program in external QSPI (8MB)
+APP_TYPE = BOOT_QSPI
+
+LIBDAISY_DIR = ../../lib/libDaisy/
+DAISYSP_DIR = ../../lib/DaisySP/
+SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
+include $(SYSTEM_FILES_DIR)/Makefile
