@@ -31,3 +31,5 @@ NET - In Development/venv311/Lib/site-packages/pip-24.0.dist-info/METADATA
 audio/
 *.json*
 onsetnet
+
+checkpoints_temporal/
