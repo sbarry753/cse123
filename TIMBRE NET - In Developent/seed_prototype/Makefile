@@ -2,7 +2,10 @@
 TARGET = nn_daisy
 
 # Sources
-CPP_SOURCES = main.cpp
+CPP_SOURCES = baseline.cpp
+
+# Optimization level
+OPT = -O3
 
 # Put the program in external QSPI (8MB)
 APP_TYPE = BOOT_QSPI
@@ -11,3 +14,7 @@ LIBDAISY_DIR = ../../lib/libDaisy/
 DAISYSP_DIR = ../../lib/DaisySP/
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 include $(SYSTEM_FILES_DIR)/Makefile
+
+# Faster float operations
+CFLAGS += -ffast-math
+CPPFLAGS += -ffast-math

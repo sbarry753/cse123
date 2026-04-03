@@ -1,7 +1,4 @@
-#!/usr/bin/env python3
 """Export a deterministic model snapshot and golden I/O for the Daisy baseline."""
-
-from __future__ import annotations
 
 import argparse
 import math
@@ -146,7 +143,6 @@ def main() -> None:
     lines.append(f"static constexpr int kContextFrames = {CONTEXT_FRAMES};")
     lines.append(f"static constexpr int kFftSize = {N_FFT};")
     lines.append(f"static constexpr int kFreqBins = {N_FREQ_BINS};")
-    lines.append("static constexpr int kStftFrames = 5;")
     lines.append("static constexpr int kFeatureChannels = 9;")
     lines.append("static constexpr int kBaseChannels = 32;")
     lines.append(f"static constexpr std::size_t kParameterCount = {param_count}u;")
