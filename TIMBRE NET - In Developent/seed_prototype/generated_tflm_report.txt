@@ -1,0 +1,56 @@
+Daisy TFLM export report
+========================
+
+activation_note=quick_gelu_sigmoid_approx
+interpreter_delegate_mode=builtin_without_default_delegates
+checkpoint_epoch=0
+checkpoint_val_loss=3.658339130471229
+float_parity_unet_max_abs=1.040643e-01
+float_parity_transient_max_abs=1.926124e-04
+
+[unet]
+model_bytes=932584
+input_shape=(1, 257, 5, 9)
+input_quant=0.08131429553031921, 14
+output_quant=[(0.03454362601041794, 22), (0.011600523255765438, -128), (0.003407025244086981, -3)]
+tensor_dtypes=["<class 'numpy.int32'>", "<class 'numpy.int8'>"]
+ops=['CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'RESIZE_BILINEAR', 'CONCATENATION', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'RESIZE_BILINEAR', 'CONCATENATION', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'RESIZE_BILINEAR', 'CONCATENATION', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'MEAN', 'SQUARED_DIFFERENCE', 'MEAN', 'ADD', 'RSQRT', 'SUB', 'MUL', 'MUL', 'ADD', 'MUL', 'LOGISTIC', 'MUL', 'CONV_2D', 'LOGISTIC', 'MUL', 'ADD', 'CONV_2D', 'TANH', 'MUL', 'CONV_2D']
+
+[transient]
+model_bytes=29912
+input_shape=(1, 512, 1)
+input_quant=0.005751787219196558, -14
+output_quant=[(0.005760053638368845, -11)]
+tensor_dtypes=["<class 'numpy.int32'>", "<class 'numpy.int8'>"]
+ops=['ABS', 'EXPAND_DIMS', 'EXPAND_DIMS', 'CONV_2D', 'RESHAPE', 'MUL', 'LOGISTIC', 'MUL', 'EXPAND_DIMS', 'CONV_2D', 'RESHAPE', 'MUL', 'LOGISTIC', 'MUL', 'EXPAND_DIMS', 'CONV_2D', 'RESHAPE', 'MUL', 'LOGISTIC', 'MUL', 'EXPAND_DIMS', 'CONV_2D', 'RESHAPE', 'ADD', 'CONV_2D', 'RESHAPE', 'MUL', 'LOGISTIC', 'MUL', 'EXPAND_DIMS', 'CONV_2D', 'RESHAPE', 'ADD', 'LOGISTIC', 'MUL', 'MUL', 'ADD']
+
+[host_float_vs_keras]
+unet_max_abs=1.040643e-01
+transient_max_abs=1.926124e-04
+
+[host_keras_vs_quantized_tflite.case_zero]
+mask_max_abs=3.963177e+00
+residual_max_abs=3.910330e+00
+phase_delta_max_abs=2.556895e-01
+pre_transient_max_abs=6.148611e+05
+transient_max_abs=2.653377e-03
+final_max_abs=7.934281e-01
+final_rmse=7.272216e-01
+
+[host_keras_vs_quantized_tflite.case_impulse]
+mask_max_abs=3.508621e+00
+residual_max_abs=3.254676e+00
+phase_delta_max_abs=3.947934e-01
+pre_transient_max_abs=1.200040e+01
+transient_max_abs=4.016489e-03
+final_max_abs=9.919124e-01
+final_rmse=1.392019e-01
+
+[host_keras_vs_quantized_tflite.case_random]
+mask_max_abs=5.776525e+00
+residual_max_abs=5.808397e+00
+phase_delta_max_abs=1.876989e-01
+pre_transient_max_abs=1.097832e+00
+transient_max_abs=5.437180e-03
+final_max_abs=7.357644e-01
+final_rmse=2.579705e-01

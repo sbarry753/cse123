@@ -15,6 +15,12 @@ constexpr float kInstanceNormEps = 1.0e-5f;
 constexpr int kWarmupIters = 5;
 constexpr int kBenchIters = 20;
 
+#if defined(BASELINE_USE_SDRAM_WEIGHTS)
+constexpr bool kUseSdramWeights = true;
+#else
+constexpr bool kUseSdramWeights = false;
+#endif
+
 constexpr int kStftFrames = (kFrameSize + kFftSize) / kHopSize - (kFftSize / kHopSize) + 1;
 constexpr int kInputSize = kContextFrames * kFrameSize;
 constexpr int kTfSize = kFreqBins * kStftFrames;
@@ -71,55 +77,55 @@ struct BenchmarkCase {
 };
 
 #define CONV2D_DESC(name, out_ch_, in_ch_, kh_, kw_, sh_, sw_, ph_, pw_, w_, b_) \
-    static const Conv2DLayer name = {out_ch_, in_ch_, kh_, kw_, sh_, sw_, ph_, pw_, w_, b_}
+    static Conv2DLayer name = {out_ch_, in_ch_, kh_, kw_, sh_, sw_, ph_, pw_, w_, b_}
 
 #define NORM2D_DESC(name, ch_, w_, b_) \
-    static const Norm2DLayer name = {ch_, w_, b_}
+    static Norm2DLayer name = {ch_, w_, b_}
 
 #define CONV1D_DESC(name, out_ch_, in_ch_, k_, s_, p_, w_, b_) \
-    static const Conv1DLayer name = {out_ch_, in_ch_, k_, s_, p_, w_, b_}
+    static Conv1DLayer name = {out_ch_, in_ch_, k_, s_, p_, w_, b_}
 
 CONV2D_DESC(kEnc1Conv0, 32, 9, 3, 3, 1, 1, 1, 1, g_unet_enc1_block_0_weight, g_unet_enc1_block_0_bias);
 NORM2D_DESC(kEnc1Norm0, 32, g_unet_enc1_block_1_weight, g_unet_enc1_block_1_bias);
 CONV2D_DESC(kEnc1Conv1, 32, 32, 3, 3, 1, 1, 1, 1, g_unet_enc1_block_3_weight, g_unet_enc1_block_3_bias);
 NORM2D_DESC(kEnc1Norm1, 32, g_unet_enc1_block_4_weight, g_unet_enc1_block_4_bias);
-static const ConvBlock2D kEnc1Block = {kEnc1Conv0, kEnc1Norm0, kEnc1Conv1, kEnc1Norm1};
+static ConvBlock2D kEnc1Block = {kEnc1Conv0, kEnc1Norm0, kEnc1Conv1, kEnc1Norm1};
 
 CONV2D_DESC(kEnc2Conv0, 64, 32, 3, 3, 2, 2, 1, 1, g_unet_enc2_block_0_weight, g_unet_enc2_block_0_bias);
 NORM2D_DESC(kEnc2Norm0, 64, g_unet_enc2_block_1_weight, g_unet_enc2_block_1_bias);
 CONV2D_DESC(kEnc2Conv1, 64, 64, 3, 3, 1, 1, 1, 1, g_unet_enc2_block_3_weight, g_unet_enc2_block_3_bias);
 NORM2D_DESC(kEnc2Norm1, 64, g_unet_enc2_block_4_weight, g_unet_enc2_block_4_bias);
-static const ConvBlock2D kEnc2Block = {kEnc2Conv0, kEnc2Norm0, kEnc2Conv1, kEnc2Norm1};
+static ConvBlock2D kEnc2Block = {kEnc2Conv0, kEnc2Norm0, kEnc2Conv1, kEnc2Norm1};
 
 CONV2D_DESC(kEnc3Conv0, 128, 64, 3, 3, 2, 2, 1, 1, g_unet_enc3_block_0_weight, g_unet_enc3_block_0_bias);
 NORM2D_DESC(kEnc3Norm0, 128, g_unet_enc3_block_1_weight, g_unet_enc3_block_1_bias);
 CONV2D_DESC(kEnc3Conv1, 128, 128, 3, 3, 1, 1, 1, 1, g_unet_enc3_block_3_weight, g_unet_enc3_block_3_bias);
 NORM2D_DESC(kEnc3Norm1, 128, g_unet_enc3_block_4_weight, g_unet_enc3_block_4_bias);
-static const ConvBlock2D kEnc3Block = {kEnc3Conv0, kEnc3Norm0, kEnc3Conv1, kEnc3Norm1};
+static ConvBlock2D kEnc3Block = {kEnc3Conv0, kEnc3Norm0, kEnc3Conv1, kEnc3Norm1};
 
 CONV2D_DESC(kBottleneckConv0, 128, 128, 3, 3, 1, 1, 1, 1, g_unet_bottleneck_block_0_weight, g_unet_bottleneck_block_0_bias);
 NORM2D_DESC(kBottleneckNorm0, 128, g_unet_bottleneck_block_1_weight, g_unet_bottleneck_block_1_bias);
 CONV2D_DESC(kBottleneckConv1, 128, 128, 3, 3, 1, 1, 1, 1, g_unet_bottleneck_block_3_weight, g_unet_bottleneck_block_3_bias);
 NORM2D_DESC(kBottleneckNorm1, 128, g_unet_bottleneck_block_4_weight, g_unet_bottleneck_block_4_bias);
-static const ConvBlock2D kBottleneckBlock = {kBottleneckConv0, kBottleneckNorm0, kBottleneckConv1, kBottleneckNorm1};
+static ConvBlock2D kBottleneckBlock = {kBottleneckConv0, kBottleneckNorm0, kBottleneckConv1, kBottleneckNorm1};
 
 CONV2D_DESC(kDec3Conv0, 64, 256, 3, 3, 1, 1, 1, 1, g_unet_dec3_block_0_weight, g_unet_dec3_block_0_bias);
 NORM2D_DESC(kDec3Norm0, 64, g_unet_dec3_block_1_weight, g_unet_dec3_block_1_bias);
 CONV2D_DESC(kDec3Conv1, 64, 64, 3, 3, 1, 1, 1, 1, g_unet_dec3_block_3_weight, g_unet_dec3_block_3_bias);
 NORM2D_DESC(kDec3Norm1, 64, g_unet_dec3_block_4_weight, g_unet_dec3_block_4_bias);
-static const ConvBlock2D kDec3Block = {kDec3Conv0, kDec3Norm0, kDec3Conv1, kDec3Norm1};
+static ConvBlock2D kDec3Block = {kDec3Conv0, kDec3Norm0, kDec3Conv1, kDec3Norm1};
 
 CONV2D_DESC(kDec2Conv0, 32, 128, 3, 3, 1, 1, 1, 1, g_unet_dec2_block_0_weight, g_unet_dec2_block_0_bias);
 NORM2D_DESC(kDec2Norm0, 32, g_unet_dec2_block_1_weight, g_unet_dec2_block_1_bias);
 CONV2D_DESC(kDec2Conv1, 32, 32, 3, 3, 1, 1, 1, 1, g_unet_dec2_block_3_weight, g_unet_dec2_block_3_bias);
 NORM2D_DESC(kDec2Norm1, 32, g_unet_dec2_block_4_weight, g_unet_dec2_block_4_bias);
-static const ConvBlock2D kDec2Block = {kDec2Conv0, kDec2Norm0, kDec2Conv1, kDec2Norm1};
+static ConvBlock2D kDec2Block = {kDec2Conv0, kDec2Norm0, kDec2Conv1, kDec2Norm1};
 
 CONV2D_DESC(kDec1Conv0, 32, 64, 3, 3, 1, 1, 1, 1, g_unet_dec1_block_0_weight, g_unet_dec1_block_0_bias);
 NORM2D_DESC(kDec1Norm0, 32, g_unet_dec1_block_1_weight, g_unet_dec1_block_1_bias);
 CONV2D_DESC(kDec1Conv1, 32, 32, 3, 3, 1, 1, 1, 1, g_unet_dec1_block_3_weight, g_unet_dec1_block_3_bias);
 NORM2D_DESC(kDec1Norm1, 32, g_unet_dec1_block_4_weight, g_unet_dec1_block_4_bias);
-static const ConvBlock2D kDec1Block = {kDec1Conv0, kDec1Norm0, kDec1Conv1, kDec1Norm1};
+static ConvBlock2D kDec1Block = {kDec1Conv0, kDec1Norm0, kDec1Conv1, kDec1Norm1};
 
 CONV2D_DESC(kOutMask, 1, 32, 1, 1, 1, 1, 0, 0, g_unet_out_mask_weight, g_unet_out_mask_bias);
 CONV2D_DESC(kOutRes, 1, 32, 1, 1, 1, 1, 0, 0, g_unet_out_res_weight, g_unet_out_res_bias);
@@ -140,6 +146,14 @@ static uint16_t g_fft_bitrev[kFftSize];
 static float g_fft_cos[9][kFftSize / 2];
 static float g_fft_sin[9][kFftSize / 2];
 static float g_istft_window_sumsquare[kPaddedFrameSize];
+
+constexpr std::size_t kWindowFloats = kFrameSize;
+#if defined(BASELINE_USE_SDRAM_WEIGHTS)
+constexpr std::size_t kWeightFloats = kWeightBytes / sizeof(float);
+static float DSY_SDRAM_BSS g_weights_sdram[kWeightFloats];
+static float DSY_SDRAM_BSS g_window_sdram[kWindowFloats];
+#endif
+static const float* g_win = g_window;
 
 static float DSY_SDRAM_BSS g_log_mag_all[kContextFrames * kTfSize];
 static float DSY_SDRAM_BSS g_current_mag[kTfSize];
@@ -174,7 +188,13 @@ static float DSY_SDRAM_BSS g_delta[kFrameSize];
 static float DSY_SDRAM_BSS g_gate[kFrameSize];
 static float DSY_SDRAM_BSS g_abs_input[kFrameSize];
 
-constexpr std::size_t kScratchBytes = sizeof(g_log_mag_all) + sizeof(g_current_mag)
+#if defined(BASELINE_USE_SDRAM_WEIGHTS)
+constexpr std::size_t kWeightCopyBytes = sizeof(g_weights_sdram) + sizeof(g_window_sdram);
+#else
+constexpr std::size_t kWeightCopyBytes = 0;
+#endif
+
+constexpr std::size_t kScratchBytes = kWeightCopyBytes + sizeof(g_log_mag_all) + sizeof(g_current_mag)
                                     + sizeof(g_current_log_mag) + sizeof(g_current_phase)
                                     + sizeof(g_features) + sizeof(g_enc1) + sizeof(g_enc2)
                                     + sizeof(g_enc3) + sizeof(g_bottleneck) + sizeof(g_upcat)
@@ -273,7 +293,7 @@ void PrecomputeIstftWindowNorm() {
         const int start = frame * kHopSize;
 
         for(int n = 0; n < kFrameSize; n++) {
-            const float w = g_window[n];
+            const float w = g_win[n];
             g_istft_window_sumsquare[start + n] += w * w;
         }
     }
@@ -495,7 +515,7 @@ void BuildSpectralFeatures(const float* audio_ctx) {
 
             for(int n = 0; n < kFrameSize; n++) {
                 const int sample_idx = ReflectIndex(start + n, kFrameSize);
-                g_fft_re[n] = audio[sample_idx] * g_window[n];
+                g_fft_re[n] = audio[sample_idx] * g_win[n];
                 g_fft_im[n] = 0.0f;
             }
 
@@ -609,7 +629,7 @@ void ReconstructWaveform(float* audio_out) {
 
         const int start = frame * kHopSize;
         for(int n = 0; n < kFrameSize; n++) {
-            g_istft_accum[start + n] += g_fft_re[n] * g_window[n];
+            g_istft_accum[start + n] += g_fft_re[n] * g_win[n];
         }
     }
 
@@ -643,8 +663,74 @@ void TransientShaperForward(float* audio_out) {
     }
 }
 
+#if defined(BASELINE_USE_SDRAM_WEIGHTS)
+static float* g_sdram_cursor;
+
+const float* CopyToSdram(const float* src, int count) {
+    float* dst = g_sdram_cursor;
+    std::memcpy(dst, src, static_cast<std::size_t>(count) * sizeof(float));
+    g_sdram_cursor += count;
+    return dst;
+}
+
+void CopyConv2D(Conv2DLayer& layer, int weight_count, int bias_count) {
+    layer.weight = CopyToSdram(layer.weight, weight_count);
+    layer.bias   = CopyToSdram(layer.bias, bias_count);
+}
+
+void CopyNorm2D(Norm2DLayer& layer) {
+    layer.weight = CopyToSdram(layer.weight, layer.channels);
+    layer.bias   = CopyToSdram(layer.bias, layer.channels);
+}
+
+void CopyConv1D(Conv1DLayer& layer) {
+    layer.weight = CopyToSdram(layer.weight, layer.out_ch * layer.in_ch * layer.kernel);
+    layer.bias = CopyToSdram(layer.bias, layer.out_ch);
+}
+
+void CopyBlock(ConvBlock2D& block) {
+    CopyConv2D(block.conv0,
+               block.conv0.out_ch * block.conv0.in_ch * block.conv0.kernel_h * block.conv0.kernel_w,
+               block.conv0.out_ch);
+    CopyNorm2D(block.norm0);
+    CopyConv2D(block.conv1,
+               block.conv1.out_ch * block.conv1.in_ch * block.conv1.kernel_h * block.conv1.kernel_w,
+               block.conv1.out_ch);
+    CopyNorm2D(block.norm1);
+}
+
+void CopyWeightsToSdram() {
+    g_sdram_cursor = g_weights_sdram;
+
+    CopyBlock(kEnc1Block);
+    CopyBlock(kEnc2Block);
+    CopyBlock(kEnc3Block);
+    CopyBlock(kBottleneckBlock);
+    CopyBlock(kDec3Block);
+    CopyBlock(kDec2Block);
+    CopyBlock(kDec1Block);
+
+    CopyConv2D(kOutMask, kOutMask.out_ch * kOutMask.in_ch * kOutMask.kernel_h * kOutMask.kernel_w, kOutMask.out_ch);
+    CopyConv2D(kOutRes, kOutRes.out_ch * kOutRes.in_ch * kOutRes.kernel_h * kOutRes.kernel_w, kOutRes.out_ch);
+    CopyConv2D(kOutPhase, kOutPhase.out_ch * kOutPhase.in_ch * kOutPhase.kernel_h * kOutPhase.kernel_w, kOutPhase.out_ch);
+
+    CopyConv1D(kTransientDelta0);
+    CopyConv1D(kTransientDelta2);
+    CopyConv1D(kTransientDelta4);
+    CopyConv1D(kTransientDelta6);
+    CopyConv1D(kTransientGate0);
+    CopyConv1D(kTransientGate2);
+
+    std::memcpy(g_window_sdram, g_window, sizeof(g_window_sdram));
+    g_win = g_window_sdram;
+}
+#endif
+
 void BaselineInit() {
     if(g_initialized) return;
+#if defined(BASELINE_USE_SDRAM_WEIGHTS)
+    CopyWeightsToSdram();
+#endif
     PrecomputeFftTables();
     PrecomputeIstftWindowNorm();
     g_initialized = true;
@@ -693,6 +779,7 @@ uint32_t CyclesToHopPctX100(uint32_t cycles, uint32_t cpu_hz) {
 void PrintMemorySummary() {
     hw.seed.PrintLine("Model params: %lu", static_cast<unsigned long>(kParameterCount));
     hw.seed.PrintLine("Weight bytes: %lu", static_cast<unsigned long>(kWeightBytes));
+    hw.seed.PrintLine("Weight source: %s", kUseSdramWeights ? "SDRAM copy" : "QSPI");
     hw.seed.PrintLine("Scratch bytes: %lu", static_cast<unsigned long>(kScratchBytes));
     hw.seed.PrintLine("Static total bytes: %lu", static_cast<unsigned long>(kTotalStaticBytes));
 }
@@ -705,7 +792,6 @@ void RunBenchmarkCase(const BenchmarkCase& bench_case, uint32_t cpu_hz) {
     hw.seed.PrintLine("Running case: %s", bench_case.name);
     hw.seed.PrintLine("Warmup/bench: %d / %d", kWarmupIters, kBenchIters);
 
-    // Warmup
     for(int i = 0; i < kWarmupIters; i++) {
         BaselineInfer(input, output);
     }
