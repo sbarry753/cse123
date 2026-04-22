@@ -32,4 +32,4 @@
 ### Reference
 - https://crazychickenguitarpedals.com/guitar-pedal-blog/guitar-pedal-builds/building-a-simple-distortion-pedal-based-on-the-electra-distortion/
 
-![Electra circuit](./images/modified_electra_distortion.png)
+![Electra circuit](./images/mod_electra_distortion.png)
