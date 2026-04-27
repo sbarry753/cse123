@@ -254,14 +254,21 @@
 			)
 			(embedded_fonts no)
 		)
-		(symbol "Connector_Audio:AudioJack2"
+		(symbol "Connector:TestPoint"
+			(pin_numbers
+				(hide yes)
+			)
+			(pin_names
+				(offset 0.762)
+				(hide yes)
+			)
 			(exclude_from_sim no)
 			(in_bom yes)
 			(on_board yes)
 			(in_pos_files yes)
 			(duplicate_pin_numbers_are_jumpers no)
-			(property "Reference" "J"
-				(at 0 8.89 0)
+			(property "Reference" "TP"
+				(at 0 6.858 0)
 				(show_name no)
 				(do_not_autoplace no)
 				(effects
@@ -270,8 +277,8 @@
 					)
 				)
 			)
-			(property "Value" "AudioJack2"
-				(at 0 6.35 0)
+			(property "Value" "TestPoint"
+				(at 0 5.08 0)
 				(show_name no)
 				(do_not_autoplace no)
 				(effects
@@ -281,7 +288,7 @@
 				)
 			)
 			(property "Footprint" ""
-				(at 0 0 0)
+				(at 5.08 0 0)
 				(show_name no)
 				(do_not_autoplace no)
 				(hide yes)
@@ -292,6 +299,17 @@
 				)
 			)
 			(property "Datasheet" ""
+				(at 5.08 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Description" "test point"
 				(at 0 0 0)
 				(show_name no)
 				(do_not_autoplace no)
@@ -302,7 +320,7 @@
 					)
 				)
 			)
-			(property "Description" "Audio Jack, 2 Poles (Mono / TS)"
+			(property "ki_keywords" "test point tp"
 				(at 0 0 0)
 				(show_name no)
 				(do_not_autoplace no)
@@ -313,7 +331,112 @@
 					)
 				)
 			)
-			(property "ki_keywords" "audio jack receptacle mono phone headphone TS connector"
+			(property "ki_fp_filters" "Pin* Test*"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(symbol "TestPoint_0_1"
+				(circle
+					(center 0 3.302)
+					(radius 0.762)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+			)
+			(symbol "TestPoint_1_1"
+				(pin passive line
+					(at 0 0 90)
+					(length 2.54)
+					(name "1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+			)
+			(embedded_fonts no)
+		)
+		(symbol "Connector_Audio:AudioJack2_Switch"
+			(exclude_from_sim no)
+			(in_bom yes)
+			(on_board yes)
+			(in_pos_files yes)
+			(duplicate_pin_numbers_are_jumpers no)
+			(property "Reference" "J"
+				(at 0 11.43 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Value" "AudioJack2_Switch"
+				(at 0 8.89 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Footprint" ""
+				(at 0 5.08 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Datasheet" ""
+				(at 0 5.08 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Description" "Audio Jack, 2 Poles (Mono / TS), Switched Pole (Normalling)"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "ki_keywords" "audio jack receptacle mono headphones phone TS connector"
 				(at 0 0 0)
 				(show_name no)
 				(do_not_autoplace no)
@@ -335,10 +458,10 @@
 					)
 				)
 			)
-			(symbol "AudioJack2_0_1"
+			(symbol "AudioJack2_Switch_0_1"
 				(rectangle
-					(start -3.81 0)
-					(end -2.54 -2.54)
+					(start -2.54 0)
+					(end -3.81 -2.54)
 					(stroke
 						(width 0.254)
 						(type default)
@@ -348,8 +471,8 @@
 					)
 				)
 				(rectangle
-					(start -2.54 3.81)
-					(end 2.54 -2.54)
+					(start 2.54 6.35)
+					(end -2.54 -3.81)
 					(stroke
 						(width 0.254)
 						(type default)
@@ -358,6 +481,8 @@
 						(type background)
 					)
 				)
+			)
+			(symbol "AudioJack2_Switch_1_1"
 				(polyline
 					(pts
 						(xy 0 0) (xy 0.635 -0.635) (xy 1.27 0) (xy 2.54 0)
@@ -372,7 +497,31 @@
 				)
 				(polyline
 					(pts
-						(xy 2.54 2.54) (xy -0.635 2.54) (xy -0.635 0) (xy -1.27 -0.635) (xy -1.905 0)
+						(xy 0.635 4.826) (xy 0.889 4.318)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy 1.778 -0.254) (xy 2.032 -0.762)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy 2.54 5.08) (xy -0.635 5.08) (xy -0.635 0) (xy -1.27 -0.635) (xy -1.905 0)
 					)
 					(stroke
 						(width 0.254)
@@ -382,8 +531,48 @@
 						(type none)
 					)
 				)
-			)
-			(symbol "AudioJack2_1_1"
+				(polyline
+					(pts
+						(xy 2.54 2.54) (xy 0.635 2.54) (xy 0.635 4.826) (xy 0.381 4.318)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy 2.54 -2.54) (xy 1.778 -2.54) (xy 1.778 -0.254) (xy 1.524 -0.762)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(pin passive line
+					(at 5.08 5.08 180)
+					(length 2.54)
+					(name ""
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "S"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
 				(pin passive line
 					(at 5.08 2.54 180)
 					(length 2.54)
@@ -394,7 +583,7 @@
 							)
 						)
 					)
-					(number "S"
+					(number "SN"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -413,6 +602,24 @@
 						)
 					)
 					(number "T"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin passive line
+					(at 5.08 -2.54 180)
+					(length 2.54)
+					(name ""
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "TN"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -1924,10 +2131,22 @@
 		)
 	)
 	(junction
+		(at 182.88 93.98)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "0d825bdd-9708-4186-88f4-bfeef717a18f")
+	)
+	(junction
 		(at 62.23 86.36)
 		(diameter 0)
 		(color 0 0 0 0)
 		(uuid "0eb2fc6f-0f77-4a90-8229-ec3fee4f083f")
+	)
+	(junction
+		(at 196.85 33.02)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "219a5c51-864e-4221-8a8c-0100fa24bdff")
 	)
 	(junction
 		(at 73.66 86.36)
@@ -1942,10 +2161,28 @@
 		(uuid "4af18e7c-aeb7-4d0f-a1d7-b5491d173009")
 	)
 	(junction
+		(at 182.88 88.9)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "50b33d63-32c3-4ee9-ad69-59bdf82d300b")
+	)
+	(junction
 		(at 116.84 114.3)
 		(diameter 0)
 		(color 0 0 0 0)
 		(uuid "6682370b-70db-4e94-8c7b-0b2c70a36ec3")
+	)
+	(junction
+		(at 120.65 88.9)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "832098ae-1812-4acf-805b-dd8c9ec77e02")
+	)
+	(junction
+		(at 46.99 86.36)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "8426ac5b-718b-4597-92e0-a68a4bd56b6f")
 	)
 	(junction
 		(at 149.86 88.9)
@@ -1960,6 +2197,12 @@
 		(uuid "9532f38f-6842-46c0-8bea-1a75eb0043b3")
 	)
 	(junction
+		(at 87.63 86.36)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "9d072838-a6a9-44de-b91e-8eae55b8602b")
+	)
+	(junction
 		(at 186.69 44.45)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -1972,6 +2215,12 @@
 		(uuid "ae8342fa-46f2-49e4-a658-638dc8e52eb8")
 	)
 	(junction
+		(at 45.72 91.44)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "b15cb625-991e-4e04-9835-b1eb6338a90d")
+	)
+	(junction
 		(at 186.69 48.26)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -1982,6 +2231,12 @@
 		(diameter 0)
 		(color 0 0 0 0)
 		(uuid "dcb2d942-3705-4d61-aa42-fb44ad29bcf7")
+	)
+	(junction
+		(at 199.39 44.45)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "f3b28ef1-34e2-4424-aaf7-57240490fb65")
 	)
 	(junction
 		(at 96.52 114.3)
@@ -2019,16 +2274,6 @@
 	)
 	(wire
 		(pts
-			(xy 45.72 88.9) (xy 45.72 92.71)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "0cf54806-55cc-4b1d-a0b7-0f7e75f21cb9")
-	)
-	(wire
-		(pts
 			(xy 201.93 44.45) (xy 201.93 45.72)
 		)
 		(stroke
@@ -2059,7 +2304,7 @@
 	)
 	(wire
 		(pts
-			(xy 83.82 86.36) (xy 96.52 86.36)
+			(xy 83.82 86.36) (xy 87.63 86.36)
 		)
 		(stroke
 			(width 0)
@@ -2109,7 +2354,7 @@
 	)
 	(wire
 		(pts
-			(xy 186.69 44.45) (xy 201.93 44.45)
+			(xy 186.69 44.45) (xy 199.39 44.45)
 		)
 		(stroke
 			(width 0)
@@ -2139,6 +2384,16 @@
 	)
 	(wire
 		(pts
+			(xy 44.45 91.44) (xy 45.72 91.44)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "454c79b6-c14a-45af-a5bc-2e184549e6b4")
+	)
+	(wire
+		(pts
 			(xy 101.6 78.74) (xy 101.6 81.28)
 		)
 		(stroke
@@ -2149,6 +2404,56 @@
 	)
 	(wire
 		(pts
+			(xy 182.88 93.98) (xy 182.88 95.25)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "4a4c0a21-00e4-465a-b71e-ae6645ca1114")
+	)
+	(wire
+		(pts
+			(xy 87.63 77.47) (xy 87.63 86.36)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "4b9cf117-9836-419b-92c2-9d742f26d70c")
+	)
+	(wire
+		(pts
+			(xy 182.88 86.36) (xy 182.88 88.9)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "544459dc-827d-4899-9a8f-31eee933149e")
+	)
+	(wire
+		(pts
+			(xy 182.88 91.44) (xy 182.88 93.98)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "54a83b0f-5f96-44e4-9d2c-319ca076ba9e")
+	)
+	(wire
+		(pts
+			(xy 182.88 88.9) (xy 184.15 88.9)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "5d70c5de-737a-4067-a18f-32d82ec75b47")
+	)
+	(wire
+		(pts
 			(xy 62.23 95.25) (xy 62.23 100.33)
 		)
 		(stroke
@@ -2156,6 +2461,16 @@
 			(type default)
 		)
 		(uuid "62585f75-bd1e-4966-8882-358068e98c07")
+	)
+	(wire
+		(pts
+			(xy 46.99 83.82) (xy 46.99 86.36)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "6916d9aa-b76f-458d-bc3b-bfadf52d340e")
 	)
 	(wire
 		(pts
@@ -2199,6 +2514,26 @@
 	)
 	(wire
 		(pts
+			(xy 196.85 33.02) (xy 200.66 33.02)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "7570c0ae-b365-494d-a40c-e9c4aead789a")
+	)
+	(wire
+		(pts
+			(xy 184.15 91.44) (xy 182.88 91.44)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "7731ccf6-faef-402c-87ca-7518ad65275f")
+	)
+	(wire
+		(pts
 			(xy 107.95 125.73) (xy 116.84 125.73)
 		)
 		(stroke
@@ -2216,6 +2551,16 @@
 			(type default)
 		)
 		(uuid "7de162c1-2876-469d-b376-65f0544531d5")
+	)
+	(wire
+		(pts
+			(xy 87.63 86.36) (xy 96.52 86.36)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "7e85a9e1-8198-49f9-911b-81374111460e")
 	)
 	(wire
 		(pts
@@ -2249,6 +2594,26 @@
 	)
 	(wire
 		(pts
+			(xy 44.45 88.9) (xy 45.72 88.9)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "8879a045-c4d0-4fc7-a46a-c67c032381f5")
+	)
+	(wire
+		(pts
+			(xy 44.45 83.82) (xy 46.99 83.82)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "93f683dc-e8f0-4fc3-9c17-5d023fb3eeb9")
+	)
+	(wire
+		(pts
 			(xy 73.66 86.36) (xy 78.74 86.36)
 		)
 		(stroke
@@ -2269,6 +2634,16 @@
 	)
 	(wire
 		(pts
+			(xy 45.72 91.44) (xy 45.72 92.71)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "95661243-2a9a-4fbf-9008-aabf7d538afa")
+	)
+	(wire
+		(pts
 			(xy 71.12 86.36) (xy 73.66 86.36)
 		)
 		(stroke
@@ -2276,6 +2651,16 @@
 			(type default)
 		)
 		(uuid "973e6a3b-a20a-4af3-8d5f-9a94389630c0")
+	)
+	(wire
+		(pts
+			(xy 120.65 80.01) (xy 120.65 88.9)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "977b8f01-4b3d-4049-875c-c6136f1124d0")
 	)
 	(wire
 		(pts
@@ -2299,6 +2684,26 @@
 	)
 	(wire
 		(pts
+			(xy 120.65 88.9) (xy 123.19 88.9)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "a374759c-f3c4-4679-897b-0f45229c8953")
+	)
+	(wire
+		(pts
+			(xy 44.45 86.36) (xy 46.99 86.36)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "a39f7b6e-189d-43cb-95c6-dde530e6f979")
+	)
+	(wire
+		(pts
 			(xy 111.76 88.9) (xy 116.84 88.9)
 		)
 		(stroke
@@ -2319,13 +2724,23 @@
 	)
 	(wire
 		(pts
-			(xy 186.69 33.02) (xy 200.66 33.02)
+			(xy 186.69 33.02) (xy 196.85 33.02)
 		)
 		(stroke
 			(width 0)
 			(type default)
 		)
 		(uuid "a63ad3d9-1b4c-464b-9d30-1fe3e0bccc41")
+	)
+	(wire
+		(pts
+			(xy 199.39 44.45) (xy 201.93 44.45)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "af444d4d-9f1f-4148-a2c3-859a8b6163c1")
 	)
 	(wire
 		(pts
@@ -2349,6 +2764,26 @@
 	)
 	(wire
 		(pts
+			(xy 45.72 88.9) (xy 45.72 91.44)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "b8359840-a648-466a-9b89-ca34d53f0252")
+	)
+	(wire
+		(pts
+			(xy 184.15 93.98) (xy 182.88 93.98)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "c28a1dc9-afcb-4045-b005-f330d9562bdf")
+	)
+	(wire
+		(pts
 			(xy 175.26 53.34) (xy 175.26 55.88)
 		)
 		(stroke
@@ -2369,16 +2804,6 @@
 	)
 	(wire
 		(pts
-			(xy 45.72 86.36) (xy 62.23 86.36)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "c801e37b-a36f-4a96-8e61-ccbc6b8244d9")
-	)
-	(wire
-		(pts
 			(xy 73.66 86.36) (xy 73.66 90.17)
 		)
 		(stroke
@@ -2389,16 +2814,6 @@
 	)
 	(wire
 		(pts
-			(xy 182.88 91.44) (xy 182.88 95.25)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "d41f0b16-f0a3-458e-9795-c0c29c6fbdc1")
-	)
-	(wire
-		(pts
 			(xy 96.52 91.44) (xy 96.52 114.3)
 		)
 		(stroke
@@ -2406,6 +2821,26 @@
 			(type default)
 		)
 		(uuid "d6484b8f-ed14-4f77-a02e-f84ed8607441")
+	)
+	(wire
+		(pts
+			(xy 184.15 86.36) (xy 182.88 86.36)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "d9744cad-b218-4507-bd36-7ad1fb56dfb3")
+	)
+	(wire
+		(pts
+			(xy 46.99 86.36) (xy 62.23 86.36)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "ddb43bc0-c4b3-4da6-80db-d443e9d65da1")
 	)
 	(wire
 		(pts
@@ -2449,7 +2884,7 @@
 	)
 	(wire
 		(pts
-			(xy 116.84 88.9) (xy 123.19 88.9)
+			(xy 116.84 88.9) (xy 120.65 88.9)
 		)
 		(stroke
 			(width 0)
@@ -2531,7 +2966,7 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 73.66 92.71 0)
 			(hide yes)
 			(show_name no)
@@ -2613,7 +3048,7 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 149.86 91.44 0)
 			(hide yes)
 			(show_name no)
@@ -2876,7 +3311,7 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 186.69 53.34 0)
 			(hide yes)
 			(show_name no)
@@ -2925,8 +3360,8 @@
 		)
 	)
 	(symbol
-		(lib_id "Connector_Audio:AudioJack2")
-		(at 187.96 88.9 180)
+		(lib_id "Connector:TestPoint")
+		(at 125.73 52.07 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -2934,31 +3369,32 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "38b522f2-f105-4d99-9b41-c4ad566b64dd")
-		(property "Reference" "J2"
-			(at 193.04 88.2649 0)
+		(fields_autoplaced yes)
+		(uuid "3a9d2dc0-51f5-417f-a90a-04d83debe4ae")
+		(property "Reference" "TP2"
+			(at 128.27 47.4979 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
 				)
-				(justify right)
+				(justify left)
 			)
 		)
-		(property "Value" "AudioJack2"
-			(at 193.04 90.8049 0)
+		(property "Value" "TP_GND"
+			(at 128.27 50.0379 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
 				)
-				(justify right)
+				(justify left)
 			)
 		)
-		(property "Footprint" ""
-			(at 187.96 88.9 0)
+		(property "Footprint" "TestPoint:TestPoint_Loop_D3.50mm_Drill0.9mm_Beaded"
+			(at 130.81 52.07 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -2969,7 +3405,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 187.96 88.9 0)
+			(at 130.81 52.07 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -2979,8 +3415,8 @@
 				)
 			)
 		)
-		(property "Description" "Audio Jack, 2 Poles (Mono / TS)"
-			(at 187.96 88.9 0)
+		(property "Description" "test point"
+			(at 125.73 52.07 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -2990,16 +3426,13 @@
 				)
 			)
 		)
-		(pin "S"
-			(uuid "8e66b675-d95d-4b88-9983-82ea9c3b2107")
-		)
-		(pin "T"
-			(uuid "006e5884-8e50-4ecd-9f50-899776830d69")
+		(pin "1"
+			(uuid "98d88796-8bf3-4995-afb8-461331ecff9e")
 		)
 		(instances
 			(project "preamp"
 				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
-					(reference "J2")
+					(reference "TP2")
 					(unit 1)
 				)
 			)
@@ -3095,7 +3528,7 @@
 		(dnp no)
 		(fields_autoplaced yes)
 		(uuid "551c20c5-ec3b-4ea5-bfda-89070c1c55a7")
-		(property "Reference" "R1"
+		(property "Reference" "R3"
 			(at 81.28 80.01 90)
 			(show_name no)
 			(do_not_autoplace no)
@@ -3115,7 +3548,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 81.28 86.36 0)
 			(hide yes)
 			(show_name no)
@@ -3157,7 +3590,7 @@
 		(instances
 			(project "preamp"
 				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
-					(reference "R1")
+					(reference "R3")
 					(unit 1)
 				)
 			)
@@ -3197,7 +3630,7 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Connector_PinSocket_2.54mm:PinSocket_1x02_P2.54mm_Vertical"
 			(at 153.67 40.386 90)
 			(hide yes)
 			(show_name no)
@@ -3435,6 +3868,85 @@
 		)
 	)
 	(symbol
+		(lib_id "Connector:TestPoint")
+		(at 199.39 44.45 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "6833648c-c69a-4dfe-97cf-bf9019727434")
+		(property "Reference" "TP7"
+			(at 201.93 39.8779 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "TP_4.5V"
+			(at 201.93 42.4179 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "TestPoint:TestPoint_Loop_D3.50mm_Drill0.9mm_Beaded"
+			(at 204.47 44.45 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 204.47 44.45 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "test point"
+			(at 199.39 44.45 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "ca7a40b9-036a-4015-a699-04d62655f75c")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "TP7")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
 		(lib_id "power:GNDREF")
 		(at 45.72 92.71 0)
 		(unit 1)
@@ -3507,6 +4019,84 @@
 			(project "preamp"
 				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
 					(reference "#PWR010")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GNDREF")
+		(at 113.03 52.07 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "825918b1-fca1-4bf0-9540-8722d3e42b2a")
+		(property "Reference" "#PWR013"
+			(at 113.03 58.42 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "GNDREF"
+			(at 113.03 57.15 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 113.03 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 113.03 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"GNDREF\" , reference supply ground"
+			(at 113.03 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "5b59f047-7d62-4b58-a515-4eb0cd4f5f29")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "#PWR013")
 					(unit 1)
 				)
 			)
@@ -3591,6 +4181,84 @@
 		)
 	)
 	(symbol
+		(lib_id "power:GNDREF")
+		(at 99.06 52.07 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "85dafd31-8ee5-409e-9c0c-4b4b3b9625d0")
+		(property "Reference" "#PWR012"
+			(at 99.06 58.42 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "GNDREF"
+			(at 99.06 57.15 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 99.06 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 99.06 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"GNDREF\" , reference supply ground"
+			(at 99.06 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "078e5689-13c9-4218-8268-292a10243525")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "#PWR012")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
 		(lib_id "Device:C_Small")
 		(at 68.58 86.36 90)
 		(unit 1)
@@ -3622,7 +4290,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Capacitor_THT:CP_Radial_D8.0mm_P3.80mm"
 			(at 68.58 86.36 0)
 			(hide yes)
 			(show_name no)
@@ -3702,7 +4370,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Capacitor_THT:CP_Radial_D8.0mm_P3.80mm"
 			(at 60.96 125.73 0)
 			(hide yes)
 			(show_name no)
@@ -3783,7 +4451,7 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Capacitor_THT:CP_Radial_D8.0mm_P3.80mm"
 			(at 175.26 50.8 0)
 			(hide yes)
 			(show_name no)
@@ -3865,7 +4533,7 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 186.69 38.1 0)
 			(hide yes)
 			(show_name no)
@@ -3945,7 +4613,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 138.43 88.9 0)
 			(hide yes)
 			(show_name no)
@@ -3994,6 +4662,85 @@
 		)
 	)
 	(symbol
+		(lib_id "Connector:TestPoint")
+		(at 139.7 52.07 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "a7d47336-4bf7-4f54-8965-73b7c2be80aa")
+		(property "Reference" "TP1"
+			(at 142.24 47.4979 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "TP_GND"
+			(at 142.24 50.0379 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "TestPoint:TestPoint_Loop_D3.50mm_Drill0.9mm_Beaded"
+			(at 144.78 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 144.78 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "test point"
+			(at 139.7 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "52018eb3-ad02-401e-b48a-19f3138cf516")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "TP1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
 		(lib_id "Device:C_Small")
 		(at 104.14 114.3 90)
 		(unit 1)
@@ -4025,7 +4772,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Capacitor_THT:CP_Radial_D8.0mm_P3.80mm"
 			(at 104.14 114.3 0)
 			(hide yes)
 			(show_name no)
@@ -4085,7 +4832,7 @@
 		(dnp no)
 		(fields_autoplaced yes)
 		(uuid "ae19a33c-a7a5-4247-8ae3-52ca1ddeecb9")
-		(property "Reference" "R3"
+		(property "Reference" "R1"
 			(at 64.77 91.4399 0)
 			(show_name no)
 			(do_not_autoplace no)
@@ -4107,7 +4854,7 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 62.23 92.71 0)
 			(hide yes)
 			(show_name no)
@@ -4149,7 +4896,85 @@
 		(instances
 			(project "preamp"
 				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
-					(reference "R3")
+					(reference "R1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GNDREF")
+		(at 139.7 52.07 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "b15c557e-02b8-462d-bca6-c08b1b1e3a08")
+		(property "Reference" "#PWR015"
+			(at 139.7 58.42 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "GNDREF"
+			(at 139.7 57.15 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 139.7 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 139.7 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"GNDREF\" , reference supply ground"
+			(at 139.7 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "93b4db15-f4f7-4236-b871-4d7c91dd5b92")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "#PWR015")
 					(unit 1)
 				)
 			)
@@ -4234,6 +5059,84 @@
 		)
 	)
 	(symbol
+		(lib_id "Connector:TestPoint")
+		(at 196.85 33.02 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "b52c9242-f8b2-4045-911e-0fa6864063b5")
+		(property "Reference" "TP8"
+			(at 199.39 28.4479 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "TP_9V"
+			(at 199.39 30.9879 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" ""
+			(at 201.93 33.02 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 201.93 33.02 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "test point"
+			(at 196.85 33.02 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "bcdcdaec-555a-418e-994f-77615ece58dc")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "TP8")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
 		(lib_id "Device:R_Small_US")
 		(at 73.66 125.73 90)
 		(unit 1)
@@ -4265,7 +5168,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 73.66 125.73 0)
 			(hide yes)
 			(show_name no)
@@ -4314,6 +5217,171 @@
 		)
 	)
 	(symbol
+		(lib_id "Connector_Audio:AudioJack2_Switch")
+		(at 39.37 86.36 0)
+		(mirror x)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "baa67a24-cf3f-4ca2-9502-6010124e1700")
+		(property "Reference" "J1"
+			(at 38.735 97.79 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "AudioJack2_Switch"
+			(at 38.735 95.25 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" "Connector_Audio:Jack_6.35mm_Neutrik_NMJ4HCD2_Horizontal"
+			(at 39.37 91.44 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 39.37 91.44 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Audio Jack, 2 Poles (Mono / TS), Switched Pole (Normalling)"
+			(at 39.37 86.36 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "S"
+			(uuid "f9895616-24d5-4349-9e9c-6c66f4443e5e")
+		)
+		(pin "SN"
+			(uuid "542e954b-9b9a-41fd-be55-28d0c7b4370e")
+		)
+		(pin "TN"
+			(uuid "9c1935f2-a2e5-43fb-bd47-184ab7bddba7")
+		)
+		(pin "T"
+			(uuid "b36d7967-3645-495d-9b6f-bcba48e69c29")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "J1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Connector:TestPoint")
+		(at 87.63 77.47 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "bb19302f-c67a-43c3-8742-e29cbfa4e11e")
+		(property "Reference" "TP5"
+			(at 90.17 72.8979 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "TP_PREAMP"
+			(at 90.17 75.4379 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "TestPoint:TestPoint_Loop_D3.50mm_Drill0.9mm_Beaded"
+			(at 92.71 77.47 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 92.71 77.47 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "test point"
+			(at 87.63 77.47 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "91c56bdc-1da6-4e8a-a6d2-e3e54c0319f3")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "TP5")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
 		(lib_id "Device:R_Potentiometer_US")
 		(at 88.9 125.73 90)
 		(unit 1)
@@ -4345,7 +5413,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical"
 			(at 88.9 125.73 0)
 			(hide yes)
 			(show_name no)
@@ -4424,6 +5492,91 @@
 			(project "preamp"
 				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
 					(reference "RV1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Connector_Audio:AudioJack2_Switch")
+		(at 189.23 88.9 180)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "c2cecd08-3646-4978-850b-f670f2c8e2be")
+		(property "Reference" "J2"
+			(at 189.865 100.33 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "AudioJack2_Switch"
+			(at 189.865 97.79 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" "Connector_Audio:Jack_6.35mm_Neutrik_NMJ4HCD2_Horizontal"
+			(at 189.23 93.98 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 189.23 93.98 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Audio Jack, 2 Poles (Mono / TS), Switched Pole (Normalling)"
+			(at 189.23 88.9 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "S"
+			(uuid "af75a408-d5a9-4d4b-bd7d-6473ebb570a1")
+		)
+		(pin "SN"
+			(uuid "bb1830e5-938a-4224-8d79-4ef79243aa38")
+		)
+		(pin "TN"
+			(uuid "8025acc7-b4d8-46a4-8374-3ba5712410e1")
+		)
+		(pin "T"
+			(uuid "73309598-5367-4560-99e4-f5113d8b5404")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "J2")
 					(unit 1)
 				)
 			)
@@ -4664,9 +5817,8 @@
 		)
 	)
 	(symbol
-		(lib_id "Connector_Audio:AudioJack2")
-		(at 40.64 86.36 0)
-		(mirror x)
+		(lib_id "Connector:TestPoint")
+		(at 99.06 52.07 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -4675,31 +5827,31 @@
 		(in_pos_files yes)
 		(dnp no)
 		(fields_autoplaced yes)
-		(uuid "d91fa8ad-21e5-4fcf-8d0a-218993db7040")
-		(property "Reference" "J1"
-			(at 35.56 85.7249 0)
+		(uuid "d11e89fc-2d69-4390-bc28-c856bb90fdc1")
+		(property "Reference" "TP4"
+			(at 101.6 47.4979 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
 				)
-				(justify right)
+				(justify left)
 			)
 		)
-		(property "Value" "AudioJack2"
-			(at 35.56 88.2649 0)
+		(property "Value" "TP_GND"
+			(at 101.6 50.0379 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
 				)
-				(justify right)
+				(justify left)
 			)
 		)
-		(property "Footprint" ""
-			(at 40.64 86.36 0)
+		(property "Footprint" "TestPoint:TestPoint_Loop_D3.50mm_Drill0.9mm_Beaded"
+			(at 104.14 52.07 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -4710,7 +5862,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 40.64 86.36 0)
+			(at 104.14 52.07 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -4720,8 +5872,8 @@
 				)
 			)
 		)
-		(property "Description" "Audio Jack, 2 Poles (Mono / TS)"
-			(at 40.64 86.36 0)
+		(property "Description" "test point"
+			(at 99.06 52.07 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -4731,16 +5883,92 @@
 				)
 			)
 		)
-		(pin "S"
-			(uuid "de9e5e20-8505-4c17-8967-a164eb309825")
-		)
-		(pin "T"
-			(uuid "0d9f6c60-1aae-4de8-9dd4-20248fa2dfb2")
+		(pin "1"
+			(uuid "272c876c-132c-4b6d-bd3b-5803219b1e79")
 		)
 		(instances
 			(project "preamp"
 				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
-					(reference "J1")
+					(reference "TP4")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Connector:TestPoint")
+		(at 113.03 52.07 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "e7589080-8b69-4abd-aff5-dc58d5a8b6d7")
+		(property "Reference" "TP3"
+			(at 115.57 47.4979 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "TP_GND"
+			(at 115.57 50.0379 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "TestPoint:TestPoint_Loop_D3.50mm_Drill0.9mm_Beaded"
+			(at 118.11 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 118.11 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "test point"
+			(at 113.03 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "dfaca51e-f3c2-4d98-8f96-be6b64ee619f")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "TP3")
 					(unit 1)
 				)
 			)
@@ -4778,7 +6006,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0414_L11.9mm_D4.5mm_P15.24mm_Horizontal"
 			(at 105.41 125.73 0)
 			(hide yes)
 			(show_name no)
@@ -4936,7 +6164,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Capacitor_THT:CP_Radial_D8.0mm_P3.80mm"
 			(at 125.73 88.9 0)
 			(hide yes)
 			(show_name no)
@@ -5016,7 +6244,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Package_DIP:DIP-8_W7.62mm_LongPads"
 			(at 105.41 87.63 0)
 			(hide yes)
 			(show_name no)
@@ -5077,6 +6305,163 @@
 			(project "preamp"
 				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
 					(reference "U1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GNDREF")
+		(at 125.73 52.07 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "fa89505f-7da4-4e05-b844-472b7840f9fc")
+		(property "Reference" "#PWR014"
+			(at 125.73 58.42 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "GNDREF"
+			(at 125.73 57.15 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 125.73 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 125.73 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"GNDREF\" , reference supply ground"
+			(at 125.73 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "bf88472f-ae38-48e9-8b7e-fed35ddea8b3")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "#PWR014")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Connector:TestPoint")
+		(at 120.65 80.01 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "fe705caa-1646-434b-a44a-eaa2040c2bf1")
+		(property "Reference" "TP6"
+			(at 123.19 75.4379 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "TP_POSTAMP"
+			(at 123.19 77.9779 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "TestPoint:TestPoint_Loop_D3.50mm_Drill0.9mm_Beaded"
+			(at 125.73 80.01 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 125.73 80.01 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "test point"
+			(at 120.65 80.01 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "9faa62ca-b51f-4dc5-b8c8-fb4e83a57138")
+		)
+		(instances
+			(project "preamp"
+				(path "/a39de2f7-c25e-4f26-96f4-587ac98692b1"
+					(reference "TP6")
 					(unit 1)
 				)
 			)
