@@ -5369,7 +5369,7 @@
 	(footprint "Connector_Audio:Jack_6.35mm_Neutrik_NMJ6HCD2_Horizontal"
 		(layer "F.Cu")
 		(uuid "b124e265-b0eb-4bc1-946a-9f4a4f7241a9")
-		(at 143.385 72.305)
+		(at 72.565 69.885)
 		(descr "M Series, 6.35mm (1/4in) stereo jack, switched, with chrome ferrule and straight PCB pins, https://www.neutrik.com/en/product/nmj6hcd2")
 		(tags "neutrik jack m")
 		(property "Reference" "J3"
@@ -5839,7 +5839,7 @@
 	(footprint "Connector_Audio:Jack_6.35mm_Neutrik_NMJ4HCD2_Horizontal"
 		(layer "F.Cu")
 		(uuid "b184518c-aa04-4364-bbda-7afc1a2ce2e1")
-		(at 143.385 51.025)
+		(at 179.565 64.885)
 		(descr "M Series, 6.35mm (1/4in) mono jack, switched, with chrome ferrule and straight PCB pins, https://www.neutrik.com/en/product/nmj4hcd2")
 		(tags "neutrik jack m")
 		(property "Reference" "J2"
@@ -8132,6 +8132,30 @@
 			(rotate
 				(xyz 0 0 0)
 			)
+		)
+	)
+	(gr_text "INPUT"
+		(at 78 64 0)
+		(layer "F.SilkS")
+		(uuid "31de9625-faef-4ce3-838a-cd6a14ec6fac")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.1)
+			)
+			(justify left bottom)
+		)
+	)
+	(gr_text "OUTPUT"
+		(at 183 59 0)
+		(layer "F.SilkS")
+		(uuid "f52f39fb-d134-4653-9599-6f2614488a30")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.1)
+			)
+			(justify left bottom)
 		)
 	)
 	(embedded_fonts no)
