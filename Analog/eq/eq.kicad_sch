@@ -1127,6 +1127,276 @@
 			)
 			(embedded_fonts no)
 		)
+		(symbol "Device:Battery"
+			(pin_numbers
+				(hide yes)
+			)
+			(pin_names
+				(offset 0)
+				(hide yes)
+			)
+			(exclude_from_sim no)
+			(in_bom yes)
+			(on_board yes)
+			(in_pos_files yes)
+			(duplicate_pin_numbers_are_jumpers no)
+			(property "Reference" "BT"
+				(at 2.54 2.54 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(justify left)
+				)
+			)
+			(property "Value" "Battery"
+				(at 2.54 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(justify left)
+				)
+			)
+			(property "Footprint" ""
+				(at 0 1.524 90)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Datasheet" ""
+				(at 0 1.524 90)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Description" "Multiple-cell battery"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Sim.Device" "V"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Sim.Type" "DC"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Sim.Pins" "1=+ 2=-"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "ki_keywords" "batt voltage-source cell"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(symbol "Battery_0_1"
+				(rectangle
+					(start -2.286 1.778)
+					(end 2.286 1.524)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type outline)
+					)
+				)
+				(rectangle
+					(start -2.286 -1.27)
+					(end 2.286 -1.524)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type outline)
+					)
+				)
+				(rectangle
+					(start -1.524 1.016)
+					(end 1.524 0.508)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type outline)
+					)
+				)
+				(rectangle
+					(start -1.524 -2.032)
+					(end 1.524 -2.54)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type outline)
+					)
+				)
+				(polyline
+					(pts
+						(xy 0 1.778) (xy 0 2.54)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy 0 0) (xy 0 0.254)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy 0 -0.508) (xy 0 -0.254)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy 0 -1.016) (xy 0 -0.762)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy 0.762 3.048) (xy 1.778 3.048)
+					)
+					(stroke
+						(width 0.254)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy 1.27 3.556) (xy 1.27 2.54)
+					)
+					(stroke
+						(width 0.254)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+			)
+			(symbol "Battery_1_1"
+				(pin passive line
+					(at 0 5.08 270)
+					(length 2.54)
+					(name "+"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin passive line
+					(at 0 -5.08 90)
+					(length 2.54)
+					(name "-"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "2"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+			)
+			(embedded_fonts no)
+		)
 		(symbol "Device:C_Polarized_Small_US"
 			(pin_numbers
 				(hide yes)
@@ -2477,6 +2747,12 @@
 		(uuid "da0968b3-36f7-41bd-9ee8-e5c9ef275e0c")
 	)
 	(junction
+		(at 24.13 38.1)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "e0400967-c7ee-4b77-99f2-4e96016597cb")
+	)
+	(junction
 		(at 165.1 106.68)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -3616,6 +3892,16 @@
 	)
 	(wire
 		(pts
+			(xy 24.13 48.26) (xy 24.13 49.53)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "d919936e-511b-4157-aa9a-b498a5c60c27")
+	)
+	(wire
+		(pts
 			(xy 72.39 87.63) (xy 72.39 97.79)
 		)
 		(stroke
@@ -3983,6 +4269,121 @@
 					(size 1.27 1.27)
 				)
 				(justify right)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:Battery")
+		(at 24.13 43.18 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "0a627667-29c7-46ca-8456-bb7494dad471")
+		(property "Reference" "BT1"
+			(at 27.94 41.3384 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "Battery"
+			(at 27.94 43.8784 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"
+			(at 24.13 41.656 90)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 24.13 41.656 90)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Multiple-cell battery"
+			(at 24.13 43.18 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Sim.Device" "V"
+			(at 24.13 43.18 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Sim.Type" "DC"
+			(at 24.13 43.18 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Sim.Pins" "1=+ 2=-"
+			(at 24.13 43.18 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "679cc9d7-7d2f-449e-9c9f-00c895c09df8")
+		)
+		(pin "2"
+			(uuid "7fe67952-a767-4da5-aa4a-e7ed15c88e85")
+		)
+		(instances
+			(project "eq"
+				(path "/0921fd0c-b2d9-4cb6-9d95-31ba2d6d2c5d"
+					(reference "BT1")
+					(unit 1)
+				)
 			)
 		)
 	)
@@ -6576,28 +6977,28 @@
 			)
 		)
 		(pin "2"
-			(uuid "595afa80-a6af-432e-a311-27f8cc9a6ce0")
+			(uuid "595afa80-a6af-432e-a311-27f8cc9a6ce1")
 		)
 		(pin "8"
-			(uuid "a8726e88-096c-4ca8-9f23-677f873f5dab")
+			(uuid "a8726e88-096c-4ca8-9f23-677f873f5dac")
 		)
 		(pin "4"
-			(uuid "61780214-bf92-4f72-b918-8f21f64dcf81")
+			(uuid "61780214-bf92-4f72-b918-8f21f64dcf82")
 		)
 		(pin "6"
-			(uuid "fb0927ef-750a-4608-aba8-b78006a4b9ce")
+			(uuid "fb0927ef-750a-4608-aba8-b78006a4b9cf")
 		)
 		(pin "5"
-			(uuid "982ef7ec-e41b-43dc-bcc1-aaf4d52a1cb2")
+			(uuid "982ef7ec-e41b-43dc-bcc1-aaf4d52a1cb3")
 		)
 		(pin "7"
-			(uuid "7a67de4a-9c53-4c47-8289-840a9ab6575a")
+			(uuid "7a67de4a-9c53-4c47-8289-840a9ab6575b")
 		)
 		(pin "1"
-			(uuid "78374ee1-1502-4021-b81f-ed52de50dc26")
+			(uuid "78374ee1-1502-4021-b81f-ed52de50dc27")
 		)
 		(pin "3"
-			(uuid "e17bf8dd-62f9-4a8c-be95-43a8ba86864e")
+			(uuid "e17bf8dd-62f9-4a8c-be95-43a8ba86864f")
 		)
 		(instances
 			(project "eq"
@@ -7164,6 +7565,84 @@
 		)
 	)
 	(symbol
+		(lib_id "power:GND")
+		(at 24.13 49.53 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "b6a2e3f9-a108-442e-8361-9bc2ff0fcb5f")
+		(property "Reference" "#PWR014"
+			(at 24.13 55.88 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 24.13 54.61 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 24.13 49.53 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 24.13 49.53 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
+			(at 24.13 49.53 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "90eb54dd-dc17-4222-8c80-a27d0c7bb1bf")
+		)
+		(instances
+			(project "eq"
+				(path "/0921fd0c-b2d9-4cb6-9d95-31ba2d6d2c5d"
+					(reference "#PWR014")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
 		(lib_id "Device:C_Polarized_Small_US")
 		(at 245.11 82.55 90)
 		(unit 1)
@@ -7386,28 +7865,28 @@
 			)
 		)
 		(pin "7"
-			(uuid "8a1aabda-e41e-41d8-a903-f3a2ade0fa53")
+			(uuid "8a1aabda-e41e-41d8-a903-f3a2ade0fa54")
 		)
 		(pin "2"
-			(uuid "5ed3ff62-ddfd-4b8d-a99d-5beb6a6e091e")
+			(uuid "5ed3ff62-ddfd-4b8d-a99d-5beb6a6e091f")
 		)
 		(pin "1"
-			(uuid "3039fb79-2881-4b84-81a8-3cc2cc7d3991")
+			(uuid "3039fb79-2881-4b84-81a8-3cc2cc7d3992")
 		)
 		(pin "3"
-			(uuid "81840d58-c0aa-43d2-9f0b-06dc3a5ef9a3")
+			(uuid "81840d58-c0aa-43d2-9f0b-06dc3a5ef9a4")
 		)
 		(pin "8"
-			(uuid "f7d9fbdf-6b1c-454a-964c-accd49cc9148")
+			(uuid "f7d9fbdf-6b1c-454a-964c-accd49cc9149")
 		)
 		(pin "4"
-			(uuid "ebaa0b3d-c1d8-4612-957d-db71b18f02b4")
+			(uuid "ebaa0b3d-c1d8-4612-957d-db71b18f02b5")
 		)
 		(pin "6"
-			(uuid "7bd4abe7-ad1d-4d55-807e-0c64df19f6fa")
+			(uuid "7bd4abe7-ad1d-4d55-807e-0c64df19f6fb")
 		)
 		(pin "5"
-			(uuid "d462094a-1965-45da-93b7-1f18ed76a9da")
+			(uuid "d462094a-1965-45da-93b7-1f18ed76a9db")
 		)
 		(instances
 			(project "eq"
@@ -8044,28 +8523,28 @@
 			)
 		)
 		(pin "7"
-			(uuid "8a1aabda-e41e-41d8-a903-f3a2ade0fa53")
+			(uuid "8a1aabda-e41e-41d8-a903-f3a2ade0fa55")
 		)
 		(pin "2"
-			(uuid "5ed3ff62-ddfd-4b8d-a99d-5beb6a6e091e")
+			(uuid "5ed3ff62-ddfd-4b8d-a99d-5beb6a6e0920")
 		)
 		(pin "1"
-			(uuid "3039fb79-2881-4b84-81a8-3cc2cc7d3991")
+			(uuid "3039fb79-2881-4b84-81a8-3cc2cc7d3993")
 		)
 		(pin "3"
-			(uuid "81840d58-c0aa-43d2-9f0b-06dc3a5ef9a3")
+			(uuid "81840d58-c0aa-43d2-9f0b-06dc3a5ef9a5")
 		)
 		(pin "8"
-			(uuid "f7d9fbdf-6b1c-454a-964c-accd49cc9148")
+			(uuid "f7d9fbdf-6b1c-454a-964c-accd49cc914a")
 		)
 		(pin "4"
-			(uuid "ebaa0b3d-c1d8-4612-957d-db71b18f02b4")
+			(uuid "ebaa0b3d-c1d8-4612-957d-db71b18f02b6")
 		)
 		(pin "6"
-			(uuid "7bd4abe7-ad1d-4d55-807e-0c64df19f6fa")
+			(uuid "7bd4abe7-ad1d-4d55-807e-0c64df19f6fc")
 		)
 		(pin "5"
-			(uuid "d462094a-1965-45da-93b7-1f18ed76a9da")
+			(uuid "d462094a-1965-45da-93b7-1f18ed76a9dc")
 		)
 		(instances
 			(project "eq"
@@ -8224,28 +8703,28 @@
 			)
 		)
 		(pin "2"
-			(uuid "595afa80-a6af-432e-a311-27f8cc9a6ce0")
+			(uuid "595afa80-a6af-432e-a311-27f8cc9a6ce2")
 		)
 		(pin "8"
-			(uuid "a8726e88-096c-4ca8-9f23-677f873f5dab")
+			(uuid "a8726e88-096c-4ca8-9f23-677f873f5dad")
 		)
 		(pin "4"
-			(uuid "61780214-bf92-4f72-b918-8f21f64dcf81")
+			(uuid "61780214-bf92-4f72-b918-8f21f64dcf83")
 		)
 		(pin "6"
-			(uuid "fb0927ef-750a-4608-aba8-b78006a4b9ce")
+			(uuid "fb0927ef-750a-4608-aba8-b78006a4b9d0")
 		)
 		(pin "5"
-			(uuid "982ef7ec-e41b-43dc-bcc1-aaf4d52a1cb2")
+			(uuid "982ef7ec-e41b-43dc-bcc1-aaf4d52a1cb4")
 		)
 		(pin "7"
-			(uuid "7a67de4a-9c53-4c47-8289-840a9ab6575a")
+			(uuid "7a67de4a-9c53-4c47-8289-840a9ab6575c")
 		)
 		(pin "1"
-			(uuid "78374ee1-1502-4021-b81f-ed52de50dc26")
+			(uuid "78374ee1-1502-4021-b81f-ed52de50dc28")
 		)
 		(pin "3"
-			(uuid "e17bf8dd-62f9-4a8c-be95-43a8ba86864e")
+			(uuid "e17bf8dd-62f9-4a8c-be95-43a8ba868650")
 		)
 		(instances
 			(project "eq"
