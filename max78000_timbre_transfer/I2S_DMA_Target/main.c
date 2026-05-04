@@ -137,33 +137,28 @@ void codec_init(void)
     if (max9867_init(CODEC_I2C, CODEC_MCLOCK, 1) != E_NO_ERROR)
         blink_halt("Error initializing MAX9867 CODEC");
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     if (max9867_enable_playback(1) != E_NO_ERROR)
         blink_halt("Error enabling playback path");
 
     printf("max9867_enable_playback() successful exit\n");
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     if (max9867_playback_volume(-6, -6) != E_NO_ERROR)
         blink_halt("Error setting playback volume");
 
     printf("max9867_playback_volume() successful exit\n");
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     if (max9867_enable_record(1) != E_NO_ERROR)
         blink_halt("Error enabling record path");
 
     printf("max9867_enable_record() successful exit\n");
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     if (max9867_adc_level(-12, -12) != E_NO_ERROR)
         blink_halt("Error setting ADC level");
 
     printf("max9867_adc_level() successful exit\n");
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     if (max9867_linein_gain(-6, -6) != E_NO_ERROR)
         blink_halt("Error setting Line-In gain");

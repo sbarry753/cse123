@@ -56,6 +56,8 @@
 
 #define MHZ(N) (N * 1000000)
 
+#define I2C_DELAY_MS 1 
+
 static mxc_i2c_req_t i2c_req;
 
 static int reg_write(uint8_t reg, uint8_t val)
@@ -66,7 +68,9 @@ static int reg_write(uint8_t reg, uint8_t val)
     i2c_req.tx_len = sizeof(buf);
     i2c_req.rx_len = 0;
 
-    return MXC_I2C_MasterTransaction(&i2c_req);
+    int err = MXC_I2C_MasterTransaction(&i2c_req);
+    MXC_Delay(MXC_DELAY_MSEC(I2C_DELAY_MS));
+    return err;
 }
 
 static int reg_read(uint8_t reg, uint8_t *dest)
@@ -78,7 +82,9 @@ static int reg_read(uint8_t reg, uint8_t *dest)
     i2c_req.rx_buf = dest;
     i2c_req.rx_len = 1;
 
-    return MXC_I2C_MasterTransaction(&i2c_req);
+    int err = MXC_I2C_MasterTransaction(&i2c_req);
+    MXC_Delay(MXC_DELAY_MSEC(I2C_DELAY_MS));
+    return err;
 }
 
 static int reg_update(uint8_t reg, uint8_t mask, uint8_t val)
@@ -91,8 +97,6 @@ static int reg_update(uint8_t reg, uint8_t mask, uint8_t val)
 
     tmp &= ~mask;
     tmp |= val & mask;
-
-    MXC_Delay(MXC_DELAY_MSEC(50));
 
     return reg_write(reg, tmp);
 }
@@ -157,7 +161,6 @@ int max9867_linein_mute(int left, int right)
     if ((err = reg_update(MAX9867_0E_LVL_LINE_IN_LEFT, 0x40, !!left << 6)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(50));
     
     return reg_update(MAX9867_0F_LVL_LINE_IN_RIGHT, 0x40, !!right << 6);
 }
@@ -173,7 +176,6 @@ int max9867_linein_gain(int left, int right)
     if ((err = reg_update(MAX9867_0E_LVL_LINE_IN_LEFT, 0x0F, ligl)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(50));
 
     return reg_update(MAX9867_0F_LVL_LINE_IN_RIGHT, 0x0F, ligr);
 }
@@ -225,7 +227,6 @@ int max9867_playback_volume(float left, float right)
     if ((err = reg_update(MAX9867_10_VOL_LEFT, 0x3F, voll)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(50));
 
     return reg_update(MAX9867_11_VOL_RIGHT, 0x3F, volr);
 }
@@ -314,20 +315,18 @@ int max9867_enable_playback(int stereo)
     if (!i2c_req.i2c)
         return E_NULL_PTR;
 
-    MXC_Delay(MXC_DELAY_MSEC(3000));
-
     if ((err = max9867_headphone_mode(HPMODE_STEREO_SE_CLICKLESS)) != E_NO_ERROR) {
         for (int i=1;(i<5);++i) {
-            MXC_Delay(MXC_DELAY_MSEC(3000));
+            MXC_Delay(MXC_DELAY_MSEC(i*100));
             err = max9867_headphone_mode(HPMODE_STEREO_SE_CLICKLESS);
 
             if (err != E_BUSY) {
                 break;
             }
             
-            if (i == 9) {
+            if (i == 4) {
                 printf("max9867_enable_playback(): set headphone TIMEOUT, err %d \n", err);
-                //return err;
+                return err;
             }
         }
     }
@@ -340,20 +339,17 @@ int max9867_enable_playback(int stereo)
     }
 
 
-    MXC_Delay(MXC_DELAY_MSEC(100));
 
     if ((err = max9867_playback_volume(0, 0)) != E_NO_ERROR) {
         printf("max9867_enable_playback(): set playback volume MXC_Error %d\n");
         return err;
     }
 
-    MXC_Delay(MXC_DELAY_MSEC(100));
 
     /* Assert SHDN as first step in toggling SHDN when changing enabled circuitry */
     if ((err = reg_update(MAX9867_17_PWR_SYS, 0x80, 0x00)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(100));
 
     en = EN_LEFT_DAC;
     if (stereo)
@@ -374,20 +370,16 @@ int max9867_enable_record(int stereo)
         E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(50));
     if ((err = max9867_adc_level(0, 0)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(50));
     /* disconnect line inputs from headphone amplifiers */
     if ((err = max9867_linein_mute(1, 1)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(50));
     if ((err = max9867_linein_gain(0, 0)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(50));
     /* Assert SHDN as first step in toggling SHDN when changing enabled circuitry */
     if ((err = reg_update(MAX9867_17_PWR_SYS, 0x80, 0x00)) != E_NO_ERROR)
         return err;
@@ -396,7 +388,6 @@ int max9867_enable_record(int stereo)
     if (stereo)
         en |= EN_RIGHT_ADC | EN_RIGHT_LINEIN;
 
-    MXC_Delay(MXC_DELAY_MSEC(50));
 
     return reg_update(MAX9867_17_PWR_SYS, 0xE3, 0x80 | en);
 }
@@ -421,12 +412,10 @@ int max9867_init(mxc_i2c_regs_t *i2c_inst, int mclk, int controller)
     if ((err = reg_read(MAX9867_FF_REV_ID, &rev_id)) != E_NO_ERROR)
         return err;
     
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     if (rev_id != MAX9867_REVID)
         return E_NOT_SUPPORTED;
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     /* Shutdown for configuration */
     if ((err = max9867_power_enable(1, 0)) != E_NO_ERROR)
@@ -436,13 +425,11 @@ int max9867_init(mxc_i2c_regs_t *i2c_inst, int mclk, int controller)
     //if ((err = max9867_power_enable(0, 0x7F)) != E_NO_ERROR)
     //    return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     /* Clear all regs to POR state */
     for (int i = MAX9867_04_INT_EN; i < MAX9867_17_PWR_SYS; i++) {
         if ((err = reg_write(i, 0x00)) != E_NO_ERROR)
             return err;
-        MXC_Delay(MXC_DELAY_MSEC(10));
     }
 
     /* Select MCLK prescaler */
@@ -459,7 +446,6 @@ int max9867_init(mxc_i2c_regs_t *i2c_inst, int mclk, int controller)
     if ((err = reg_write(MAX9867_05_SYS_CLK, psclk << 4)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     /* Use PLL in target mode or appropriate NI in controller mode.
      NI=0x3000 when MCLK=12.288MHz and LRCLK=24KHz
@@ -467,19 +453,16 @@ int max9867_init(mxc_i2c_regs_t *i2c_inst, int mclk, int controller)
     if ((err = reg_write(MAX9867_06_CLK_HIGH, controller ? 0x30 : 0x80)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     if (controller)
         if ((err = reg_write(MAX9867_09_DAI_CLOCK, 0x02)) != E_NO_ERROR)
             return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     /* I2S format, data is delayed 1 bit clock, HI-Z mode disabled */
     if ((err = reg_write(MAX9867_08_DAI_FORMAT, controller ? 0x98 : 0x18)) != E_NO_ERROR)
         return err;
 
-    MXC_Delay(MXC_DELAY_MSEC(10));
 
     return E_NO_ERROR;
 }
