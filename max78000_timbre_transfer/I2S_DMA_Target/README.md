@@ -15,4 +15,4 @@ To step through the program in GDB, follow this sequence:
 - Connect the MAX78000FTHR board, and monitor it using the Serial Monitor extension.
 - Open a terminal window and enter *this* directory.
 - Run `make clean`, then `make all`, then `make flash-hold`.
-- Open a new terminal window, without closing the previous one, and enter this directory. In the new terminal window, run `make debug`. You should now be in GDB, with the program paused at `main()`. [Reference for GDB commands](https://visualgdb.com/gdbreference/commands/)
+- Open a new terminal window, without closing the previous one, and enter this directory. In the new terminal window, run `make gdb-debug`. You should now be in GDB, with the program paused at `main()`. [Reference for GDB commands](https://visualgdb.com/gdbreference/commands/)
