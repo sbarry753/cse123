@@ -25,7 +25,7 @@ NET - In Development/venv311/Lib/site-packages/pip-24.0.dist-info/METADATA
 /TIMBRE NET - In Developent/dataset
 /TIMBRE NET - In Developent/checkpoints
 /TIMBRE NET - In Developent/checkpoints
-/TIMBRE NET - In Developent/checkpoints
+/TIMBRE NET - In Developent/checkpoints*
 /TIMBRE NET - In Developent/checkpoints_resynth
 /TIMBRE NET - In Developent/checkpoints
 /TIMBRE NET - In Developent/data/.g2p_temporal_cache
@@ -42,3 +42,12 @@ checkpoints_temporal/
 .history/**
 **/.history
 
+/TIMBRE NET - In Developent/data_extended
+/TIMBRE NET - In Developent/audio_out
+/TIMBRE NET - In Developent/cache_*
+/TIMBRE NET - In Developent/data_small
+/TIMBRE NET - In Developent/f0_cache*
+/TIMBRE NET - In Developent/monophonic
+/TIMBRE NET - In Developent/synth_capacity
+
+*.png

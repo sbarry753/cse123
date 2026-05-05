@@ -34,7 +34,7 @@ import sounddevice as sd
 from pathlib import Path
 from tqdm import tqdm
 
-from model import DDSPGuitarToPiano, SAMPLE_RATE, FRAME_SIZE
+from model import DDSPGuitarToPiano, OverlapAddRenderer, SAMPLE_RATE, FRAME_SIZE, N_MELS
 
 
 # ─────────────────────────────────────────────
@@ -50,6 +50,27 @@ LATENCY    = 'low'       # sounddevice latency hint
 # ─────────────────────────────────────────────
 #  SHARED HELPERS
 # ─────────────────────────────────────────────
+def checkpoint_state_dict(ckpt):
+    return ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+
+
+def infer_model_config(state_dict: dict[str, torch.Tensor]) -> dict[str, int]:
+    config = {}
+    first_weight = state_dict.get('decoder.net.0.weight')
+    if first_weight is not None:
+        config['hidden_size'] = int(first_weight.shape[0])
+        decoder_input_size = int(first_weight.shape[1])
+        z_latent_size = decoder_input_size - (2 + N_MELS)
+        config['use_z'] = z_latent_size > 0
+        config['z_latent_size'] = max(0, z_latent_size)
+
+    harm_weight = state_dict.get('decoder.head_harmonic_amps.weight')
+    if harm_weight is not None:
+        config['n_harmonics'] = int(harm_weight.shape[0])
+
+    return config
+
+
 def get_device(preference: str) -> torch.device:
     if preference == 'auto':
         if torch.cuda.is_available():         return torch.device('cuda')
@@ -58,23 +79,42 @@ def get_device(preference: str) -> torch.device:
     return torch.device(preference)
 
 
-def load_model(path: str, device: torch.device):
+def load_model(path: str, params: dict[str, int], device: torch.device):
     try:
         model = torch.jit.load(path, map_location='cpu')
         print(f"Loaded TorchScript model from {path}")
     except Exception:
         print(f"Loading state dict from {path}")
-        model = DDSPGuitarToPiano()
-        ckpt  = torch.load(path, map_location='cpu', weights_only=False)
-        model.load_state_dict(ckpt['model'] if 'model' in ckpt else ckpt)
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        state_dict = checkpoint_state_dict(ckpt)
+        inferred = infer_model_config(state_dict)
+        hidden_size = inferred.get('hidden_size', params['hidden_size'])
+        n_harmonics = inferred.get('n_harmonics', params['n_harmonics'])
+        use_z = inferred.get('use_z', params.get('use_z', True))
+        z_latent_size = inferred.get('z_latent_size', params.get('z_latent_size', 64))
+        if inferred:
+            print(
+                "Inferred checkpoint config: "
+                f"hidden_size={hidden_size}, n_harmonics={n_harmonics}, "
+                f"use_z={use_z}, z_latent_size={z_latent_size}"
+            )
+        model = DDSPGuitarToPiano(
+                    hidden_size=hidden_size,
+                    n_harmonics=n_harmonics,
+                    context_size=params['context_size'], 
+                    hop_size=params['hop_size'],
+                    use_z=use_z,
+                    z_latent_size=z_latent_size,
+                )
+        model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     return model
 
 
-def warmup(model, device, n_iters=20):
+def warmup(model, device, context_size, n_iters=20):
     print(f"Warming up ({n_iters} iters)...", end='', flush=True)
-    dummy = torch.randn(1, BLOCKSIZE, device=device)
+    dummy = torch.randn(1, context_size, device=device)
     lats = []
     with torch.no_grad():
         for _ in range(n_iters):
@@ -87,22 +127,45 @@ def warmup(model, device, n_iters=20):
     return avg
 
 
-def _infer(model, buf, frame_np):
-    """Copy frame into pre-allocated tensor and run one forward pass."""
-    buf[0].copy_(torch.from_numpy(frame_np).to(buf.device), non_blocking=True)
+def _push_context(context_buf, frame_np, hop_size):
+    """Append one hop of audio to the rolling model context."""
+    frame = torch.from_numpy(frame_np).to(context_buf.device)
+    context_buf[:, :-hop_size] = context_buf[:, hop_size:].clone()
+    context_buf[:, -hop_size:] = frame
+
+
+def _infer(model, context_buf, frame_np, hop_size):
+    """Push one hop into the rolling context and run one forward pass."""
+    _push_context(context_buf, frame_np, hop_size)
     with torch.no_grad():
-        pred = model.infer_frame(buf) if hasattr(model, 'infer_frame') else model(buf)[0]
+        pred = model.infer_frame(context_buf) if hasattr(model, 'infer_frame') else model(context_buf)[0]
     return pred[0].cpu().numpy()
+
+
+def _can_overlap_add(model) -> bool:
+    return hasattr(model, 'predict_params') and hasattr(model, 'render_params')
 
 
 # ─────────────────────────────────────────────
 #  WAV FILE MODE
 # ─────────────────────────────────────────────
-def process_wav(model_path, input_path, output_path, wet, volume, device_str):
+def process_wav(
+        model_path: str,
+        model_params: dict[str, int],
+        input_path: str, 
+        output_path: str, 
+        wet: float, 
+        volume: float,
+        device_str: str = 'auto',
+        overlap_add: bool = True,
+    ):
+    
     device = get_device(device_str)
     print(f"Device : {device}")
-    model  = load_model(model_path, device)
-    warmup(model, device)
+    model  = load_model(model_path, model_params, device)
+    context_size = int(model_params['context_size'])
+    hop_size = int(model_params['hop_size'])
+    warmup(model, device, context_size)
 
     # Load + prep
     audio, sr = torchaudio.load(input_path)
@@ -118,24 +181,38 @@ def process_wav(model_path, input_path, output_path, wet, volume, device_str):
     print(f"Input  : {input_path}  ({duration:.2f}s, {orig_len:,} samples)")
 
     # Pad to frame boundary
-    pad = (BLOCKSIZE - orig_len % BLOCKSIZE) % BLOCKSIZE
+    pad = (hop_size - orig_len % hop_size) % hop_size
     if pad:
         audio_np = np.concatenate([audio_np, np.zeros(pad, dtype=np.float32)])
-    n_frames  = len(audio_np) // BLOCKSIZE
+    n_frames  = len(audio_np) // hop_size
     output_np = np.zeros_like(audio_np)
-    buf       = torch.zeros(1, BLOCKSIZE, device=device)
+    context_buf = torch.zeros(1, context_size, device=device)
+    ola_renderer = (
+        OverlapAddRenderer(model, context_size, hop_size, device)
+        if overlap_add and _can_overlap_add(model) else None
+    )
     lats      = []
 
-    if hasattr(model, 'reset_phase'):
+    if ola_renderer is not None:
+        ola_renderer.reset()
+    elif hasattr(model, 'reset_phase'):
         model.reset_phase()
 
-    print(f"Processing {n_frames:,} frames  (wet={wet:.0%}, vol={volume:.1f}x)...")
+    print(
+        f"Processing {n_frames:,} frames  "
+        f"(context={context_size}, hop={hop_size}, wet={wet:.0%}, "
+        f"vol={volume:.1f}x, overlap_add={ola_renderer is not None})..."
+    )
     for i in tqdm(range(n_frames), unit='frame', ncols=72):
-        s, e  = i * BLOCKSIZE, (i + 1) * BLOCKSIZE
+        s, e  = i * hop_size, (i + 1) * hop_size
         frame = audio_np[s:e].copy()
 
         t0              = time.perf_counter()
-        pred            = _infer(model, buf, frame)
+        pred            = (
+            ola_renderer.process_frame(frame).cpu().numpy()
+            if ola_renderer is not None
+            else _infer(model, context_buf, frame, hop_size)
+        )
         lats.append((time.perf_counter() - t0) * 1000)
 
         mixed           = wet * pred + (1.0 - wet) * frame
@@ -163,31 +240,49 @@ def process_wav(model_path, input_path, output_path, wet, volume, device_str):
 #  LIVE MIC MODE
 # ─────────────────────────────────────────────
 class RealTimePipeline:
-    def __init__(self, model_path: str, device_str: str = 'auto'):
+    def __init__(
+        self,
+        model_path: str,
+        model_params: dict[str, int],
+        device_str: str = 'auto',
+        overlap_add: bool = True,
+    ):
         self.device   = get_device(device_str)
         print(f"Inference device: {self.device}")
-        self.model    = load_model(model_path, self.device)
+        self.model    = load_model(model_path, model_params, self.device)
+        self.context_size = int(model_params['context_size'])
+        self.hop_size = int(model_params['hop_size'])
         self.volume   = 1.0
         self.wet_mix  = 1.0
         self.running  = False
         self._lats    = []
         self._frames  = 0
-        self._buf     = torch.zeros(1, BLOCKSIZE, device=self.device)
-        print(f"Frame: {BLOCKSIZE} samples ({1000*BLOCKSIZE/SAMPLE_RATE:.1f}ms)")
+        self._context_buf = torch.zeros(1, self.context_size, device=self.device)
+        self._ola_renderer = (
+            OverlapAddRenderer(self.model, self.context_size, self.hop_size, self.device)
+            if overlap_add and _can_overlap_add(self.model) else None
+        )
+        print(
+            f"Context: {self.context_size} samples | "
+            f"Hop: {self.hop_size} samples ({1000*self.hop_size/SAMPLE_RATE:.1f}ms) | "
+            f"Overlap-add: {self._ola_renderer is not None}"
+        )
 
     def audio_callback(self, indata, outdata, frames, time_info, status):
         if status:
             print(status, file=sys.stderr)
         t0 = time.perf_counter()
 
-        self._buf[0].copy_(
-            torch.from_numpy(indata[:, 0]).to(self.device), non_blocking=True
-        )
-        with torch.no_grad():
-            pred = self.model.infer_frame(self._buf) if hasattr(self.model, 'infer_frame') \
-                   else self.model(self._buf)[0]
+        if self._ola_renderer is not None:
+            pred_np = self._ola_renderer.process_frame(indata[:, 0].copy()).cpu().numpy()
+        else:
+            _push_context(self._context_buf, indata[:, 0].copy(), self.hop_size)
+            with torch.no_grad():
+                pred = self.model.infer_frame(self._context_buf) if hasattr(self.model, 'infer_frame') \
+                       else self.model(self._context_buf)[0]
+            pred_np = pred[0].cpu().numpy()
 
-        mixed = self.wet_mix * pred[0].cpu().numpy() + (1.0 - self.wet_mix) * indata[:, 0]
+        mixed = self.wet_mix * pred_np + (1.0 - self.wet_mix) * indata[:, 0]
         outdata[:, 0] = np.clip(mixed * self.volume, -1.0, 1.0)
 
         self._frames += 1
@@ -195,15 +290,18 @@ class RealTimePipeline:
             self._lats.append((time.perf_counter() - t0) * 1000)
 
     def run(self):
-        warmup(self.model, self.device)
+        warmup(self.model, self.device, self.context_size)
         print("\n─── LIVE MODE ───────────────────────────────")
-        print(f"SR: {SAMPLE_RATE} Hz | Buffer: {BLOCKSIZE} samples ({1000*BLOCKSIZE/SAMPLE_RATE:.1f}ms)")
+        print(
+            f"SR: {SAMPLE_RATE} Hz | Context: {self.context_size} samples | "
+            f"Buffer: {self.hop_size} samples ({1000*self.hop_size/SAMPLE_RATE:.1f}ms)"
+        )
         print(f"Wet: {self.wet_mix:.0%} piano | Volume: {self.volume:.1f}x")
         print("Controls: [q]uit  [r]eset phase  [+/-] volume  [m]ix toggle")
         print("─────────────────────────────────────────────\n")
         self.running = True
         try:
-            with sd.Stream(samplerate=SAMPLE_RATE, blocksize=BLOCKSIZE,
+            with sd.Stream(samplerate=SAMPLE_RATE, blocksize=self.hop_size,
                            device=(DEVICE_IN, DEVICE_OUT), channels=1,
                            dtype=DTYPE, latency=LATENCY, callback=self.audio_callback):
                 print("Streaming... (type command + Enter)\n")
@@ -226,8 +324,12 @@ class RealTimePipeline:
     def _handle(self, cmd):
         if   cmd == 'q':  self.running = False
         elif cmd == 'r':
-            if hasattr(self.model, 'reset_phase'): self.model.reset_phase()
-            print("  Phase reset.")
+            if self._ola_renderer is not None:
+                self._ola_renderer.reset()
+                print("  Phase and OLA buffers reset.")
+            else:
+                if hasattr(self.model, 'reset_phase'): self.model.reset_phase()
+                print("  Phase reset.")
         elif cmd == '+':
             self.volume = min(4.0, self.volume + 0.1); print(f"  Volume: {self.volume:.1f}x")
         elif cmd == '-':
@@ -245,13 +347,32 @@ class RealTimePipeline:
 def main():
     p = argparse.ArgumentParser(description='DDSP Guitar→Piano | live mic or WAV file')
     p.add_argument('--model',        required=True,      help='Model checkpoint (.pt)')
+    p.add_argument('--hidden_size', type=int,   default=512)
+    p.add_argument('--n_harmonics', type=int,   default=64)
+    p.add_argument('--context_size', type=int, default=2048,
+                   help='Number of guitar samples the encoder sees for each prediction')
+    p.add_argument('--hop_size', type=int, default=FRAME_SIZE,
+                   help='Number of target/output samples predicted per step')
     p.add_argument('--input',        default=None,       help='[WAV mode] Input guitar WAV')
     p.add_argument('--output',       default=None,       help='[WAV mode] Output path (default: <stem>_piano.wav)')
     p.add_argument('--wet',          type=float, default=1.0,   help='Wet mix 0.0–1.0 (default: 1.0)')
     p.add_argument('--volume',       type=float, default=1.0,   help='Output volume multiplier')
     p.add_argument('--device',       default='auto',     help='auto | cuda | mps | cpu')
     p.add_argument('--list-devices', action='store_true', help='List audio devices and exit')
+    p.add_argument(
+        '--overlap_add',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Use inference-time Hann overlap-add smoothing when supported',
+    )
     args = p.parse_args()
+
+    model_params = {
+        'hidden_size': args.hidden_size, 
+        'n_harmonics': args.n_harmonics,
+        'context_size': args.context_size, 
+        'hop_size': args.hop_size
+    }
 
     if args.list_devices:
         print(sd.query_devices())
@@ -264,10 +385,19 @@ def main():
         if args.output is None:
             stem = Path(args.input).stem
             args.output = str(Path(args.input).parent / f"{stem}_piano.wav")
-        process_wav(args.model, args.input, args.output, args.wet, args.volume, args.device)
+        process_wav(
+            args.model,
+            model_params,
+            args.input,
+            args.output,
+            args.wet,
+            args.volume,
+            args.device,
+            overlap_add=args.overlap_add,
+        )
     else:
         # ── Live mic mode ──────────────────────
-        pipe = RealTimePipeline(args.model, args.device)
+        pipe = RealTimePipeline(args.model, model_params, args.device, overlap_add=args.overlap_add)
         pipe.wet_mix = args.wet
         pipe.volume  = args.volume
         pipe.run()
