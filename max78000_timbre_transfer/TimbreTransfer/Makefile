@@ -386,4 +386,3 @@ flash-hold:
 
 gdb-debug:
 	arm-none-eabi-gdb --se=build/max78000.elf -x gdbinit
-	

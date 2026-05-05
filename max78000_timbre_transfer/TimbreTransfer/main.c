@@ -19,16 +19,169 @@
  ******************************************************************************/
 
 /**
- * @file    main.c
- * @brief   Main for I2S CODEC loopback
- * @details I2S CODEC loopback using DMA
+ * @file        main.c
+ * @brief       FreeRTOS Example Application.
  */
 
 #include <stdio.h>
 #include <stdint.h>
-#include "mxc.h"
+#include <string.h>
+#include "FreeRTOS.h"
+#include "FreeRTOSConfig.h"
+#include "portmacro.h"
+#include "task.h"
+#include "semphr.h"
+#include "FreeRTOS_CLI.h"
+#include "mxc_device.h"
+#include "wut.h"
+#include "uart.h"
+#include "lp.h"
+#include "led.h"
 #include "board.h"
+#include "mxc.h"
 #include "max9867.h"
+
+/* FreeRTOS+CLI */
+//void vRegisterCLICommands(void);
+
+/* Mutual exclusion (mutex) semaphores */
+SemaphoreHandle_t xGPIOmutex;
+
+/* Task IDs */
+TaskHandle_t cmd_task_id;
+
+/* Enables/disables tick-less mode */
+unsigned int disable_tickless = 1;
+
+/* Stringification macros */
+#define STRING(x) STRING_(x)
+#define STRING_(x) #x
+
+/* Console ISR selection */
+#if (CONSOLE_UART == 0)
+#define UARTx_IRQHandler UART0_IRQHandler
+#define UARTx_IRQn UART0_IRQn
+mxc_gpio_cfg_t uart_cts = { MXC_GPIO0, MXC_GPIO_PIN_2, MXC_GPIO_FUNC_IN, MXC_GPIO_PAD_WEAK_PULL_UP,
+                            MXC_GPIO_VSSEL_VDDIOH };
+mxc_gpio_cfg_t uart_rts = { MXC_GPIO0, MXC_GPIO_PIN_3, MXC_GPIO_FUNC_OUT, MXC_GPIO_PAD_NONE,
+                            MXC_GPIO_VSSEL_VDDIOH };
+#else
+#error "Please update ISR macro for UART CONSOLE_UART"
+#endif
+mxc_uart_regs_t *ConsoleUART = MXC_UART_GET_UART(CONSOLE_UART);
+
+mxc_gpio_cfg_t uart_cts_isr;
+
+/* Array sizes */
+#define CMD_LINE_BUF_SIZE 80
+#define OUTPUT_BUF_SIZE 512
+
+void passthrough_task(void* pvParameters);
+
+/* Defined in freertos_tickless.c */
+extern void wutHitSnooze(void);
+
+
+/***** Functions *****/
+
+/* =| UART0_IRQHandler |======================================
+ *
+ * This function overrides the weakly-declared interrupt handler
+ *  in system_max326xx.c and is needed for asynchronous UART
+ *  calls to work properly
+ *
+ * ===========================================================
+ */
+void UARTx_IRQHandler(void)
+{
+    MXC_UART_AsyncHandler(ConsoleUART);
+    wutHitSnooze();
+}
+
+
+#if configUSE_TICKLESS_IDLE
+/* =| freertos_permit_tickless |==========================
+ *
+ * Determine if any hardware activity should prevent
+ *  low-power tickless operation.
+ *
+ * =======================================================
+ */
+int freertos_permit_tickless(void)
+{
+    if (disable_tickless == 1) {
+        return E_BUSY;
+    }
+
+    return MXC_UART_GetActive(ConsoleUART);
+}
+#endif
+
+/* =| WUT_IRQHandler |==========================
+ *
+ * Interrupt handler for the wake up timer.
+ *
+ * =======================================================
+ */
+void WUT_IRQHandler(void)
+{
+    MXC_WUT_ClearFlags();
+    NVIC_ClearPendingIRQ(WUT_IRQn);
+}
+
+/* =| main |==============================================
+ *
+ * This program demonstrates FreeRTOS tasks, mutexes,
+ *  and the FreeRTOS+CLI extension.
+ *
+ * =======================================================
+ */
+int main(void)
+{
+    /* Delay to prevent bricks */
+    MXC_Delay(MXC_DELAY_MSEC(200));
+
+    /* Setup manual CTS/RTS to lockout console and wake from deep sleep */
+    MXC_GPIO_Config(&uart_cts);
+    MXC_GPIO_Config(&uart_rts);
+
+    /* Enable incoming characters */
+    MXC_GPIO_OutClr(uart_rts.port, uart_rts.mask);
+
+    /* Print banner (RTOS scheduler not running) */
+    printf("\n-=- %s FreeRTOS (%s) Demo -=-\n", STRING(TARGET), tskKERNEL_VERSION_NUMBER);
+#if configUSE_TICKLESS_IDLE
+    printf("Tickless idle is configured. Type 'tickless 1' to enable.\n");
+#endif
+    printf("SystemCoreClock = %d\n", SystemCoreClock);
+
+    /* Create mutexes */
+    xGPIOmutex = xSemaphoreCreateMutex();
+    if (xGPIOmutex == NULL) {
+        printf("xSemaphoreCreateMutex failed to create a mutex.\n");
+    } else {
+        /* Configure task */
+        if ((xTaskCreate(passthrough_task, (const char *)"passthrough", configMINIMAL_STACK_SIZE, NULL,
+                         tskIDLE_PRIORITY + 1, NULL) != pdPASS) ) {
+            printf("xTaskCreate() failed to create a task.\n");
+        } else {
+            /* Start scheduler */
+            printf("Starting scheduler.\n");
+            vTaskStartScheduler();
+        }
+    }
+
+    /* This code is only reached if the scheduler failed to start */
+    printf("ERROR: FreeRTOS did not start due to above error!\n");
+    while (1) {
+        __NOP();
+    }
+
+    /* Quiet GCC warnings */
+    return -1;
+}
+
+// --------------- Audio passthrough program ---------------------- //
 
 #undef USE_I2S_INTERRUPTS
 
@@ -198,7 +351,7 @@ void i2s_init(void)
         printf("I2S initialized successfully \n");
 }
 
-int main(void)
+void passthrough_task(void* pvParameters)
 {
 #if defined(BOARD_FTHR_REVA)
     /* Wait for PMIC 1.8V to become available, about 180ms after power up. */
