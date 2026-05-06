@@ -10,9 +10,9 @@ import torch.nn.functional as F
 # ============================================================
 
 SAMPLE_RATE = 48000
-FRAME_SIZE = 1024               # analysis window
-HOP_SIZE = 256                  # 75% overlap
-N_FFT = 1024
+FRAME_SIZE = 512                # was 1024 — halves analysis window
+HOP_SIZE = 128                  # was 256 — keeps 75% overlap
+N_FFT = 512                     # match frame size
 N_FREQ_BINS = N_FFT // 2 + 1
 
 # Kept for compatibility with old scripts / imports
@@ -62,9 +62,17 @@ class UpBlock2d(nn.Module):
 
 class SpectralUNet(nn.Module):
     """
+    Predicts a bounded log-magnitude DELTA per (frequency, time) bin.
+
     Input : log-magnitude spectrogram patch  (B, 1, F, T)
-    Output: multiplicative mask + additive residual in log-mag domain
+    Output: log-mag delta in [-MAX_DELTA, +MAX_DELTA] (B, 1, F, T)
+
+    Adding this delta in log space is equivalent to a per-bin multiplicative
+    correction in linear space — but, unlike a sigmoid mask multiplied onto
+    log_mag, the gradients stay sane near silence.
     """
+
+    MAX_DELTA = 4.0  # ~ ×exp(4) = ×54 boost or ÷54 cut per bin
 
     def __init__(self, base_ch: int = 24):
         super().__init__()
@@ -78,10 +86,9 @@ class SpectralUNet(nn.Module):
         self.dec2 = UpBlock2d(base_ch * 2, base_ch * 2, base_ch)
         self.dec1 = UpBlock2d(base_ch, base_ch, base_ch)
 
-        self.out_mask = nn.Conv2d(base_ch, 1, kernel_size=1)
-        self.out_res = nn.Conv2d(base_ch, 1, kernel_size=1)
+        self.out_delta = nn.Conv2d(base_ch, 1, kernel_size=1)
 
-    def forward(self, log_mag: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, log_mag: torch.Tensor) -> torch.Tensor:
         s1 = self.enc1(log_mag)
         s2 = self.enc2(s1)
         s3 = self.enc3(s2)
@@ -92,9 +99,8 @@ class SpectralUNet(nn.Module):
         x = self.dec2(x, s2)
         x = self.dec1(x, s1)
 
-        mask = torch.sigmoid(self.out_mask(x)) * 2.0
-        residual = self.out_res(x)
-        return mask, residual
+        delta = torch.tanh(self.out_delta(x)) * self.MAX_DELTA
+        return delta
 
 
 class TransientShaper(nn.Module):
@@ -179,32 +185,33 @@ class PolyphonicGuitarToPiano(nn.Module):
         """
         length = audio_frame.shape[-1]
 
-        spec = self._stft(audio_frame)         # (B, F, T)
+        spec = self._stft(audio_frame)             # (B, F, T)
         mag = torch.abs(spec)
         phase = torch.angle(spec)
 
-        log_mag = safe_log(mag).unsqueeze(1)   # (B, 1, F, T)
+        log_mag = safe_log(mag).unsqueeze(1)       # (B, 1, F, T)
 
-        mask, residual = self.unet(log_mag)
-        out_log_mag = log_mag * mask + residual
+        # Per-bin log-mag delta. Additive in log == multiplicative in linear.
+        log_mag_delta = self.unet(log_mag)         # (B, 1, F, T) in [-4, 4]
+        out_log_mag = log_mag + log_mag_delta
         out_mag = torch.exp(out_log_mag.squeeze(1))
 
-        # Reuse input phase for low-latency polyphonic consistency
+        # Reuse input phase for low-latency reconstruction.
+        # (This caps achievable quality; complex masking is the next step.)
         out_spec = torch.polar(out_mag, phase)
 
         audio_out = self._istft(out_spec, length=length)
         audio_out = self.transient(audio_out)
 
-        # Small dry blend helps keep articulation stable
-        audio_out = 0.9 * torch.tanh(audio_out) + 0.1 * audio_frame
+        # Hard limit only — NO dry blend, NO tanh distortion.
+        audio_out = torch.clamp(audio_out, -1.0, 1.0)
 
         features = {
             "input_mag": mag,
             "input_log_mag": log_mag.squeeze(1),
         }
         params = {
-            "mask": mask.squeeze(1),
-            "residual": residual.squeeze(1),
+            "log_mag_delta": log_mag_delta.squeeze(1),
         }
         return audio_out, features, params
 

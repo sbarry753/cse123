@@ -42,8 +42,8 @@ from model import DDSPGuitarToPiano, SAMPLE_RATE, FRAME_SIZE, HOP_SIZE
 # CONFIG
 # ============================================================
 BLOCKSIZE = HOP_SIZE          # callback/output chunk size
-DEVICE_IN = None              # set to input device index/name if needed
-DEVICE_OUT = None             # set to output device index/name if needed
+DEVICE_IN = None
+DEVICE_OUT = None
 DTYPE = "float32"
 LATENCY = "low"
 
@@ -116,17 +116,20 @@ def prepare_audio_file(input_path: str) -> np.ndarray:
 
 
 # ============================================================
-# OVERLAP-ADD ENGINE
+# OVERLAP-ADD ENGINE  (COLA-correct)
 # ============================================================
 class OverlapAddEngine:
     """
-    Maintains rolling input/output buffers.
+    Each model call produces a full FRAME_SIZE waveform. We OLA-sum these
+    overlapping predictions with a synthesis Hann window scaled so the COLA
+    sum equals 1.
 
-    For each HOP_SIZE input chunk:
-      - shift new samples into input ring
-      - run model on full FRAME_SIZE window
-      - overlap-add full predicted frame into output ring
-      - emit next HOP_SIZE samples
+    For Hann analysis at hop = FRAME_SIZE / overlap:
+        sum_k hann(n - kH) = overlap / 2
+    so we divide the synthesis Hann by (overlap / 2) for unity gain.
+
+    Without this, with overlap=4 you'd get ~4x amplitude inflation and the
+    final clip(-1, 1) would hard-clip every sustained note → audible distortion.
     """
 
     def __init__(self, model, device: torch.device):
@@ -135,6 +138,12 @@ class OverlapAddEngine:
         self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
         self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
         self.buf = torch.zeros(1, FRAME_SIZE, device=device)
+
+        # COLA-correct synthesis window
+        synth = np.hanning(FRAME_SIZE).astype(np.float32)
+        overlap = FRAME_SIZE // HOP_SIZE
+        cola = overlap / 2.0
+        self.synth_window = synth / cola
 
     def reset(self):
         self.input_ring.fill(0.0)
@@ -153,8 +162,8 @@ class OverlapAddEngine:
         # Model predicts full FRAME_SIZE window
         pred_frame = _infer(self.model, self.buf, self.input_ring.copy())
 
-        # Overlap-add prediction
-        self.output_ring += pred_frame
+        # Window then overlap-add (unity gain across consecutive predictions)
+        self.output_ring += pred_frame * self.synth_window
 
         # Emit earliest hop
         out_hop = self.output_ring[:HOP_SIZE].copy()
@@ -236,7 +245,6 @@ def process_wav(
         # Flush the tail so saved file captures final overlap-add decay
         if collected is not None:
             tail_hops = FRAME_SIZE // HOP_SIZE
-            tail_start = len(audio_np)
             tail_out = []
 
             for _ in range(tail_hops):

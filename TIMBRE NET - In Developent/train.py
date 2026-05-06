@@ -59,13 +59,8 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch=0):
 
         optimizer.zero_grad(set_to_none=True)
 
-        pred, _, params = model(guitar_frames)
+        pred, _, _ = model(guitar_frames)
         loss = criterion(pred, piano_frames)
-
-        # Mild regularization on very large residual outputs
-        if "residual" in params:
-            reg = 1e-4 * params["residual"].abs().mean()
-            loss = loss + reg
 
         if torch.isnan(loss) or torch.isinf(loss):
             print("  ⚠ NaN/Inf loss detected, skipping batch")
@@ -94,11 +89,8 @@ def val_epoch(model, loader, criterion, device):
         guitar_frames = guitar_frames.to(device)
         piano_frames = piano_frames.to(device)
 
-        pred, _, params = model(guitar_frames)
+        pred, _, _ = model(guitar_frames)
         loss = criterion(pred, piano_frames)
-
-        if "residual" in params:
-            loss = loss + 1e-4 * params["residual"].abs().mean()
 
         total_loss += float(loss.item())
         n_batches += 1
