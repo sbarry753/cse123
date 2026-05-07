@@ -7,3 +7,9 @@
 [submodule "lib/tflite-micro"]
 	path = lib/tflite-micro
 	url = https://github.com/tensorflow/tflite-micro.git
+[submodule "lib/ai8x-training"]
+	path = lib/ai8x-training
+	url = https://github.com/analogdevicesinc/ai8x-training.git
+[submodule "lib/ai8x-synthesis"]
+	path = lib/ai8x-synthesis
+	url = https://github.com/analogdevicesinc/ai8x-synthesis.git
