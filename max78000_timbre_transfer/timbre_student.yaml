@@ -1,0 +1,56 @@
+---
+# MAX78000 CHW configuration for TimbreStudent.
+#
+# Input shape: 1x513x5
+# Model: l1 -> l2 -> l3 -> l4 -> out
+
+arch: timbrestudent
+dataset: MAXGuitarPiano
+
+layers:
+  # l1: Conv2d 1 -> 8, 3x3, ReLU
+  - out_offset: 0x4000
+    processors: 0x0000000000000001
+    output_processors: 0x00000000000000ff
+    data_format: CHW
+    operation: conv2d
+    kernel_size: 3x3
+    pad: 1
+    activate: ReLU
+
+  # l2: Conv2d 8 -> 16, 3x3, ReLU
+  - out_offset: 0x0000
+    processors: 0x00000000000000ff
+    output_processors: 0x000000000000ffff
+    operation: conv2d
+    kernel_size: 3x3
+    pad: 1
+    activate: ReLU
+
+  # l3: Conv2d 16 -> 16, 3x3, ReLU
+  - out_offset: 0x4000
+    processors: 0x000000000000ffff
+    output_processors: 0x000000000000ffff
+    operation: conv2d
+    kernel_size: 3x3
+    pad: 1
+    activate: ReLU
+
+  # l4: Conv2d 16 -> 8, 3x3, ReLU
+  - out_offset: 0x0000
+    processors: 0x000000000000ffff
+    output_processors: 0x00000000000000ff
+    operation: conv2d
+    kernel_size: 3x3
+    pad: 1
+    activate: ReLU
+
+  # out: Conv2d 8 -> 1, 1x1, linear output
+  - out_offset: 0x4000
+    processors: 0x00000000000000ff
+    output_processors: 0x0000000000000001
+    operation: conv2d
+    kernel_size: 1x1
+    pad: 0
+    activate: None
+    output: true
