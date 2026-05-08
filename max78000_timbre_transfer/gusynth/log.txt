@@ -1,0 +1,18 @@
+ai8xize.py --device MAX78000 --config-file ../../max78000_timbre_transfer/timbre_student.yaml --checkpoint-file ../../max78000_timbre_transfer/checkpoints/q8_best.pth.tar --prefix gusynth --board-name FTHR_RevA --sample-input tests/sample_MAXGuitarPiano.npy --test-dir ../../max78000_timbre_transfer/
+MAX78000
+
+gusynth
+NOTICE: --scale-output set, but all output scales are zero. Unload operation will be realized without scaling.
+NOTICE: Layer 4: Use --mlator to optimize cnn_unload() for 8-bit output values.
+SUMMARY OF OPS
+Hardware: 12,147,840 ops (12,024,720 macc; 123,120 comp; 0 add; 0 mul; 0 bitwise)
+  Layer 0: 205,200 ops (184,680 macc; 20,520 comp; 0 add; 0 mul; 0 bitwise)
+  Layer 1: 2,995,920 ops (2,954,880 macc; 41,040 comp; 0 add; 0 mul; 0 bitwise)
+  Layer 2: 5,950,800 ops (5,909,760 macc; 41,040 comp; 0 add; 0 mul; 0 bitwise)
+  Layer 3: 2,975,400 ops (2,954,880 macc; 20,520 comp; 0 add; 0 mul; 0 bitwise)
+  Layer 4: 20,520 ops (20,520 macc; 0 comp; 0 add; 0 mul; 0 bitwise)
+
+RESOURCE USAGE
+Weight memory: 4,688 bytes out of 442,368 bytes total (1.1%)
+Bias memory:   49 bytes out of 2,048 bytes total (2.4%)
+
