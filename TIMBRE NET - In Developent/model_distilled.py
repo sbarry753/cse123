@@ -38,23 +38,23 @@ class TimbreStudent(nn.Module):
 
         self.l1 = ai8x.FusedConv2dBNReLU(
             num_channels, base_ch, 3, stride=1, padding=1,
-            bias=bias, batchnorm='NoAffine', **kwargs
+            bias=bias, batchnorm='Affine', **kwargs
         )
         self.l2 = ai8x.FusedConv2dBNReLU(
             base_ch, base_ch * 2, 3, stride=1, padding=1,
-            bias=bias, batchnorm='NoAffine', **kwargs
+            bias=bias, batchnorm='Affine', **kwargs
         )
         self.l3 = ai8x.FusedConv2dBNReLU(
             base_ch * 2, base_ch * 2, 3, stride=1, padding=1,
-            bias=bias, batchnorm='NoAffine', **kwargs
+            bias=bias, batchnorm='Affine', **kwargs
         )
         self.l4 = ai8x.FusedConv2dBNReLU(
             base_ch * 2, base_ch, 3, stride=1, padding=1,
-            bias=bias, batchnorm='NoAffine', **kwargs
+            bias=bias, batchnorm='Affine', **kwargs
         )
         self.out = ai8x.FusedConv2dBN(
             base_ch, num_classes, 1, stride=1, padding=0,
-            bias=bias, batchnorm='NoAffine', **kwargs
+            bias=bias, batchnorm='Affine', **kwargs
         )
 
     def forward(self, x):

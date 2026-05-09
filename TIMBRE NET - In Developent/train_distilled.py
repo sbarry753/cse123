@@ -195,8 +195,8 @@ def make_kd_batch(teacher, guitar_frames, piano_frames, window, args):
     return student_input, hard_target, soft_target
 
 def kd_loss(student_pred, hard_target, soft_target, hard_weight, soft_weight):
-    hard_loss = F.mse_loss(student_pred, hard_target)
-    soft_loss = F.mse_loss(student_pred, soft_target)
+    hard_loss = torch.sqrt(F.mse_loss(student_pred, hard_target))
+    soft_loss = torch.sqrt(F.mse_loss(student_pred, soft_target))
     loss = hard_weight * hard_loss + soft_weight * soft_loss
     return loss, hard_loss, soft_loss
 
@@ -357,14 +357,6 @@ def main():
             f"val={val_loss:.5f} (hard={val_hard:.5f}, soft={val_soft:.5f})"
         )
 
-        save_checkpoint(
-            student,
-            optimizer,
-            epoch,
-            val_loss,
-            Path(args.output_dir) / f"epoch_{epoch + 1:04d}.pt",
-            args,
-        )
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(
@@ -375,8 +367,21 @@ def main():
                 Path(args.output_dir) / "best_model.pt",
                 args,
             )
+        if (epoch + 1) % 10 == 0:
+            save_checkpoint(
+                student,
+                optimizer,
+                epoch,
+                val_loss,
+                Path(args.output_dir) / f"epoch_{epoch + 1:04d}.pt",
+                args,
+            )
 
-    plot_loss_curves(train_losses, val_losses, args.output_dir)
+        if (epoch + 1) % 5 == 0:
+            plot_loss_curves(train_losses, val_losses, args.output_dir)
+        
+        
+
     print(f"Done. Best val loss: {best_val:.5f}")
 
 if __name__ == "__main__":
