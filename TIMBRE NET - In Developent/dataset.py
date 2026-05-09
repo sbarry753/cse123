@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from model import FRAME_SIZE, HOP_SIZE, SAMPLE_RATE
-
+from data_splits import load_split_manifest, collect_stems, find_split_manifest
 
 def _to_mono_resampled(path: Path, sample_rate: int) -> torch.Tensor:
     audio, sr = torchaudio.load(str(path))
@@ -466,30 +466,33 @@ def make_dataloaders(
     min_rms: float = 0.002,
     keep_silence_prob: float = 1.0,
     seed: int = 22,
+    split_manifest: str | Path | None = None,
 ):
     """
     Split by clip stem, not by frame, so validation is honest.
     """
     data_dir = Path(data_dir)
-    guitar_dir = data_dir / "guitar"
-    piano_dir = data_dir / "piano"
+    manifest_splits = load_split_manifest(data_dir, split_manifest)
 
-    guitar_files = sorted(guitar_dir.glob("*.wav")) + sorted(guitar_dir.glob("*.flac"))
-    piano_files = sorted(piano_dir.glob("*.wav")) + sorted(piano_dir.glob("*.flac"))
+    if manifest_splits is not None:
+        train_stems = manifest_splits["train"]
+        val_stems = manifest_splits["val"]
+        if not val_stems:
+            raise ValueError("Split manifest must include a non-empty val split for make_dataloaders().")
+    else:
+        guitar_stems = collect_stems(data_dir / "guitar")
+        piano_stems = collect_stems(data_dir / "piano")
+        common = sorted(guitar_stems & piano_stems)
 
-    guitar_stems = {f.stem for f in guitar_files}
-    piano_stems = {f.stem for f in piano_files}
-    common = sorted(guitar_stems & piano_stems)
+        if not common:
+            raise ValueError("No matching guitar/piano stems found.")
 
-    if not common:
-        raise ValueError("No matching guitar/piano stems found.")
+        rng = random.Random(seed)
+        rng.shuffle(common)
 
-    rng = random.Random(seed)
-    rng.shuffle(common)
-
-    n_val = max(2, int(round(len(common) * val_split))) if len(common) > 2 else 1
-    val_stems = common[:n_val]
-    train_stems = common[n_val:] if n_val > 0 else common
+        n_val = max(2, int(round(len(common) * val_split))) if len(common) > 2 else 1
+        val_stems = common[:n_val]
+        train_stems = common[n_val:] if n_val > 0 else common
 
     train_set = GuitarPianoDataset(
         data_dir=str(data_dir),

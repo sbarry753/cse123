@@ -7,7 +7,11 @@ Place it in lib/ai8x-training/models and select it with:
     --model ai85timbrestudent
 """
 from torch import nn
+import sys
+from pathlib import Path
 
+ai8x_dir = str(Path(__file__).resolve().parent.parent / "lib" / "ai8x-training")
+sys.path.insert(0, str(ai8x_dir))
 import ai8x
 
 class TimbreStudent(nn.Module):
