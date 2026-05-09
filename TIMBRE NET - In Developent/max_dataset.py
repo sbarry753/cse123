@@ -1,7 +1,6 @@
 """
 max_dataset.py - Guitar-piano dataset for MAX78000
 """
-
 import random
 from pathlib import Path
 from typing import List
@@ -11,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from dataset import GuitarPianoDataset, SAMPLE_RATE, FRAME_SIZE
+from data_splits import load_split_manifest
 
 class MAXGuitarPianoDataset(Dataset):
     """
@@ -37,6 +37,8 @@ class MAXGuitarPianoDataset(Dataset):
             keep_silence_prob: float = 1.0,
             log_scale: float = 6.0,
             truncate_testset: bool = False,
+            split_manifest: str | Path | None = None,
+            eval_split: str = "val",
         ):
         self.root_dir = Path(root_dir)
         self.d_type = d_type
@@ -53,13 +55,17 @@ class MAXGuitarPianoDataset(Dataset):
         self.keep_silence_prob = keep_silence_prob
         self.log_scale = log_scale
         self.truncate_testset = truncate_testset
+        self.split_manifest = split_manifest
+        self.eval_split = eval_split
         self.window = torch.hann_window(frame_size)
 
         if d_type not in {"train", "test"}:
             raise ValueError(f"Unknown dataset type: {d_type}")
+        if eval_split not in {"val", "test"}:
+            raise ValueError(f"eval_split must be 'val' or 'test', got: {eval_split}")
 
         split = self._split_stems()
-        self.stems = split["train"] if d_type == "train" else split["test"]
+        self.stems = split["train"] if d_type == "train" else split[eval_split]
         self.freq_bins = self.n_fft // 2 + 1
         self.time_frames = self._spectrogram_mag(torch.zeros(self.frame_size)).shape[-1]
 
@@ -76,6 +82,15 @@ class MAXGuitarPianoDataset(Dataset):
             self.num_frames = min(self.num_frames, 1)
 
     def _split_stems(self) -> dict[str, List[str]]:
+        manifest_splits = load_split_manifest(self.root_dir, self.split_manifest)
+        if manifest_splits is not None:
+            if not manifest_splits[self.eval_split]:
+                raise ValueError(
+                    f"Split manifest must include a non-empty {self.eval_split} split "
+                    "for MAXGuitarPianoDataset evaluation."
+                )
+            return manifest_splits
+
         guitar_dir = self.root_dir / "guitar"
         piano_dir = self.root_dir / "piano"
 
@@ -108,6 +123,8 @@ class MAXGuitarPianoDataset(Dataset):
             "min_rms": self.min_rms,
             "keep_silence_prob": self.keep_silence_prob,
             "log_scale": self.log_scale,
+            "split_manifest": str(self.split_manifest) if self.split_manifest else None,
+            "eval_split": self.eval_split,
         }
 
     def _prepare_cache(self) -> None:
@@ -200,7 +217,6 @@ class MAXGuitarPianoDataset(Dataset):
 
 def MAXGuitarPiano_get_datasets(data, load_train=True, load_test=True):
     """Load MAX78000 guitar-to-piano spectrogram regression datasets."""
-    import ai8x 
 
     data_dir, args = data
     transform = ai8x.normalize(args=args)
@@ -210,6 +226,8 @@ def MAXGuitarPiano_get_datasets(data, load_train=True, load_test=True):
             root_dir=data_dir,
             d_type="train",
             transform=transform,
+            split_manifest=getattr(args, "split_manifest", None),
+            eval_split=getattr(args, "eval_split", "val"),
         )
         print(f"Train dataset length: {len(train_dataset)}\n")
     else:
@@ -221,6 +239,8 @@ def MAXGuitarPiano_get_datasets(data, load_train=True, load_test=True):
             d_type="test",
             transform=transform,
             truncate_testset=getattr(args, "truncate_testset", False),
+            split_manifest=getattr(args, "split_manifest", None),
+            eval_split=getattr(args, "eval_split", "val"),
         )
         print(f"Test dataset length: {len(test_dataset)}\n")
     else:
