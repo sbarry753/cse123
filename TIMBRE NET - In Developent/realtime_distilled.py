@@ -34,7 +34,7 @@ import torchaudio
 from tqdm import tqdm
 
 from model import FRAME_SIZE, HOP_SIZE, N_FFT, SAMPLE_RATE
-from model_distilled import TimbreStudent
+from unet_distilled import TimbreUNetStudent
 import ai8x
 
 
@@ -63,16 +63,16 @@ def get_device(preference: str) -> torch.device:
 
 class DistilledStudentRealtime(torch.nn.Module):
     """
-    Waveform-facing wrapper around TimbreStudent.
+    Waveform-facing wrapper around TimbreUNetStudent.
 
-    TimbreStudent is trained against target_mask = clamp(piano_mag/guitar_mag,
+    TimbreUNetStudent is trained against target_mask = clamp(piano_mag/guitar_mag,
     0, 2) / 2, so inference maps the predicted [0, 1] mask back to [0, 2]
     before applying it to the guitar magnitude.
     """
 
     def __init__(
         self,
-        student: TimbreStudent,
+        student: TimbreUNetStudent,
         frame_size: int = FRAME_SIZE,
         hop_size: int = HOP_SIZE,
         n_fft: int = N_FFT,
@@ -89,6 +89,15 @@ class DistilledStudentRealtime(torch.nn.Module):
         self.mask_gain = mask_gain
         self.dry_blend = dry_blend
         self.register_buffer("window", torch.hann_window(frame_size))
+
+    @staticmethod
+    def _pad_to_multiple_2d(x: torch.Tensor, multiple: int = 4) -> torch.Tensor:
+        freq_bins, time_frames = x.shape[-2:]
+        pad_freq = (multiple - freq_bins % multiple) % multiple
+        pad_time = (multiple - time_frames % multiple) % multiple
+        if pad_freq == 0 and pad_time == 0:
+            return x
+        return torch.nn.functional.pad(x, (0, pad_time, 0, pad_freq))
 
     def _stft(self, audio: torch.Tensor) -> torch.Tensor:
         return torch.stft(
@@ -119,7 +128,9 @@ class DistilledStudentRealtime(torch.nn.Module):
         phase = torch.angle(spec)
 
         student_input = torch.clamp(torch.log1p(mag) / self.log_scale, 0.0, 1.0).unsqueeze(1)
+        student_input = self._pad_to_multiple_2d(student_input)
         pred_mask = torch.clamp(self.student(student_input), 0.0, 1.0).squeeze(1)
+        pred_mask = pred_mask[..., :mag.shape[-2], :mag.shape[-1]]
         out_mag = mag * (pred_mask * self.mask_gain)
 
         out_spec = torch.polar(out_mag, phase)
@@ -144,6 +155,14 @@ def _checkpoint_state(payload):
     return payload
 
 
+def padded_spectrogram_dimensions(n_fft: int, frame_size: int, hop_size: int, multiple: int = 4):
+    freq_bins = n_fft // 2 + 1
+    time_frames = frame_size // hop_size + 1
+    padded_freq = freq_bins + (multiple - freq_bins % multiple) % multiple
+    padded_time = time_frames + (multiple - time_frames % multiple) % multiple
+    return padded_freq, padded_time
+
+
 def load_model(path: str, device: torch.device, args):
     if path.endswith(".pt") or path.endswith(".pth"):
         payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -164,10 +183,10 @@ def load_model(path: str, device: torch.device, args):
             simulate=args.simulate,
             round_avg=args.avg_pool_rounding,
         )
-        student = TimbreStudent(
+        student = TimbreUNetStudent(
             num_classes=1,
             num_channels=1,
-            dimensions=(n_fft // 2 + 1, frame_size // hop_size + 1),
+            dimensions=padded_spectrogram_dimensions(n_fft, frame_size, hop_size),
             base_ch=base_ch,
         )
         student.load_state_dict(_checkpoint_state(payload))
