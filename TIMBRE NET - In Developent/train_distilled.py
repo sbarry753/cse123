@@ -22,7 +22,8 @@ from tqdm import tqdm
 
 from dataset import GuitarPianoDataset, load_split_manifest
 from model import DDSPGuitarToPiano, FRAME_SIZE, HOP_SIZE, N_FFT, SAMPLE_RATE
-from model_distilled import TimbreStudent
+# from model_distilled import TimbreStudent
+from unet_distilled import TimbreUNetStudent
 import ai8x
 
 def get_device(preference: str) -> torch.device:
@@ -168,6 +169,24 @@ def clipped_mask(target_mag, guitar_mag):
     """
     return torch.clamp(target_mag / (guitar_mag + 1e-5), 0.0, 2.0) / 2.0
 
+def pad_to_multiple_2d(x, multiple=4):
+    """
+    Pads spectrogram tensors on the bottom/right so U-Net pooling dimensions line up.
+    """
+    freq_bins, time_frames = x.shape[-2:]
+    pad_freq = (multiple - freq_bins % multiple) % multiple
+    pad_time = (multiple - time_frames % multiple) % multiple
+    if pad_freq == 0 and pad_time == 0:
+        return x
+    return F.pad(x, (0, pad_time, 0, pad_freq))
+
+def padded_spectrogram_dimensions(args, multiple=4):
+    freq_bins = args.n_fft // 2 + 1
+    time_frames = args.frame_size // args.hop_size + 1
+    padded_freq = freq_bins + (multiple - freq_bins % multiple) % multiple
+    padded_time = time_frames + (multiple - time_frames % multiple) % multiple
+    return padded_freq, padded_time
+
 def make_kd_batch(teacher, guitar_frames, piano_frames, window, args):
     """
     Computes the student input and targets for KD training.
@@ -182,15 +201,19 @@ def make_kd_batch(teacher, guitar_frames, piano_frames, window, args):
         piano_frames, window, args.n_fft, args.hop_size, args.frame_size
     )
 
-    student_input = normalize_log_mag(guitar_mag, args.log_scale).unsqueeze(1)
-    hard_target = clipped_mask(piano_mag, guitar_mag).unsqueeze(1)
+    student_input = pad_to_multiple_2d(
+        normalize_log_mag(guitar_mag, args.log_scale).unsqueeze(1)
+    )
+    hard_target = pad_to_multiple_2d(clipped_mask(piano_mag, guitar_mag).unsqueeze(1))
 
     with torch.no_grad():
         teacher_audio, _, _ = teacher(guitar_frames)
         teacher_mag = spectrogram_mag(
             teacher_audio, window, args.n_fft, args.hop_size, args.frame_size
         )
-        soft_target = clipped_mask(teacher_mag, guitar_mag).unsqueeze(1)
+        soft_target = pad_to_multiple_2d(
+            clipped_mask(teacher_mag, guitar_mag).unsqueeze(1)
+        )
 
     return student_input, hard_target, soft_target
 
@@ -279,6 +302,7 @@ def save_checkpoint(student, optimizer, epoch, val_loss, path, args):
             "frame_size": args.frame_size,
             "hop_size": args.hop_size,
             "n_fft": args.n_fft,
+            "base_ch": args.base_ch,
             "log_scale": args.log_scale,
         },
         path,
@@ -308,10 +332,10 @@ def main():
         simulate=args.simulate,
         round_avg=args.avg_pool_rounding,
     )
-    student = TimbreStudent(
+    student = TimbreUNetStudent(
         num_classes=1,
         num_channels=1,
-        dimensions=(args.n_fft // 2 + 1, args.frame_size // args.hop_size + 1),
+        dimensions=padded_spectrogram_dimensions(args),
         base_ch=args.base_ch,
     ).to(device)
     window = torch.hann_window(args.frame_size, device=device)
@@ -352,13 +376,14 @@ def main():
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         print(
-            f"Epoch {epoch + 1:3d}/{args.epochs} "
-            f"train={train_loss:.5f} (hard={train_hard:.5f}, soft={train_soft:.5f}) "
-            f"val={val_loss:.5f} (hard={val_hard:.5f}, soft={val_soft:.5f})"
+            f"Epoch {epoch + 1:3d}/{args.epochs}\n"
+            f"  train={train_loss:.5f} (hard={train_hard:.5f}, soft={train_soft:.5f})\n"
+            f"  val={val_loss:.5f} (hard={val_hard:.5f}, soft={val_soft:.5f})"
         )
 
         if val_loss < best_val:
             best_val = val_loss
+            print(f"    Best val loss: {best_val}, saving checkpoint")
             save_checkpoint(
                 student,
                 optimizer,
@@ -381,7 +406,7 @@ def main():
             plot_loss_curves(train_losses, val_losses, args.output_dir)
         
         
-
+        print()
     print(f"Done. Best val loss: {best_val:.5f}")
 
 if __name__ == "__main__":

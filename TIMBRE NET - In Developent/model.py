@@ -194,9 +194,7 @@ class PolyphonicGuitarToPiano(nn.Module):
 
         audio_out = self._istft(out_spec, length=length)
         audio_out = self.transient(audio_out)
-
-        # Small dry blend helps keep articulation stable
-        audio_out = 0.9 * torch.tanh(audio_out) + 0.1 * audio_frame
+        audio_out = torch.tanh(audio_out)
 
         features = {
             "input_mag": mag,
