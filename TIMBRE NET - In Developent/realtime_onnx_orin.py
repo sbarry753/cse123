@@ -21,6 +21,12 @@ python realtime_onnx_orin.py --model model.onnx --host-api JACK --queue-hops 8 -
 # Run a TensorRT engine built with trtexec
 python realtime_onnx_orin.py --engine model_fp16.plan --host-api JACK
 
+# WAV -> save processed output
+python realtime_onnx_orin.py --engine model_fp16.plan --input guitar.wav --output piano.wav
+
+# WAV -> play processed output
+python realtime_onnx_orin.py --engine model_fp16.plan --input guitar.wav --play --host-api JACK
+
 # Force CPU if the Jetson ONNX Runtime build does not expose CUDA/TensorRT
 python realtime_onnx_orin.py --model model.onnx --provider cpu
 """
@@ -30,14 +36,11 @@ import queue
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
-
-import onnxruntime as ort
-import tensorrt as trt
-from cuda import cudart
 
 SAMPLE_RATE = 48000
 FRAME_SIZE = 1024
@@ -119,6 +122,8 @@ def validate_device(idx, want_input: bool) -> None:
 # ONNX inference + overlap-add
 # ------------------------------------------------------------
 def choose_providers(provider: str) -> List[str]:
+    import onnxruntime as ort
+
     available = ort.get_available_providers()
     if provider == "cpu":
         return ["CPUExecutionProvider"]
@@ -144,6 +149,8 @@ class OnnxOLAEngine:
     """
 
     def __init__(self, model_path: str, providers: List[str]):
+        import onnxruntime as ort
+
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess_opts.intra_op_num_threads = 1
@@ -217,6 +224,9 @@ class TrtOLAEngine:
     """
 
     def __init__(self, engine_path: str):
+        import tensorrt as trt
+        from cuda import cudart
+
         self.trt = trt
         self.cudart = cudart
         self.stream = None
@@ -366,6 +376,116 @@ def warmup(engine, n: int = 64) -> None:
     avg = float(np.mean(lats[len(lats) // 2:]))
     print(f" done. avg worker inference: {avg:.2f} ms")
     engine.reset()
+
+
+# ------------------------------------------------------------
+# WAV file mode
+# ------------------------------------------------------------
+def prepare_audio_file(input_path: str) -> np.ndarray:
+    import torchaudio
+
+    audio, sr = torchaudio.load(input_path)
+    if audio.shape[0] > 1:
+        audio = audio.mean(0, keepdim=True)
+    if sr != SAMPLE_RATE:
+        print(f"Resampling {sr} -> {SAMPLE_RATE} Hz...")
+        audio = torchaudio.functional.resample(audio, sr, SAMPLE_RATE)
+    return audio.squeeze(0).numpy().astype(np.float32)
+
+
+def save_audio_file(output_path: str, audio: np.ndarray) -> None:
+    import torch
+    import torchaudio
+
+    torchaudio.save(output_path, torch.from_numpy(audio).unsqueeze(0), SAMPLE_RATE)
+
+
+def process_wav(
+    engine,
+    input_path: str,
+    output_path: Optional[str],
+    wet: float,
+    volume: float,
+    play: bool,
+    output_device=None,
+    host_api: Optional[str] = "JACK",
+    latency="low",
+) -> None:
+    warmup(engine)
+    audio_np = prepare_audio_file(input_path)
+    orig_len = len(audio_np)
+    duration = orig_len / SAMPLE_RATE
+    print(f"Input: {input_path} ({duration:.2f}s, {orig_len:,} samples)")
+
+    pad = (HOP_SIZE - (orig_len % HOP_SIZE)) % HOP_SIZE
+    if pad:
+        audio_np = np.concatenate([audio_np, np.zeros(pad, dtype=np.float32)])
+
+    n_steps = len(audio_np) // HOP_SIZE
+    engine.reset()
+
+    collected = np.zeros_like(audio_np) if output_path is not None else None
+    lats = []
+    stream = None
+
+    try:
+        if play:
+            play_device = find_device(output_device, host_api, want_input=False)
+            validate_device(play_device, want_input=False)
+            stream = sd.OutputStream(
+                samplerate=SAMPLE_RATE,
+                blocksize=HOP_SIZE,
+                device=play_device,
+                channels=1,
+                dtype=DTYPE,
+                latency=latency,
+            )
+            stream.start()
+            print(f"Playing processed output on device: {play_device}")
+
+        print(f"Processing {n_steps:,} hops...")
+        for i in range(n_steps):
+            s = i * HOP_SIZE
+            e = s + HOP_SIZE
+            in_hop = audio_np[s:e]
+
+            t0 = time.perf_counter()
+            out_hop = engine.process_hop(in_hop)
+            lats.append((time.perf_counter() - t0) * 1000.0)
+
+            mixed = wet * out_hop + (1.0 - wet) * in_hop
+            mixed = np.clip(mixed * volume, -1.0, 1.0).astype(np.float32)
+
+            if collected is not None:
+                collected[s:e] = mixed
+            if stream is not None:
+                stream.write(mixed.reshape(-1, 1))
+    finally:
+        if stream is not None:
+            stream.stop()
+            stream.close()
+        close = getattr(engine, "close", None)
+        if close is not None:
+            close()
+
+    if collected is not None and output_path is not None:
+        collected = collected[:orig_len]
+        save_audio_file(output_path, collected)
+        print(f"Saved to: {output_path}")
+
+    if lats:
+        arr = np.array(lats, dtype=np.float32)
+        print(
+            f"Latency ms: avg={arr.mean():.2f} "
+            f"p95={np.percentile(arr, 95):.2f} max={arr.max():.2f}"
+        )
+
+
+def create_engine(args):
+    if args.engine:
+        return TrtOLAEngine(args.engine), "TensorRT"
+    providers = choose_providers(args.provider)
+    return OnnxOLAEngine(args.model, providers=providers), "ONNX Runtime"
 
 
 # ------------------------------------------------------------
@@ -557,6 +677,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Guitar->piano on Jetson Orin via JACK/ALSA")
     ap.add_argument("--model", default="./model.onnx", help="Path to exported ONNX file")
     ap.add_argument("--engine", default=None, help="Path to serialized TensorRT engine (.plan)")
+    ap.add_argument("--input", default=None, help="[WAV mode] Input WAV file")
+    ap.add_argument("--output", default=None, help="[WAV mode] Output WAV file")
+    ap.add_argument("--play", action="store_true", help="[WAV mode] Play output while processing")
     ap.add_argument("--list-devices", action="store_true", help="List PortAudio devices and exit")
     ap.add_argument("--host-api", default="JACK", help="Host API filter for device names, e.g. JACK or ALSA")
     ap.add_argument("--input-device", default=None, help="Input device index or partial device name")
@@ -578,13 +701,30 @@ def main() -> None:
         list_devices(args.host_api)
         return
 
-    if args.engine:
-        engine = TrtOLAEngine(args.engine)
-        mode_name = "TensorRT"
-    else:
-        providers = choose_providers(args.provider)
-        engine = OnnxOLAEngine(args.model, providers=providers)
-        mode_name = "ONNX Runtime"
+    if args.input:
+        input_path = Path(args.input)
+        if not input_path.is_file():
+            print(f"Error: file not found: {args.input}", file=sys.stderr)
+            sys.exit(1)
+        if args.output is None and not args.play:
+            args.output = str(input_path.with_name(f"{input_path.stem}_piano.wav"))
+
+        engine, mode_name = create_engine(args)
+        print(f"Mode: {mode_name} WAV processing")
+        process_wav(
+            engine=engine,
+            input_path=args.input,
+            output_path=args.output,
+            wet=args.wet,
+            volume=args.volume,
+            play=args.play,
+            output_device=args.output_device,
+            host_api=args.host_api,
+            latency=parse_latency(args.latency),
+        )
+        return
+
+    engine, mode_name = create_engine(args)
 
     pipe = ThreadedLivePipeline(
         engine=engine,
