@@ -8,3 +8,4 @@
 # **********************************************************
 
 # Add your config here!
+# PROJ_CFLAGS+=-DCNN_INFERENCE_TIMER=MXC_TMR0
