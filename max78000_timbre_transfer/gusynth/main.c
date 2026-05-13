@@ -108,12 +108,18 @@ int main(void)
 
   printf("\n*** CNN Inference Test gusynth ***\n");
 
+  // Measure setup/start overhead (init, load, configure, input load, start call).
+  // MXC_TMR_SW_Start(MXC_TMR1);
+  
   cnn_init(); // Bring state machine into consistent state
   cnn_load_weights(); // Load kernels
   cnn_load_bias();
   cnn_configure(); // Configure state machine
   load_input(); // Load data input
   cnn_start(); // Start CNN processing
+
+  // uint32_t setup_time_us = MXC_TMR_SW_Stop(MXC_TMR1);
+  // printf("Setup+start time: %u us\n", setup_time_us);
 
   while (cnn_time == 0)
     MXC_LP_EnterSleepMode(); // Wait for CNN
