@@ -1,0 +1,24 @@
+{
+  "code": {
+    "exts": [".cpp", ".h", ".py"],
+    "exclude": [
+      "JuceLibraryCode/",
+      "onset_weights.h",
+      "onset_weights copy.h",
+      ".tflite",
+      "tflite_onset.h",
+      ".gitignore",
+      ".gitmodules",
+      ".python-version",
+      "uv.lock",
+      "generated_model_data.h",
+      "generated_tflm_model_data.h",
+      "generated_tflm_report.txt"
+    ]
+  },
+  "doc": {
+    "exts": [".md", ".tex"],
+    "include": ["Documentation/", "Demo_Materials/"],
+    "exclude": ["status_repots/", "Demo_Materials/README.md"]
+  }
+}

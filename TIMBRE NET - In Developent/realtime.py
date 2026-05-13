@@ -76,6 +76,32 @@ def get_device(preference: str) -> torch.device:
     return torch.device(preference)
 
 
+
+
+def configure_jetson_runtime(device: torch.device, fp16: bool = False):
+    """Enable CUDA settings that help Jetson Orin avoid slow default paths."""
+    torch.set_grad_enabled(False)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        # Make timing more honest after warmup and avoid first-use hiccups.
+        torch.cuda.empty_cache()
+        print(f"CUDA: {torch.cuda.get_device_name(0)}")
+        print(f"cuDNN benchmark: {torch.backends.cudnn.benchmark} | TF32: enabled | fp16: {fp16}")
+
+
+def _model_forward(model, x: torch.Tensor) -> torch.Tensor:
+    y = model.infer_frame(x) if hasattr(model, "infer_frame") else model(x)[0]
+    if y.dim() == 1:
+        y = y.unsqueeze(0)
+    return y
+
+
 def load_model(path: str, device: torch.device, fp16: bool = False):
     try:
         model = torch.jit.load(path, map_location="cpu")
@@ -89,14 +115,13 @@ def load_model(path: str, device: torch.device, fp16: bool = False):
     model.to(device)
     if fp16 and device.type == "cuda":
         model.half()
-        print("Using FP16 model")
     model.eval()
     return model
 
 
-def warmup(model, device, n_iters=20, fp16=False):
+def warmup(model, device, n_iters=30):
     print(f"Warming up ({n_iters} iters)...", end="", flush=True)
-    dtype = torch.float16 if (fp16 and device.type == "cuda") else torch.float32
+    dtype = next(model.parameters()).dtype if hasattr(model, "parameters") else torch.float32
     dummy = torch.randn(1, FRAME_SIZE, device=device, dtype=dtype)
     lats = []
 
@@ -105,10 +130,7 @@ def warmup(model, device, n_iters=20, fp16=False):
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
-            if hasattr(model, "infer_frame"):
-                _ = model.infer_frame(dummy)
-            else:
-                _ = model(dummy)[0]
+            _ = _model_forward(model, dummy)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             lats.append((time.perf_counter() - t0) * 1000.0)
@@ -118,16 +140,14 @@ def warmup(model, device, n_iters=20, fp16=False):
     return avg
 
 
-def _infer(model, buf_tensor, frame_np: np.ndarray, fp16: bool = False) -> np.ndarray:
-    # One host->device copy per hop. This is acceptable ONLY because it is in the worker thread,
-    # not the audio callback.
+def _infer(model, buf_tensor, frame_np: np.ndarray) -> np.ndarray:
     src = torch.from_numpy(frame_np)
-    if fp16 and buf_tensor.device.type == "cuda":
-        src = src.to(dtype=torch.float16)
-    buf_tensor[0].copy_(src.to(buf_tensor.device, non_blocking=True))
+    if buf_tensor.dtype != src.dtype:
+        src = src.to(dtype=buf_tensor.dtype)
+    buf_tensor[0].copy_(src.to(buf_tensor.device), non_blocking=True)
     with torch.inference_mode():
-        pred = model.infer_frame(buf_tensor) if hasattr(model, "infer_frame") else model(buf_tensor)[0]
-    return pred[0].detach().float().cpu().numpy().astype(np.float32)
+        pred = _model_forward(model, buf_tensor)
+    return pred[0].detach().to(dtype=torch.float32, device="cpu").numpy()
 
 
 def prepare_audio_file(input_path: str) -> np.ndarray:
@@ -153,7 +173,7 @@ class OverlapAddEngine:
         self.fp16 = fp16 and device.type == "cuda"
         self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
         self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
-        dtype = torch.float16 if self.fp16 else torch.float32
+        dtype = next(model.parameters()).dtype if hasattr(model, "parameters") else torch.float32
         self.buf = torch.zeros(1, FRAME_SIZE, device=device, dtype=dtype)
 
     def reset(self):
@@ -181,18 +201,99 @@ class OverlapAddEngine:
 # ============================================================
 # WAV MODE — kept simple/original-style
 # ============================================================
-def process_wav(model_path, input_path, output_path, wet, volume, device_str, play, fp16, input_device, output_device, latency):
+
+
+def process_wav_fast_batched(
+    model,
+    audio_np: np.ndarray,
+    wet: float,
+    volume: float,
+    device: torch.device,
+    batch_size: int = 256,
+) -> np.ndarray:
+    """
+    Jetson-fast WAV path:
+    - creates all FRAME_SIZE windows with torch.unfold
+    - runs model in batches on CUDA
+    - overlap-adds with torch.nn.functional.fold
+
+    This removes the old per-hop CPU->GPU->CPU round trip, which is the main reason
+    file processing was crawling on Orin.
+    """
+    import torch.nn.functional as F
+
+    orig_len = len(audio_np)
+    pad = (HOP_SIZE - (orig_len % HOP_SIZE)) % HOP_SIZE
+    if pad:
+        audio_np = np.concatenate([audio_np, np.zeros(pad, dtype=np.float32)])
+
+    n_steps = len(audio_np) // HOP_SIZE
+    model_dtype = next(model.parameters()).dtype if hasattr(model, "parameters") else torch.float32
+
+    audio_t = torch.from_numpy(audio_np).to(device=device, dtype=model_dtype, non_blocking=True)
+    left_pad = torch.zeros(FRAME_SIZE - HOP_SIZE, device=device, dtype=model_dtype)
+    framed_src = torch.cat([left_pad, audio_t], dim=0)
+    frames = framed_src.unfold(0, FRAME_SIZE, HOP_SIZE)[:n_steps].contiguous()
+
+    preds = []
+    print(f"Fast CUDA batched inference: {n_steps:,} frames, batch={batch_size}")
+    with torch.inference_mode():
+        for start in tqdm(range(0, n_steps, batch_size), unit="batch", ncols=72):
+            x = frames[start:start + batch_size]
+            y = _model_forward(model, x)
+            preds.append(y.to(dtype=torch.float32))
+
+    pred_frames = torch.cat(preds, dim=0)  # [n_steps, FRAME_SIZE]
+
+    # Fold performs vectorized overlap-add.
+    cols = pred_frames.T.unsqueeze(0)  # [1, FRAME_SIZE, n_steps]
+    out_len = n_steps * HOP_SIZE + FRAME_SIZE
+    ola = F.fold(
+        cols,
+        output_size=(1, out_len),
+        kernel_size=(1, FRAME_SIZE),
+        stride=(1, HOP_SIZE),
+    ).view(-1)
+
+    wet_out = ola[:len(audio_np)]
+    dry = torch.from_numpy(audio_np).to(device=device, dtype=torch.float32)
+    mixed = wet * wet_out + (1.0 - wet) * dry
+    mixed = torch.clamp(mixed * volume, -1.0, 1.0)
+    return mixed[:orig_len].detach().cpu().numpy().astype(np.float32)
+
+def process_wav(
+    model_path: str,
+    input_path: str,
+    output_path: str | None,
+    wet: float,
+    volume: float,
+    device_str: str,
+    play: bool,
+    batch_size: int = 256,
+    fp16: bool = False,
+    fast_wav: bool = True,
+):
     device = get_device(device_str)
     configure_jetson_torch(device, fp16)
     print(f"Device: {device}")
+    configure_jetson_runtime(device, fp16=fp16)
 
     model = load_model(model_path, device, fp16=fp16)
-    warmup(model, device, fp16=fp16)
+    warmup(model, device)
 
     audio_np = prepare_audio_file(input_path)
     orig_len = len(audio_np)
     duration = orig_len / SAMPLE_RATE
     print(f"Input: {input_path} ({duration:.2f}s, {orig_len:,} samples)")
+
+    if fast_wav and not play and output_path is not None and device.type == "cuda":
+        t0 = time.perf_counter()
+        collected = process_wav_fast_batched(model, audio_np, wet, volume, device, batch_size=batch_size)
+        elapsed = time.perf_counter() - t0
+        print(f"Fast path elapsed: {elapsed:.2f}s for {duration:.2f}s audio ({duration / max(elapsed, 1e-9):.2f}x realtime)")
+        torchaudio.save(output_path, torch.from_numpy(collected).unsqueeze(0), SAMPLE_RATE)
+        print(f"Saved to: {output_path}")
+        return
 
     pad = (HOP_SIZE - (orig_len % HOP_SIZE)) % HOP_SIZE
     if pad:
@@ -275,10 +376,10 @@ class ThreadedRealTimePipeline:
         configure_jetson_torch(self.device, fp16)
         print(f"Inference device: {self.device}")
 
-        self.model = load_model(model_path, self.device, fp16=fp16)
-        self.fp16 = fp16 and self.device.type == "cuda"
-        self.volume = volume
-        self.wet_mix = wet
+        configure_jetson_runtime(self.device, fp16=False)
+        self.model = load_model(model_path, self.device, fp16=False)
+        self.volume = 1.0
+        self.wet_mix = 1.0
         self.running = False
         self.input_device = input_device
         self.output_device = output_device
@@ -458,11 +559,9 @@ def main():
     p.add_argument("--device", default="auto", help="auto | cuda | cpu")
     p.add_argument("--fp16", action="store_true", help="Use half precision on CUDA")
     p.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
-    p.add_argument("--input-device", default=None, help="sounddevice input device index or name")
-    p.add_argument("--output-device", default=None, help="sounddevice output device index or name")
-    p.add_argument("--latency", default="low", help="sounddevice latency: low, high, or seconds like 0.08")
-    p.add_argument("--queue-hops", type=int, default=6, help="Live safety queue size in hops")
-    p.add_argument("--fallback", choices=["dry", "zero"], default="dry", help="Output when worker is late")
+    p.add_argument("--batch-size", type=int, default=256, help="CUDA batch size for fast WAV export")
+    p.add_argument("--fp16", action="store_true", help="Use FP16 on CUDA. Fast on Orin; disable if output quality changes.")
+    p.add_argument("--no-fast-wav", action="store_true", help="Disable batched CUDA WAV export path")
     args = p.parse_args()
 
     if args.list_devices:
@@ -494,10 +593,9 @@ def main():
             volume=args.volume,
             device_str=args.device,
             play=args.play,
+            batch_size=args.batch_size,
             fp16=args.fp16,
-            input_device=input_device,
-            output_device=output_device,
-            latency=latency,
+            fast_wav=not args.no_fast_wav,
         )
     else:
         pipe = ThreadedRealTimePipeline(
