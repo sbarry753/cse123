@@ -134,11 +134,15 @@ class OverlapAddEngine:
         self.device = device
         self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
         self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.norm_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.ola_window = np.hanning(FRAME_SIZE).astype(np.float32)
+        self.ola_window = np.maximum(self.ola_window, 1e-4)
         self.buf = torch.zeros(1, FRAME_SIZE, device=device)
 
     def reset(self):
         self.input_ring.fill(0.0)
         self.output_ring.fill(0.0)
+        self.norm_ring.fill(0.0)
         if hasattr(self.model, "reset_phase"):
             self.model.reset_phase()
 
@@ -153,15 +157,21 @@ class OverlapAddEngine:
         # Model predicts full FRAME_SIZE window
         pred_frame = _infer(self.model, self.buf, self.input_ring.copy())
 
-        # Overlap-add prediction
-        self.output_ring += pred_frame
+        # Windowed + normalized overlap-add. Without this, 75% overlap can
+        # sum several full-amplitude frames together and cause distortion.
+        win = self.ola_window
+        self.output_ring += pred_frame * win
+        self.norm_ring += win
 
-        # Emit earliest hop
-        out_hop = self.output_ring[:HOP_SIZE].copy()
+        # Emit earliest hop with gain compensation
+        denom = np.maximum(self.norm_ring[:HOP_SIZE], 1e-6)
+        out_hop = (self.output_ring[:HOP_SIZE] / denom).copy()
 
-        # Shift output ring left by one hop
+        # Shift output and normalization rings left by one hop
         self.output_ring[:-HOP_SIZE] = self.output_ring[HOP_SIZE:]
         self.output_ring[-HOP_SIZE:] = 0.0
+        self.norm_ring[:-HOP_SIZE] = self.norm_ring[HOP_SIZE:]
+        self.norm_ring[-HOP_SIZE:] = 0.0
 
         return out_hop
 

@@ -27,9 +27,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--hidden_size", type=int, default=128)
-    p.add_argument("--base_ch", type=int, default=12, help="U-Net base channels; lower is faster")
-    p.add_argument("--transient_channels", type=int, default=16, help="Transient shaper channels; lower is faster")
+    p.add_argument("--hidden_size", type=int, default=256)
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--device", type=str, default="auto")
     return p.parse_args()
@@ -66,8 +64,9 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch=0):
 
         # Mild regularization on very large residual outputs
         if "residual" in params:
-            reg = 1e-4 * params["residual"].abs().mean()
-            loss = loss + reg
+            loss = loss + 1e-4 * params["residual"].abs().mean()
+        if "refine_residual" in params:
+            loss = loss + 5e-4 * params["refine_residual"].abs().mean()
 
         if torch.isnan(loss) or torch.isinf(loss):
             print("  ⚠ NaN/Inf loss detected, skipping batch")
@@ -101,6 +100,8 @@ def val_epoch(model, loader, criterion, device):
 
         if "residual" in params:
             loss = loss + 1e-4 * params["residual"].abs().mean()
+        if "refine_residual" in params:
+            loss = loss + 5e-4 * params["refine_residual"].abs().mean()
 
         total_loss += float(loss.item())
         n_batches += 1
@@ -169,8 +170,6 @@ def main():
         sample_rate=SAMPLE_RATE,
         frame_size=FRAME_SIZE,
         hop_size=HOP_SIZE,
-        base_ch=args.base_ch,
-        transient_channels=args.transient_channels,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

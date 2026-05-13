@@ -10,15 +10,15 @@ import torch.nn.functional as F
 # ============================================================
 
 SAMPLE_RATE = 48000
-FRAME_SIZE = 512                # analysis window (lower latency than 1024)
-HOP_SIZE = 128                  # 75% overlap; callback chunk is 2.7 ms at 48 kHz
+FRAME_SIZE = 512                # analysis window (~10.7 ms @ 48 kHz)
+HOP_SIZE = 128                  # 75% overlap (~2.7 ms callback)
 N_FFT = 512
 N_FREQ_BINS = N_FFT // 2 + 1
 
 # Kept for compatibility with old scripts / imports
 N_HARMONICS = 64
 N_NOISE_BANDS = 65
-HIDDEN_SIZE = 128
+HIDDEN_SIZE = 256
 N_MFCC = 20
 
 
@@ -66,7 +66,7 @@ class SpectralUNet(nn.Module):
     Output: multiplicative mask + additive residual in log-mag domain
     """
 
-    def __init__(self, base_ch: int = 12):
+    def __init__(self, base_ch: int = 24):
         super().__init__()
         self.enc1 = ConvBlock2d(1, base_ch)
         self.enc2 = ConvBlock2d(base_ch, base_ch * 2, stride=(2, 2))
@@ -102,22 +102,21 @@ class TransientShaper(nn.Module):
     Learns onset reshaping so pick transients become more hammer-like.
     """
 
-    def __init__(self, channels: int = 16):
+    def __init__(self, channels: int = 32):
         super().__init__()
-        # Lighter transient shaper for real-time use.
-        # This keeps the same input/output behavior but uses fewer channels
-        # and one fewer convolution than the original version.
         self.delta_net = nn.Sequential(
-            nn.Conv1d(1, channels, kernel_size=7, padding=3),
+            nn.Conv1d(1, channels, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=9, padding=4),
             nn.GELU(),
             nn.Conv1d(channels, channels, kernel_size=5, padding=2),
             nn.GELU(),
             nn.Conv1d(channels, 1, kernel_size=1),
         )
         self.gate_net = nn.Sequential(
-            nn.Conv1d(1, 4, kernel_size=5, padding=2),
+            nn.Conv1d(1, 8, kernel_size=7, padding=3),
             nn.GELU(),
-            nn.Conv1d(4, 1, kernel_size=1),
+            nn.Conv1d(8, 1, kernel_size=1),
             nn.Sigmoid(),
         )
 
@@ -127,6 +126,33 @@ class TransientShaper(nn.Module):
         gate = self.gate_net(torch.abs(x))
         y = x + 0.30 * gate * delta
         return y.squeeze(1)
+
+
+class PianoToneRefiner(nn.Module):
+    """
+    Lightweight post-processing network.
+
+    It learns a small residual polish after the spectral U-Net + transient
+    shaper. The tanh scale keeps it from becoming a distortion generator.
+    """
+
+    def __init__(self, channels: int = 32, max_residual: float = 0.12):
+        super().__init__()
+        self.max_residual = max_residual
+        self.net = nn.Sequential(
+            nn.Conv1d(2, channels, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(channels, 1, kernel_size=1),
+        )
+
+    def forward(self, audio: torch.Tensor, dry: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = torch.stack([audio, dry], dim=1)
+        residual = torch.tanh(self.net(x)).squeeze(1) * self.max_residual
+        return audio + residual, residual
 
 
 class PolyphonicGuitarToPiano(nn.Module):
@@ -146,12 +172,9 @@ class PolyphonicGuitarToPiano(nn.Module):
         self.hop_size = hop_size
         self.hidden_size = hidden_size
 
-        # Smaller defaults make inference much cheaper than the original
-        # base_ch=24 / transient=32 model.
-        base_ch = int(kwargs.pop("base_ch", 12))
-        transient_channels = int(kwargs.pop("transient_channels", 16))
-        self.unet = SpectralUNet(base_ch=base_ch)
-        self.transient = TransientShaper(channels=transient_channels)
+        self.unet = SpectralUNet(base_ch=24)
+        self.transient = TransientShaper(channels=32)
+        self.refiner = PianoToneRefiner(channels=32, max_residual=0.12)
 
         self.register_buffer("window", torch.hann_window(frame_size))
 
@@ -200,8 +223,11 @@ class PolyphonicGuitarToPiano(nn.Module):
         audio_out = self._istft(out_spec, length=length)
         audio_out = self.transient(audio_out)
 
-        # Small dry blend helps keep articulation stable
-        audio_out = 0.9 * torch.tanh(audio_out) + 0.1 * audio_frame
+        # Add a small learned polish stage for piano-like body/noise cleanup.
+        audio_out, refine_residual = self.refiner(audio_out, audio_frame)
+
+        # Very small dry blend keeps articulation stable without washing out piano tone.
+        audio_out = 0.97 * torch.tanh(audio_out) + 0.03 * audio_frame
 
         features = {
             "input_mag": mag,
@@ -210,6 +236,7 @@ class PolyphonicGuitarToPiano(nn.Module):
         params = {
             "mask": mask.squeeze(1),
             "residual": residual.squeeze(1),
+            "refine_residual": refine_residual,
         }
         return audio_out, features, params
 
