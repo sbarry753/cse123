@@ -41,6 +41,13 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
+import torch
+import torchaudio
+
+import onnxruntime as ort
+import tensorrt as trt
+from cuda.bindings import runtime as cudart
+
 
 SAMPLE_RATE = 48000
 FRAME_SIZE = 1024
@@ -122,8 +129,6 @@ def validate_device(idx, want_input: bool) -> None:
 # ONNX inference + overlap-add
 # ------------------------------------------------------------
 def choose_providers(provider: str) -> List[str]:
-    import onnxruntime as ort
-
     available = ort.get_available_providers()
     if provider == "cpu":
         return ["CPUExecutionProvider"]
@@ -149,8 +154,6 @@ class OnnxOLAEngine:
     """
 
     def __init__(self, model_path: str, providers: List[str]):
-        import onnxruntime as ort
-
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess_opts.intra_op_num_threads = 1
@@ -224,9 +227,6 @@ class TrtOLAEngine:
     """
 
     def __init__(self, engine_path: str):
-        import tensorrt as trt
-        from cuda import cudart
-
         self.trt = trt
         self.cudart = cudart
         self.stream = None
@@ -382,8 +382,6 @@ def warmup(engine, n: int = 64) -> None:
 # WAV file mode
 # ------------------------------------------------------------
 def prepare_audio_file(input_path: str) -> np.ndarray:
-    import torchaudio
-
     audio, sr = torchaudio.load(input_path)
     if audio.shape[0] > 1:
         audio = audio.mean(0, keepdim=True)
@@ -394,9 +392,6 @@ def prepare_audio_file(input_path: str) -> np.ndarray:
 
 
 def save_audio_file(output_path: str, audio: np.ndarray) -> None:
-    import torch
-    import torchaudio
-
     torchaudio.save(output_path, torch.from_numpy(audio).unsqueeze(0), SAMPLE_RATE)
 
 
