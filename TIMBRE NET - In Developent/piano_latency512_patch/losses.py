@@ -16,9 +16,9 @@ import numpy as np
 class MultiScaleSpectralLoss(nn.Module):
     def __init__(
         self,
-        fft_sizes=(128, 256, 512),
+        fft_sizes=(128, 256, 512, 1024),
         hop_fractions=0.25,
-        n_mels=48,
+        n_mels=80,
         sample_rate=48000,
     ):
         super().__init__()
@@ -121,10 +121,10 @@ class OnsetLoss(nn.Module):
 class CombinedLoss(nn.Module):
     def __init__(
         self,
-        spectral_weight=1.0,
-        waveform_weight=0.25,
-        envelope_weight=0.10,
-        onset_weight=0.35,
+        spectral_weight=1.20,
+        waveform_weight=0.08,
+        envelope_weight=0.20,
+        onset_weight=0.18,
     ):
         super().__init__()
         self.spectral_loss = MultiScaleSpectralLoss()
