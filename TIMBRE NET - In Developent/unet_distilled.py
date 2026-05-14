@@ -2,13 +2,14 @@
 MAX78000-compatible small U-Net student for timbre-transfer KD.
 
 The network itself uses ai8x-supported modules: fused convolution, fused
-pool-convolution, fused transposed convolution, and element-wise add. Inputs
+pool-convolution, fused transposed convolution, and concatenative skips. Inputs
 with odd spectrogram sizes should be padded by the caller before entering the
 network, then cropped back after inference.
 """
 from pathlib import Path
 import sys
 
+import torch
 from torch import nn
 
 ai8x_dir = str(Path(__file__).resolve().parent.parent / "lib" / "ai8x-training")
@@ -18,7 +19,7 @@ import ai8x
 
 class TimbreUNetStudent(nn.Module):
     """
-    Compact additive-skip U-Net for mask + residual spectrogram prediction.
+    Compact concat-skip U-Net for mask + residual spectrogram prediction.
 
     Expected input shape is (N, 1, padded_freq_bins, padded_time_frames), where
     both spatial dimensions are divisible by 4. The output preserves that padded
@@ -73,9 +74,8 @@ class TimbreUNetStudent(nn.Module):
             base_ch * 4, base_ch * 2, 3, stride=2, padding=1,
             bias=bias, batchnorm="Affine", **kwargs
         )
-        self.skip1 = ai8x.Add()
         self.dec1 = ai8x.FusedConv2dBNReLU(
-            base_ch * 2, base_ch * 2, 3, stride=1, padding=1,
+            base_ch * 4, base_ch * 2, 3, stride=1, padding=1,
             bias=bias, batchnorm="Affine", **kwargs
         )
 
@@ -83,8 +83,22 @@ class TimbreUNetStudent(nn.Module):
             base_ch * 2, base_ch, 3, stride=2, padding=1,
             bias=bias, batchnorm="Affine", **kwargs
         )
-        self.skip0 = ai8x.Add()
         self.dec0 = ai8x.FusedConv2dBNReLU(
+            base_ch * 2, base_ch, 3, stride=1, padding=1,
+            bias=bias, batchnorm="Affine", **kwargs
+        )
+
+        self.dec0_refine = ai8x.FusedConv2dBNReLU(
+            base_ch, base_ch, 3, stride=1, padding=1,
+            bias=bias, batchnorm="Affine", **kwargs
+        )
+
+        self.dec0_refine2 = ai8x.FusedConv2dBNReLU(
+            base_ch, base_ch, 3, stride=1, padding=1,
+            bias=bias, batchnorm="Affine", **kwargs
+        )
+
+        self.dec0_refine3 = ai8x.FusedConv2dBNReLU(
             base_ch, base_ch, 3, stride=1, padding=1,
             bias=bias, batchnorm="Affine", **kwargs
         )
@@ -100,12 +114,16 @@ class TimbreUNetStudent(nn.Module):
         x = self.bottleneck(self.down2(enc1))
 
         x = self.up1(x)
-        x = self.skip1(x, enc1)
+        x = torch.cat((x, enc1), dim=1)
         x = self.dec1(x)
 
         x = self.up0(x)
-        x = self.skip0(x, enc0)
+        x = torch.cat((x, enc0), dim=1)
+
         x = self.dec0(x)
+        x = self.dec0_refine(x)
+        x = self.dec0_refine2(x)
+        x = self.dec0_refine3(x)
         return self.out(x)
 
 

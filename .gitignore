@@ -150,5 +150,8 @@ local.properties
 
 /TIMBRE NET - In Developent/data_extended
 /TIMBRE NET - In Developent/audio_out
-/TIMBRE NET - In Developent/checkpoints_distilled
+TIMBRE NET - In Developent/checkpoints*
 TIMBRE NET - In Developent/cache_data
+
+TIMBRE NET - In Developent/spectral_debug_plots*
+TIMBRE NET - In Developent/spectral_renders*
