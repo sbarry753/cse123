@@ -1,8 +1,8 @@
 """
 Plot frame-level spectral KD debug maps for a distilled spectral student.
 
-The plots compare guitar input, teacher pretransient target, student output,
-residuals, errors, and the energy weighting used by train_spectral.py.
+The plots compare guitar input, teacher pretransient target, teacher final
+target, student output, residuals, errors, and training energy weights.
 """
 from __future__ import annotations
 
@@ -62,7 +62,8 @@ def get_device(preference: str) -> torch.device:
 
 
 def checkpoint_state(payload):
-    return payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    return {key: value for key, value in state.items() if key != "window"}
 
 
 def metadata_get(payload: dict | None, name: str, default):
@@ -120,12 +121,13 @@ def parse_frame_indices(args) -> list[int]:
     return [args.start_frame + i * args.frame_stride for i in range(args.num_frames)]
 
 
-def load_teacher(path: str, device: torch.device, frame_size: int, hop_size: int, n_fft: int):
+def load_teacher(path: str, device: torch.device, frame_size: int, hop_size: int, n_fft: int, win_length: int):
     teacher = DDSPGuitarToPiano(
         sample_rate=SAMPLE_RATE,
         frame_size=frame_size,
         hop_size=hop_size,
         n_fft=n_fft,
+        win_length=win_length,
     ).to(device)
     payload = torch.load(path, map_location=device, weights_only=False)
     teacher.load_state_dict(checkpoint_state(payload))
@@ -140,13 +142,15 @@ def load_student(path: str, device: torch.device, args):
     frame_size = int(args.frame_size or metadata_get(payload, "frame_size", FRAME_SIZE))
     hop_size = int(args.hop_size or metadata_get(payload, "hop_size", HOP_SIZE))
     n_fft = int(args.n_fft or metadata_get(payload, "n_fft", N_FFT))
+    win_length = int(metadata_get(payload, "win_length", n_fft))
     base_ch = int(args.base_ch or metadata_get(payload, "base_ch", 8))
     log_scale = float(args.log_scale or metadata_get(payload, "log_scale", 6.0))
     spectral_output = str(metadata_get(payload, "spectral_output", "mask_residual"))
+    distill_target = str(metadata_get(payload, "distill_target", "teacher_pretransient"))
     one_channel_outputs = {"log_residual", "log_mag"}
     default_num_classes = 1 if spectral_output in one_channel_outputs else 2
     num_classes = int(metadata_get(payload, "num_classes", default_num_classes))
-    if spectral_output not in {"mask_residual", "log_residual", "log_mag"}:
+    if spectral_output not in {"mask_residual", "identity_mask_residual", "log_residual", "log_mag"}:
         raise ValueError(f"Unsupported spectral_output={spectral_output!r}")
     expected_classes = 1 if spectral_output in one_channel_outputs else 2
     if num_classes != expected_classes:
@@ -185,11 +189,13 @@ def load_student(path: str, device: torch.device, args):
         "frame_size": frame_size,
         "hop_size": hop_size,
         "n_fft": n_fft,
+        "win_length": win_length,
         "base_ch": base_ch,
         "log_scale": log_scale,
         "log_floor": log_floor,
         "residual_clip": residual_clip,
         "spectral_output": spectral_output,
+        "distill_target": distill_target,
         "num_classes": num_classes,
         "energy_weight_floor": energy_floor,
         "energy_weight_ceiling": energy_ceiling,
@@ -203,14 +209,14 @@ class SpectralDebugFrame(torch.nn.Module):
         self.teacher = teacher
         self.student = student
         self.config = config
-        self.register_buffer("window", torch.hann_window(config["frame_size"]))
+        self.register_buffer("window", torch.hann_window(config["win_length"]))
 
     def _stft(self, audio: torch.Tensor) -> torch.Tensor:
         return torch.stft(
             audio.float(),
             n_fft=self.config["n_fft"],
             hop_length=self.config["hop_size"],
-            win_length=self.config["frame_size"],
+            win_length=self.config["win_length"],
             window=self.window.to(audio.device),
             return_complex=True,
             center=True,
@@ -250,20 +256,20 @@ class SpectralDebugFrame(torch.nn.Module):
             teacher_spec,
             n_fft=self.config["n_fft"],
             hop_length=self.config["hop_size"],
-            win_length=self.config["frame_size"],
+            win_length=self.config["win_length"],
             window=self.window.to(audio_frame.device),
             center=True,
             length=audio_frame.shape[-1],
         )
-        teacher_shaped_audio = torch.tanh(self.teacher.transient(teacher_audio))
-        teacher_shaped_spec = self._stft(teacher_shaped_audio)
-        teacher_shaped_mag = torch.abs(teacher_shaped_spec)
-        teacher_shaped_log_mag = torch.log(
-            torch.clamp(teacher_shaped_mag, min=self.config["log_floor"])
+        teacher_final_audio = torch.tanh(self.teacher.transient(teacher_audio))
+        teacher_final_spec = self._stft(teacher_final_audio)
+        teacher_final_mag = torch.abs(teacher_final_spec)
+        teacher_final_log_mag = torch.log(
+            torch.clamp(teacher_final_mag, min=self.config["log_floor"])
         ).unsqueeze(1)
 
         input_log_padded = pad_to_multiple_2d(input_log)
-        if self.config["spectral_output"] == "log_mag":
+        if self.config["spectral_output"] in {"log_mag", "identity_mask_residual"}:
             student_input = input_log_padded
         else:
             scaled_log = torch.clamp(torch.log1p(mag) / self.config["log_scale"], 0.0, 1.0)
@@ -282,6 +288,11 @@ class SpectralDebugFrame(torch.nn.Module):
                     max=self.config["residual_clip"],
                 )
             student_log_mag = input_log_padded + predicted_residual
+        elif self.config["spectral_output"] == "identity_mask_residual":
+            student_mask = 1.0 + 0.5 * torch.tanh(student_pred[:, :1])
+            student_residual = student_pred[:, 1:2]
+            student_log_mag = input_log_padded * student_mask + student_residual
+            predicted_residual = student_log_mag - input_log_padded
         else:
             student_mask = torch.sigmoid(student_pred[:, :1]) * 2.0
             predicted_residual = student_pred[:, 1:2]
@@ -293,18 +304,28 @@ class SpectralDebugFrame(torch.nn.Module):
             piano_log_mag = crop_valid(piano_log_mag, valid_shape)
             piano_residual = piano_log_mag - input_log
         teacher_log_mag = crop_valid(teacher_log_mag, valid_shape)
-        teacher_shaped_log_mag = crop_valid(teacher_shaped_log_mag, valid_shape)
-        teacher_shaped_residual = teacher_shaped_log_mag - input_log
+        teacher_final_log_mag = crop_valid(teacher_final_log_mag, valid_shape)
+        teacher_final_mag = crop_valid(teacher_final_mag.unsqueeze(1), valid_shape)
+        teacher_final_residual = teacher_final_log_mag - input_log
         student_log_mag = crop_valid(student_log_mag, valid_shape)
         target_residual = crop_valid(target_residual, valid_shape)
         predicted_residual = crop_valid(predicted_residual, valid_shape)
         teacher_mag = crop_valid(teacher_mag, valid_shape)
 
-        abs_error = torch.abs(student_log_mag - teacher_log_mag)
-        signed_error = student_log_mag - teacher_log_mag
-        denom = teacher_mag.mean(dim=(-2, -1), keepdim=True).clamp_min(1.0e-8)
+        if self.config["distill_target"] == "teacher_final":
+            primary_log_mag = teacher_final_log_mag
+            primary_residual = teacher_final_residual
+            primary_mag = teacher_final_mag
+        else:
+            primary_log_mag = teacher_log_mag
+            primary_residual = target_residual
+            primary_mag = teacher_mag
+
+        abs_error = torch.abs(student_log_mag - primary_log_mag)
+        signed_error = student_log_mag - primary_log_mag
+        denom = primary_mag.mean(dim=(-2, -1), keepdim=True).clamp_min(1.0e-8)
         energy_weight = torch.clamp(
-            teacher_mag / denom,
+            primary_mag / denom,
             min=self.config["energy_weight_floor"],
             max=self.config["energy_weight_ceiling"],
         )
@@ -313,10 +334,12 @@ class SpectralDebugFrame(torch.nn.Module):
         result = {
             "input_log": input_log,
             "teacher_log_mag": teacher_log_mag,
-            "teacher_shaped_log_mag": teacher_shaped_log_mag,
-            "teacher_shaped_residual": teacher_shaped_residual,
+            "teacher_final_log_mag": teacher_final_log_mag,
+            "teacher_final_residual": teacher_final_residual,
             "student_log_mag": student_log_mag,
             "target_residual": target_residual,
+            "primary_target_log_mag": primary_log_mag,
+            "primary_target_residual": primary_residual,
             "predicted_residual": predicted_residual,
             "abs_error": abs_error,
             "signed_error": signed_error,
@@ -359,7 +382,7 @@ def plot_frame(result: dict, out_png: Path, title: str):
     log_maps = [
         maps["input_log"],
         maps["teacher_log_mag"],
-        maps["teacher_shaped_log_mag"],
+        maps["teacher_final_log_mag"],
         maps["student_log_mag"],
     ]
     if "piano_log_mag" in maps:
@@ -367,7 +390,8 @@ def plot_frame(result: dict, out_png: Path, title: str):
     log_vmin, log_vmax = finite_range(*log_maps)
     residual_vmin, residual_vmax = symmetric_range(
         maps["target_residual"],
-        maps["teacher_shaped_residual"],
+        maps["teacher_final_residual"],
+        maps["primary_target_residual"],
         maps["predicted_residual"],
         maps["signed_error"],
         *( [maps["piano_residual"]] if "piano_residual" in maps else [] ),
@@ -382,10 +406,10 @@ def plot_frame(result: dict, out_png: Path, title: str):
         specs.append(("Target piano log-mag", "piano_log_mag", "magma", log_vmin, log_vmax))
     specs.extend([
         ("Teacher log-mag", "teacher_log_mag", "magma", log_vmin, log_vmax),
-        ("Teacher shaped log-mag", "teacher_shaped_log_mag", "magma", log_vmin, log_vmax),
+        ("Teacher final log-mag", "teacher_final_log_mag", "magma", log_vmin, log_vmax),
         ("Student log-mag", "student_log_mag", "magma", log_vmin, log_vmax),
         ("Target residual", "target_residual", "coolwarm", residual_vmin, residual_vmax),
-        ("Teacher shaped residual", "teacher_shaped_residual", "coolwarm", residual_vmin, residual_vmax),
+        ("Teacher final residual", "teacher_final_residual", "coolwarm", residual_vmin, residual_vmax),
     ])
     if "piano_residual" in maps:
         specs.append(("Piano residual", "piano_residual", "coolwarm", residual_vmin, residual_vmax))
@@ -425,8 +449,10 @@ def plot_frame(result: dict, out_png: Path, title: str):
 def write_metrics(result: dict, out_txt: Path, args, config: dict, frame_index: int, start_sample: int):
     input_log = result["input_log"]
     teacher_log_mag = result["teacher_log_mag"]
-    teacher_shaped_log_mag = result["teacher_shaped_log_mag"]
-    teacher_shaped_residual = result["teacher_shaped_residual"]
+    teacher_final_log_mag = result["teacher_final_log_mag"]
+    teacher_final_residual = result["teacher_final_residual"]
+    primary_target_log_mag = result["primary_target_log_mag"]
+    primary_target_residual = result["primary_target_residual"]
     student_log_mag = result["student_log_mag"]
     piano_log_mag = result.get("piano_log_mag")
     piano_residual = result.get("piano_residual")
@@ -453,29 +479,42 @@ def write_metrics(result: dict, out_txt: Path, args, config: dict, frame_index: 
 
     metrics = {
         "weighted_log_mag_l1": float(weighted_error.mean().item()),
-        "unweighted_log_mag_l1": float(F.l1_loss(student_log_mag, teacher_log_mag).item()),
-        "residual_l1": float(F.l1_loss(predicted_residual, target_residual).item()),
+        "unweighted_log_mag_l1": float(
+            F.l1_loss(student_log_mag, primary_target_log_mag).item()
+        ),
+        "residual_l1": float(
+            F.l1_loss(predicted_residual, primary_target_residual).item()
+        ),
         "mean_absolute_error": float(abs_error.mean().item()),
         "max_absolute_error": float(abs_error.max().item()),
     }
     add_range(metrics, "input_log", input_log)
     add_range(metrics, "teacher_log_mag", teacher_log_mag)
-    add_range(metrics, "teacher_shaped_log_mag", teacher_shaped_log_mag)
-    add_range(metrics, "teacher_shaped_residual", teacher_shaped_residual)
-    metrics["teacher_pre_vs_shaped_log_mag_l1"] = float(
-        F.l1_loss(teacher_log_mag, teacher_shaped_log_mag).item()
+    add_range(metrics, "teacher_final_log_mag", teacher_final_log_mag)
+    add_range(metrics, "teacher_final_residual", teacher_final_residual)
+    metrics["teacher_pre_vs_teacher_final_log_mag_l1"] = float(
+        F.l1_loss(teacher_log_mag, teacher_final_log_mag).item()
     )
-    metrics["student_vs_teacher_shaped_log_mag_l1"] = float(
-        F.l1_loss(student_log_mag, teacher_shaped_log_mag).item()
+    metrics["student_vs_teacher_final_log_mag_l1"] = float(
+        F.l1_loss(student_log_mag, teacher_final_log_mag).item()
     )
-    metrics["student_vs_teacher_shaped_residual_l1"] = float(
-        F.l1_loss(predicted_residual, teacher_shaped_residual).item()
+    metrics["student_vs_teacher_final_residual_l1"] = float(
+        F.l1_loss(predicted_residual, teacher_final_residual).item()
+    )
+    metrics["student_vs_primary_target_log_mag_l1"] = float(
+        F.l1_loss(student_log_mag, primary_target_log_mag).item()
+    )
+    metrics["student_vs_primary_target_residual_l1"] = float(
+        F.l1_loss(predicted_residual, primary_target_residual).item()
     )
     add_range(metrics, "student_log_mag", student_log_mag)
     if piano_log_mag is not None:
         add_range(metrics, "piano_log_mag", piano_log_mag)
         metrics["teacher_vs_piano_log_mag_l1"] = float(
             F.l1_loss(teacher_log_mag, piano_log_mag).item()
+        )
+        metrics["teacher_final_vs_piano_log_mag_l1"] = float(
+            F.l1_loss(teacher_final_log_mag, piano_log_mag).item()
         )
         metrics["student_vs_piano_log_mag_l1"] = float(
             F.l1_loss(student_log_mag, piano_log_mag).item()
@@ -484,6 +523,9 @@ def write_metrics(result: dict, out_txt: Path, args, config: dict, frame_index: 
         add_range(metrics, "piano_residual", piano_residual)
         metrics["teacher_vs_piano_residual_l1"] = float(
             F.l1_loss(target_residual, piano_residual).item()
+        )
+        metrics["teacher_final_vs_piano_residual_l1"] = float(
+            F.l1_loss(teacher_final_residual, piano_residual).item()
         )
         metrics["student_vs_piano_residual_l1"] = float(
             F.l1_loss(predicted_residual, piano_residual).item()
@@ -499,10 +541,18 @@ def write_metrics(result: dict, out_txt: Path, args, config: dict, frame_index: 
     ) * (SAMPLE_RATE / float(config["n_fft"]))
     hf_mask = (bin_hz >= args.debug_hf_start_hz).view(1, 1, freq_bins, 1)
     hf_teacher = teacher_log_mag.masked_select(hf_mask.expand_as(teacher_log_mag))
+    hf_teacher_final = teacher_final_log_mag.masked_select(
+        hf_mask.expand_as(teacher_final_log_mag)
+    )
+    hf_primary = primary_target_log_mag.masked_select(
+        hf_mask.expand_as(primary_target_log_mag)
+    )
     hf_student = student_log_mag.masked_select(hf_mask.expand_as(student_log_mag))
     hf_signed_error = signed_error.masked_select(hf_mask.expand_as(signed_error))
     hf_abs_error = abs_error.masked_select(hf_mask.expand_as(abs_error))
     add_optional_stats(metrics, "high_freq_teacher_log_mag", hf_teacher)
+    add_optional_stats(metrics, "high_freq_teacher_final_log_mag", hf_teacher_final)
+    add_optional_stats(metrics, "high_freq_primary_target_log_mag", hf_primary)
     add_optional_stats(metrics, "high_freq_student_log_mag", hf_student)
     add_optional_stats(metrics, "high_freq_signed_error", hf_signed_error)
     add_optional_stats(metrics, "high_freq_abs_error", hf_abs_error)
@@ -520,11 +570,13 @@ def write_metrics(result: dict, out_txt: Path, args, config: dict, frame_index: 
         f"frame_size={config['frame_size']}",
         f"hop_size={config['hop_size']}",
         f"n_fft={config['n_fft']}",
+        f"win_length={config['win_length']}",
         f"base_ch={config['base_ch']}",
         f"log_scale={config['log_scale']}",
         f"log_floor={config['log_floor']}",
         f"residual_clip={config['residual_clip']}",
         f"spectral_output={config['spectral_output']}",
+        f"distill_target={config['distill_target']}",
         f"energy_weight_floor={config['energy_weight_floor']}",
         f"energy_weight_ceiling={config['energy_weight_ceiling']}",
     ]
@@ -558,6 +610,7 @@ def main():
         config["frame_size"],
         config["hop_size"],
         config["n_fft"],
+        config["win_length"],
     )
     debugger = SpectralDebugFrame(teacher, student, config).to(device)
     audio = load_audio(args.guitar_wav)
@@ -575,7 +628,7 @@ def main():
     print(f"Device: {device}")
     print(
         f"Student: {args.student_ckpt} | frame={config['frame_size']}, "
-        f"hop={config['hop_size']}, n_fft={config['n_fft']}, "
+        f"hop={config['hop_size']}, n_fft={config['n_fft']}, win={config['win_length']}, "
         f"spectral_output={config['spectral_output']}"
     )
 

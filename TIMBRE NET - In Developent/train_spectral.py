@@ -1,10 +1,11 @@
 """
-Direct residual spectral KD pretraining for DDSPGuitarToPiano -> TimbreUNetStudent.
+Identity-mask residual spectral KD pretraining for DDSPGuitarToPiano -> TimbreUNetStudent.
 
 The MAX78000-compatible student receives a raw guitar log-magnitude spectrogram
-and predicts the teacher's pretransient residual in the raw log-magnitude domain:
+and predicts a bounded deviation from identity mask plus an additive residual:
 
-    student_log_mag = input_log_mag + student(input_log_mag)
+    student_mask = 1.0 + 0.5 * tanh(mask_delta)
+    student_log_mag = input_log_mag * student_mask + student_residual
 
 The default objective is teacher-only pretransient spectral mimicry.
 """
@@ -53,10 +54,12 @@ def parse_args():
     p.add_argument("--teacher_ckpt", "--teacher-ckpt", type=str, required=True)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--n_fft", type=int, default=N_FFT)
+    p.add_argument("--win_length", type=int, default=None)
     p.add_argument("--hop_size", type=int, default=HOP_SIZE)
     p.add_argument("--frame_size", type=int, default=FRAME_SIZE)
     p.add_argument("--base_ch", type=int, default=8)
     p.add_argument("--log_scale", type=float, default=6.0)
+    p.add_argument("--mask_loss_weight", type=float, default=0.2)
     p.add_argument("--residual_loss_weight", type=float, default=0.2)
     p.add_argument("--log_mag_loss_weight", type=float, default=0.6)
     p.add_argument("--piano_log_mag_loss_weight", type=float, default=0.01)
@@ -80,7 +83,14 @@ def parse_args():
     p.add_argument("--ai8x_device", type=int, default=85, help="ai8x hardware device code, 85 for MAX78000.")
     p.add_argument("--simulate", action="store_true", help="Use ai8x hardware-simulation quantization behavior.")
     p.add_argument("--avg_pool_rounding", action="store_true", help="Use ai8x average-pooling rounding mode.")
-    return p.parse_args()
+    args = p.parse_args()
+    args.win_length = int(args.win_length or args.n_fft)
+    return args
+
+
+def checkpoint_state(payload):
+    state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    return {key: value for key, value in state.items() if key != "window"}
 
 def load_teacher(args, device):
     """
@@ -91,11 +101,11 @@ def load_teacher(args, device):
         frame_size=args.frame_size,
         hop_size=args.hop_size,
         n_fft=args.n_fft,
+        win_length=args.win_length,
     ).to(device)
 
     payload = torch.load(args.teacher_ckpt, map_location=device, weights_only=False)
-    state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-    teacher.load_state_dict(state)
+    teacher.load_state_dict(checkpoint_state(payload))
     teacher.eval()
     for param in teacher.parameters():
         param.requires_grad_(False)
@@ -163,7 +173,7 @@ def spectrogram(
         window: torch.Tensor, 
         n_fft: int, 
         hop_size: int, 
-        frame_size: int) -> torch.Tensor:
+        win_length: int) -> torch.Tensor:
     """
     Computes spectrogram of the audio frame
     (B, samples) -> (B, freq_bins, frames)
@@ -172,7 +182,7 @@ def spectrogram(
         audio.float(),
         n_fft=n_fft,
         hop_length=hop_size,
-        win_length=frame_size,
+        win_length=win_length,
         window=window.to(audio.device),
         return_complex=True,
         center=True,
@@ -209,7 +219,7 @@ def pretransient_target(
         length: int, 
         guitar_log_mag: torch.Tensor, 
         phase: torch.Tensor,
-        args) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        args) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes the teacher's raw log-mag target, residual target, and pretransient audio.
     """
@@ -224,6 +234,7 @@ def pretransient_target(
                 max=args.residual_clip,
             )
             teacher_log_mag = guitar_log_mag + target_residual
+            teacher_residual = teacher_log_mag - guitar_log_mag * teacher_mask
         teacher_mag = torch.exp(teacher_log_mag.squeeze(1))
 
         teacher_spec = torch.polar(teacher_mag, phase)
@@ -231,13 +242,13 @@ def pretransient_target(
             teacher_spec,
             n_fft = args.n_fft,
             hop_length = args.hop_size,
-            win_length = args.frame_size,
+            win_length = args.win_length,
             window = window.to(guitar_log_mag.device),
             center = True,
             length = length
         )
 
-    return target_residual, teacher_log_mag, teacher_pt_audio, teacher_mag
+    return teacher_mask, teacher_residual, target_residual, teacher_log_mag, teacher_pt_audio, teacher_mag
         
 
 def make_kd_batch(
@@ -249,7 +260,7 @@ def make_kd_batch(
     result = {}
 
     guitar_spec = spectrogram(
-        guitar_frames, window, args.n_fft, args.hop_size, args.frame_size
+        guitar_frames, window, args.n_fft, args.hop_size, args.win_length
     )
 
     guitar_mag = torch.abs(guitar_spec)
@@ -258,14 +269,14 @@ def make_kd_batch(
     guitar_log_mag = torch.log(torch.clamp(guitar_mag, args.log_floor)).unsqueeze(1)
 
     piano_spec = spectrogram(
-        piano_frames, window, args.n_fft, args.hop_size, args.frame_size
+        piano_frames, window, args.n_fft, args.hop_size, args.win_length
     )
 
     piano_mag = torch.abs(piano_spec)
     piano_log_mag = torch.log(torch.clamp(piano_mag, min=args.log_floor)).unsqueeze(1)
     piano_residual = piano_log_mag - guitar_log_mag
 
-    target_residual, teacher_log_mag, teacher_pt_audio, teacher_mag = pretransient_target(
+    teacher_mask, teacher_residual, target_residual, teacher_log_mag, teacher_pt_audio, teacher_mag = pretransient_target(
         teacher,
         window,
         guitar_frames.shape[-1],
@@ -276,6 +287,8 @@ def make_kd_batch(
     input_log = pad_to_multiple_2d(guitar_log_mag)
     result["input_log"] = input_log
     result["student_input"] = input_log
+    result["teacher_mask"] = pad_to_multiple_2d(teacher_mask)
+    result["teacher_residual"] = pad_to_multiple_2d(teacher_residual)
     result["target_residual"] = pad_to_multiple_2d(target_residual)
     result["teacher_log_mag"] = pad_to_multiple_2d(teacher_log_mag)
     result["teacher_pt_audio"] = teacher_pt_audio
@@ -290,12 +303,14 @@ def make_kd_batch(
 def decode_student(student_pred: torch.Tensor, 
                    input_log: torch.Tensor,
                    args
-                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pred_residual = student_pred[:, :1]
-        pred_log_mag = input_log + pred_residual
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mask_delta = student_pred[:, :1]
+        student_mask = 1.0 + 0.5 * torch.tanh(mask_delta)
+        student_residual = student_pred[:, 1:2]
+        pred_log_mag = input_log * student_mask + student_residual
         pred_mag = torch.exp(pred_log_mag.squeeze(1))
 
-        return pred_residual, pred_log_mag, pred_mag
+        return student_mask, student_residual, pred_log_mag, pred_mag
 
 def energy_weighted_l1(pred_log_mag, teacher_log_mag, teacher_mag, args):
       abs_err = torch.abs(pred_log_mag - teacher_log_mag)
@@ -341,6 +356,8 @@ def spectral_kd_loss(
     student_pred,
     input_log,
     phase,
+    teacher_mask,
+    teacher_residual,
     target_residual,
     teacher_log_mag,
     piano_log_mag,
@@ -353,12 +370,15 @@ def spectral_kd_loss(
     args,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     
-    pred_residual, pred_log_mag, pred_mag = decode_student(
+    student_mask, student_residual, pred_log_mag, pred_mag = decode_student(
         student_pred, input_log, args
     )
 
     pred_log_mag_valid = crop_valid(pred_log_mag, valid_shape)
-    pred_residual_valid = crop_valid(pred_residual, valid_shape)
+    student_mask_valid = crop_valid(student_mask, valid_shape)
+    student_residual_valid = crop_valid(student_residual, valid_shape)
+    teacher_mask_valid = crop_valid(teacher_mask, valid_shape)
+    teacher_residual_valid = crop_valid(teacher_residual, valid_shape)
     target_residual_valid = crop_valid(target_residual, valid_shape)
     teacher_log_mag_valid = crop_valid(teacher_log_mag, valid_shape)
     piano_log_mag_valid = crop_valid(piano_log_mag, valid_shape)
@@ -374,7 +394,8 @@ def spectral_kd_loss(
     )
 
     log_mag_unweighted = F.l1_loss(pred_log_mag_valid, teacher_log_mag_valid)
-    residual_loss = F.l1_loss(pred_residual_valid, target_residual_valid)
+    mask_loss = F.l1_loss(student_mask_valid, teacher_mask_valid)
+    residual_loss = F.l1_loss(student_residual_valid, teacher_residual_valid)
     hf_suppression_loss = high_frequency_suppression_loss(
         pred_log_mag_valid,
         input_log_valid,
@@ -390,7 +411,7 @@ def spectral_kd_loss(
             pred_spec,
             n_fft=args.n_fft,
             hop_length=args.hop_size,
-            win_length=args.frame_size,
+            win_length=args.win_length,
             window=window.to(pred_mag.device),
             center=True,
             length=teacher_pt_audio.shape[-1],
@@ -398,10 +419,13 @@ def spectral_kd_loss(
         teacher_audio_loss = criterion(pred_pt_audio, teacher_pt_audio)
 
     piano_log_mag_loss = F.l1_loss(pred_log_mag_valid, piano_log_mag_valid)
-    piano_residual_loss = F.l1_loss(pred_residual_valid, piano_residual_valid)
+    decoded_residual_valid = pred_log_mag_valid - input_log_valid
+    combined_residual_loss = F.l1_loss(decoded_residual_valid, target_residual_valid)
+    piano_residual_loss = F.l1_loss(decoded_residual_valid, piano_residual_valid)
 
     loss = (
         args.log_mag_loss_weight * log_mag_loss
+        + args.mask_loss_weight * mask_loss
         + args.residual_loss_weight * residual_loss
         + args.hf_suppression_loss_weight * hf_suppression_loss
         + args.piano_log_mag_loss_weight * piano_log_mag_loss
@@ -413,9 +437,11 @@ def spectral_kd_loss(
     return loss, {
         "log_mag": log_mag_loss,
         "log_mag_unweighted": log_mag_unweighted,
+        "mask": mask_loss,
         "piano_log_mag": piano_log_mag_loss,
         "piano_residual": piano_residual_loss,
         "residual": residual_loss,
+        "combined_residual": combined_residual_loss,
         "hf_suppression": hf_suppression_loss,
         "teacher_audio_loss": teacher_audio_loss,
     }
@@ -426,6 +452,7 @@ def train_epoch(teacher, student, loader, criterion, optimizer, window, args, de
     total_loss = 0.0
     total_log_mag_loss = 0.0
     total_log_mag_unweighted_loss = 0.0
+    total_mask_loss = 0.0
     total_piano_log_mag_loss = 0.0
     total_piano_residual_loss = 0.0
     total_residual_loss  = 0.0
@@ -445,7 +472,8 @@ def train_epoch(teacher, student, loader, criterion, optimizer, window, args, de
         optimizer.zero_grad(set_to_none=True)
         student_pred = student(result["student_input"])
         loss, loss_components = spectral_kd_loss(
-            student_pred, result["input_log"], result["phase"], result["target_residual"],
+            student_pred, result["input_log"], result["phase"], 
+            result["teacher_mask"], result["teacher_residual"], result["target_residual"],
             result["teacher_log_mag"], result["piano_log_mag"], result["piano_residual"], 
             result["teacher_pt_audio"], result["teacher_mag"], result["valid_shape"], 
             criterion, window, args
@@ -462,6 +490,7 @@ def train_epoch(teacher, student, loader, criterion, optimizer, window, args, de
         total_loss += float(loss.item())
         total_log_mag_loss += float(loss_components["log_mag"].item())
         total_log_mag_unweighted_loss += float(loss_components["log_mag_unweighted"].item())
+        total_mask_loss += float(loss_components["mask"].item())
         total_piano_log_mag_loss += float(loss_components["piano_log_mag"].item())
         total_piano_residual_loss += float(loss_components["piano_residual"].item())
         total_residual_loss += float(loss_components["residual"].item())
@@ -474,6 +503,7 @@ def train_epoch(teacher, student, loader, criterion, optimizer, window, args, de
         total_loss / denom,
         total_log_mag_loss / denom,
         total_log_mag_unweighted_loss / denom,
+        total_mask_loss / denom,
         total_piano_log_mag_loss / denom,
         total_piano_residual_loss / denom,
         total_residual_loss / denom,
@@ -488,6 +518,7 @@ def eval_epoch(teacher, student, loader, criterion, window, args, device):
     total_loss = 0.0
     total_log_mag_loss = 0.0
     total_log_mag_unweighted_loss = 0.0
+    total_mask_loss = 0.0
     total_piano_log_mag_loss = 0.0
     total_piano_residual_loss = 0.0
     total_residual_loss  = 0.0
@@ -504,7 +535,8 @@ def eval_epoch(teacher, student, loader, criterion, window, args, device):
 
         student_pred = student(result["student_input"])
         loss, loss_components = spectral_kd_loss(
-            student_pred, result["input_log"], result["phase"], result["target_residual"],
+            student_pred, result["input_log"], result["phase"],
+            result["teacher_mask"], result["teacher_residual"], result["target_residual"],
             result["teacher_log_mag"], result["piano_log_mag"], result["piano_residual"], 
             result["teacher_pt_audio"], result["teacher_mag"], result["valid_shape"], 
             criterion, window, args
@@ -513,6 +545,7 @@ def eval_epoch(teacher, student, loader, criterion, window, args, device):
         total_loss += float(loss.item())
         total_log_mag_loss += float(loss_components["log_mag"].item())
         total_log_mag_unweighted_loss += float(loss_components["log_mag_unweighted"].item())
+        total_mask_loss += float(loss_components["mask"].item())
         total_piano_log_mag_loss += float(loss_components["piano_log_mag"].item())
         total_piano_residual_loss += float(loss_components["piano_residual"].item())
         total_residual_loss += float(loss_components["residual"].item())
@@ -525,6 +558,7 @@ def eval_epoch(teacher, student, loader, criterion, window, args, device):
         total_loss / denom,
         total_log_mag_loss / denom,
         total_log_mag_unweighted_loss / denom,
+        total_mask_loss / denom,
         total_piano_log_mag_loss / denom,
         total_piano_residual_loss / denom,
         total_residual_loss / denom,
@@ -543,10 +577,11 @@ def save_checkpoint(student, optimizer, epoch, val_loss, path, args):
             "frame_size": args.frame_size,
             "hop_size": args.hop_size,
             "n_fft": args.n_fft,
+            "win_length": args.win_length,
             "base_ch": args.base_ch,
             "log_scale": args.log_scale,
-            "num_classes": 1,
-            "spectral_output": "log_residual",
+            "num_classes": 2,
+            "spectral_output": "identity_mask_residual",
             "log_floor": args.log_floor,
             "residual_clip": args.residual_clip,
             "energy_weight_log_mag_loss": args.energy_weight_log_mag_loss,
@@ -556,8 +591,11 @@ def save_checkpoint(student, optimizer, epoch, val_loss, path, args):
             "hf_suppression_start_hz": args.hf_suppression_start_hz,
             "hf_suppression_margin": args.hf_suppression_margin,
             "hf_suppression_topk_frac": args.hf_suppression_topk_frac,
+            "mask_loss_weight": args.mask_loss_weight,
             "residual_loss_weight": args.residual_loss_weight,
             "log_mag_loss_weight": args.log_mag_loss_weight,
+            "piano_log_mag_loss_weight": args.piano_log_mag_loss_weight,
+            "piano_residual_loss_weight": args.piano_residual_loss_weight,
             "use_teacher_audio_loss": args.use_teacher_audio_loss,
             "teacher_audio_loss_weight": args.teacher_audio_loss_weight,
         },
@@ -579,9 +617,10 @@ def plot_loss_curves(train_losses, val_losses, output_dir):
 def format_metrics(metrics):
     return (
         f"loss={metrics[0]:.5f}, log_mag={metrics[1]:.5f}, "
-        f"log_mag_unweighted={metrics[2]:.5f}, piano_log_mag={metrics[3]:.5f}, "
-        f"piano_residual={metrics[4]:.5f}, residual={metrics[5]:.5f}, "
-        f"hf_suppression={metrics[6]:.5f}, teacher_audio={metrics[7]:.5f}"
+        f"log_mag_unweighted={metrics[2]:.5f}, mask={metrics[3]:.5f}, "
+        f"piano_log_mag={metrics[4]:.5f}, piano_residual={metrics[5]:.5f}, "
+        f"residual={metrics[6]:.5f}, hf_suppression={metrics[7]:.5f}, "
+        f"teacher_audio={metrics[8]:.5f}"
     )
 
 def main():
@@ -597,12 +636,12 @@ def main():
         round_avg=args.avg_pool_rounding,
     )
     student = TimbreUNetStudent(
-        num_classes=1,
+        num_classes=2,
         num_channels=1,
         dimensions=padded_spectrogram_dimensions(args),
         base_ch=args.base_ch,
     ).to(device)
-    window = torch.hann_window(args.frame_size, device=device)
+    window = torch.hann_window(args.win_length, device=device)
 
     optimizer = optim.AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
@@ -627,11 +666,15 @@ def main():
 
     warmup_epochs = min(5, args.epochs)
     print(f"Device: {device}")
-    print(f"Training TimbreUNetStudent direct log-mag spectral KD for {args.epochs} epochs")
+    print(f"Training TimbreUNetStudent identity-mask residual spectral KD for {args.epochs} epochs")
     print(
         "Loss weights: "
+        f"mask={args.mask_loss_weight}, "
         f"residual={args.residual_loss_weight}, "
-        f"log_mag={args.log_mag_loss_weight}, teacher_audio={args.teacher_audio_loss_weight}, "
+        f"log_mag={args.log_mag_loss_weight}, "
+        f"piano_log_mag={args.piano_log_mag_loss_weight}, "
+        f"piano_residual={args.piano_residual_loss_weight}, "
+        f"teacher_audio={args.teacher_audio_loss_weight}, "
         f"use_teacher_audio={args.use_teacher_audio_loss}, "
         f"log_floor={args.log_floor}, residual_clip={args.residual_clip}, "
         f"energy_weight_log_mag={args.energy_weight_log_mag_loss}, "

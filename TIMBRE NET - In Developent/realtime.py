@@ -61,13 +61,19 @@ def get_device(preference: str) -> torch.device:
     return torch.device(preference)
 
 
-def load_model(path: str, device: torch.device):
+def load_model(path: str, device: torch.device, args):
     try:
         model = torch.jit.load(path, map_location="cpu")
         print(f"Loaded TorchScript model from {path}")
     except Exception:
         print(f"Loading state dict from {path}")
-        model = DDSPGuitarToPiano()
+        model = DDSPGuitarToPiano(
+            sample_rate=SAMPLE_RATE,
+            frame_size=args.frame_size,
+            win_length=args.win_length,
+            hop_size=HOP_SIZE,
+            base_ch=args.base_ch
+        )
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
 
@@ -177,11 +183,12 @@ def process_wav(
     volume: float,
     device_str: str,
     play: bool,
+    args
 ):
     device = get_device(device_str)
     print(f"Device: {device}")
 
-    model = load_model(model_path, device)
+    model = load_model(model_path, device, args)
     warmup(model, device)
 
     audio_np = prepare_audio_file(input_path)
@@ -279,11 +286,11 @@ def process_wav(
 # LIVE MIC MODE
 # ============================================================
 class RealTimePipeline:
-    def __init__(self, model_path: str, device_str: str = "auto"):
-        self.device = get_device(device_str)
+    def __init__(self, args):
+        self.device = get_device(args.device)
         print(f"Inference device: {self.device}")
 
-        self.model = load_model(model_path, self.device)
+        self.model = load_model(args.model, self.device, args)
         self.volume = 1.0
         self.wet_mix = 1.0
         self.running = False
@@ -377,7 +384,10 @@ class RealTimePipeline:
 def main():
     p = argparse.ArgumentParser(description="Polyphonic Guitar->Piano | live mic or WAV")
     p.add_argument("--model", required=True, help="Model checkpoint (.pt)")
-    p.add_argument("--input", default=None, help="[WAV mode] Input WAV file")
+    p.add_argument("--base_ch", type=int, default=32)
+    p.add_argument("--win_length", type=int, default=1024)
+    p.add_argument("--frame_size", type=int, default=1024)
+    p.add_argument("--input", default="overfit/guitar/plaz.wav", help="[WAV mode] Input WAV file")
     p.add_argument("--output", default=None, help="[WAV mode] Output WAV file")
     p.add_argument("--play", action="store_true", help="[WAV mode] Play output while processing")
     p.add_argument("--wet", type=float, default=1.0, help="Wet mix 0.0-1.0")
@@ -407,9 +417,10 @@ def main():
             volume=args.volume,
             device_str=args.device,
             play=args.play,
+            args=args
         )
     else:
-        pipe = RealTimePipeline(args.model, args.device)
+        pipe = RealTimePipeline(args)
         pipe.wet_mix = args.wet
         pipe.volume = args.volume
         pipe.run()
