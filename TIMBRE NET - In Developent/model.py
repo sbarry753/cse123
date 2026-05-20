@@ -19,7 +19,7 @@ N_FREQ_BINS = N_FFT // 2 + 1
 # Kept for compatibility with old scripts / imports
 N_HARMONICS = 64
 N_NOISE_BANDS = 65
-HIDDEN_SIZE = 256
+HIDDEN_SIZE = 128
 N_MFCC = 20
 
 
@@ -67,7 +67,7 @@ class SpectralUNet(nn.Module):
     Output: multiplicative mask + additive residual in log-mag domain
     """
 
-    def __init__(self, base_ch: int = 24):
+    def __init__(self, base_ch: int = 12):
         super().__init__()
         self.enc1 = ConvBlock2d(1, base_ch)
         self.enc2 = ConvBlock2d(base_ch, base_ch * 2, stride=(2, 2))
@@ -178,21 +178,22 @@ class TransientShaper(nn.Module):
     Learns onset reshaping so pick transients become more hammer-like.
     """
 
-    def __init__(self, channels: int = 32):
+    def __init__(self, channels: int = 16):
         super().__init__()
+        # Lighter transient shaper for real-time use.
+        # This keeps the same input/output behavior but uses fewer channels
+        # and one fewer convolution than the original version.
         self.delta_net = nn.Sequential(
-            nn.Conv1d(1, channels, kernel_size=9, padding=4),
-            nn.GELU(),
-            nn.Conv1d(channels, channels, kernel_size=9, padding=4),
+            nn.Conv1d(1, channels, kernel_size=7, padding=3),
             nn.GELU(),
             nn.Conv1d(channels, channels, kernel_size=5, padding=2),
             nn.GELU(),
             nn.Conv1d(channels, 1, kernel_size=1),
         )
         self.gate_net = nn.Sequential(
-            nn.Conv1d(1, 8, kernel_size=7, padding=3),
+            nn.Conv1d(1, 4, kernel_size=5, padding=2),
             nn.GELU(),
-            nn.Conv1d(8, 1, kernel_size=1),
+            nn.Conv1d(4, 1, kernel_size=1),
             nn.Sigmoid(),
         )
 

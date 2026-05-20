@@ -16,9 +16,9 @@ import numpy as np
 class MultiScaleSpectralLoss(nn.Module):
     def __init__(
         self,
-        fft_sizes=(256, 512, 1024, 2048),
+        fft_sizes=(128, 256, 512),
         hop_fractions=0.25,
-        n_mels=80,
+        n_mels=48,
         sample_rate=48000,
         mel_weight=1.0,
         spectral_convergence_weight=0.25,
