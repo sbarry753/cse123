@@ -131,28 +131,24 @@ class PhaseResidualTCN(nn.Module):
             nn.GELU(),
         )
 
-        self.blocks = nn.Sequential(
+        blocks = []
+        for idx in range(layers):
+            dilation = 2 ** idx
+            blocks.extend(
+                [
                     nn.Conv1d(
-                        hidden_ch, hidden_ch, kernel_size=3, padding=1, dilation=1,
+                        hidden_ch,
+                        hidden_ch,
+                        kernel_size=3,
+                        padding=dilation,
+                        dilation=dilation,
                     ),
                     nn.GELU(),
                     nn.Conv1d(hidden_ch, hidden_ch, kernel_size=1),
                     nn.GELU(),
-                    
-                    nn.Conv1d(
-                        hidden_ch, hidden_ch, kernel_size=3, padding=2, dilation=2,
-                    ),
-                    nn.GELU(),
-                    nn.Conv1d(hidden_ch, hidden_ch, kernel_size=1),
-                    nn.GELU(),
-                    
-                    nn.Conv1d(
-                        hidden_ch, hidden_ch, kernel_size=3, padding=4, dilation=4,
-                    ),
-                    nn.GELU(),
-                    nn.Conv1d(hidden_ch, hidden_ch, kernel_size=1),
-                    nn.GELU(),
-                )
+                ]
+            )
+        self.blocks = nn.Sequential(*blocks)
 
         self.out = nn.Conv1d(hidden_ch, self.n_freq_bins, kernel_size=1)
         self.max_delta = float(max_delta)
@@ -162,7 +158,7 @@ class PhaseResidualTCN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 4:
-            raise ValueError(f"PhaseResidualTCN expects (B, C, F, T), got shape {tuple(x.shape)}")
+            raise ValueError("PhaseResidualTCN expects a 4D tensor shaped (B, C, F, T)")
         batch, channels, freq_bins, frames = x.shape
         if channels != self.in_ch:
             raise ValueError(f"PhaseResidualTCN expected {self.in_ch} channels, got {channels}")
@@ -208,6 +204,59 @@ class TransientShaper(nn.Module):
         return y.squeeze(1)
 
 
+class TransientCorrection(nn.Module):
+    """
+    Small post-ISTFT residual branch for attack-local waveform correction.
+    Starts as a no-op because the final projection is zero-initialized.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        channels: int = 16,
+        transient_ms: float = 30.0,
+        max_gain: float = 0.20,
+    ):
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"transient_ch must be > 0, got {channels}")
+        if transient_ms <= 0.0:
+            raise ValueError(f"transient_ms must be > 0, got {transient_ms}")
+        if max_gain < 0.0:
+            raise ValueError(f"transient_max_gain must be >= 0, got {max_gain}")
+        self.sample_rate = int(sample_rate)
+        self.transient_ms = float(transient_ms)
+        self.max_gain = float(max_gain)
+        self.net = nn.Sequential(
+            nn.Conv1d(3, channels, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.Conv1d(channels, 1, kernel_size=1),
+        )
+        final = self.net[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+
+    def _window(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        n_attack = min(length, max(1, int(round(self.transient_ms * self.sample_rate / 1000.0))))
+        window = torch.zeros(length, device=device, dtype=dtype)
+        if n_attack == 1:
+            window[0] = 1.0
+            return window.view(1, length)
+        fade = torch.hann_window(n_attack * 2, periodic=False, device=device, dtype=dtype)[n_attack:]
+        window[:n_attack] = fade
+        return window.view(1, length)
+
+    def forward(self, guitar_audio: torch.Tensor, base_audio: torch.Tensor) -> torch.Tensor:
+        if guitar_audio.shape != base_audio.shape:
+            raise ValueError("TransientCorrection inputs must have matching shapes")
+        x = torch.stack([guitar_audio, base_audio, base_audio - guitar_audio], dim=1)
+        residual = torch.tanh(self.net(x)).squeeze(1)
+        window = self._window(base_audio.shape[-1], base_audio.device, base_audio.dtype)
+        return self.max_gain * window * residual
+
+
 class PolyphonicGuitarToPiano(nn.Module):
     def __init__(
         self,
@@ -221,6 +270,9 @@ class PolyphonicGuitarToPiano(nn.Module):
         phase_tcn_ch: int = 16,
         phase_tcn_layers: int = 3,
         phase_max_delta: float = 0.5,
+        transient_ch: int = 16,
+        transient_ms: float = 30.0,
+        transient_max_gain: float = 0.20,
         **kwargs,
     ):
         super().__init__()
@@ -241,15 +293,32 @@ class PolyphonicGuitarToPiano(nn.Module):
 
         self.unet = SpectralUNet(base_ch)
         self.phase_tcn = PhaseResidualTCN(
-            in_ch=4,
+            in_ch=10,
             n_freq_bins=self.n_freq_bins,
             hidden_ch=phase_tcn_ch,
             layers=phase_tcn_layers,
             max_delta=phase_max_delta,
         )
         self.transient = TransientShaper(base_ch)
+        self.transient_correction = TransientCorrection(
+            sample_rate=sample_rate,
+            channels=transient_ch,
+            transient_ms=transient_ms,
+            max_gain=transient_max_gain,
+        )
 
         self.register_buffer("window", torch.hann_window(self.win_length), persistent=False)
+
+    @staticmethod
+    def _wrapped_phase_delta(delta: torch.Tensor) -> torch.Tensor:
+        return torch.atan2(torch.sin(delta), torch.cos(delta))
+
+    def _phase_context(self, phase: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        phase_dt = self._wrapped_phase_delta(phase[:, :, 1:] - phase[:, :, :-1])
+        phase_dt = F.pad(phase_dt, (1, 0))
+        phase_df = self._wrapped_phase_delta(phase[:, 1:, :] - phase[:, :-1, :])
+        phase_df = F.pad(phase_df, (0, 0, 1, 0))
+        return phase_dt, phase_df
 
     def _stft(self, audio: torch.Tensor) -> torch.Tensor:
         return torch.stft(
@@ -290,7 +359,22 @@ class PolyphonicGuitarToPiano(nn.Module):
         out_log_mag = log_mag * mask + residual
         out_mag = torch.exp(out_log_mag.squeeze(1))
 
-        phase_input = torch.cat([log_mag, out_log_mag, mask, residual], dim=1)
+        phase_dt, phase_df = self._phase_context(phase)
+        phase_input = torch.cat(
+            [
+                log_mag,
+                out_log_mag,
+                mask,
+                residual,
+                torch.sin(phase).unsqueeze(1),
+                torch.cos(phase).unsqueeze(1),
+                torch.sin(phase_dt).unsqueeze(1),
+                torch.cos(phase_dt).unsqueeze(1),
+                torch.sin(phase_df).unsqueeze(1),
+                torch.cos(phase_df).unsqueeze(1),
+            ],
+            dim=1,
+        )
         phase_delta, phase_delta_raw = self.phase_tcn(phase_input)
         phase_delta = phase_delta.squeeze(1)
         phase_delta_raw = phase_delta_raw.squeeze(1)
@@ -298,7 +382,9 @@ class PolyphonicGuitarToPiano(nn.Module):
 
         out_spec = torch.polar(out_mag, out_phase)
 
-        audio_out = self._istft(out_spec, length=length)
+        audio_before_transient = self._istft(out_spec, length=length)
+        transient_delta = self.transient_correction(audio_frame, audio_before_transient)
+        audio_out = audio_before_transient + transient_delta
         #audio_out = self.transient(audio_out)
         # audio_out = torch.tanh(audio_out)
 
@@ -306,14 +392,20 @@ class PolyphonicGuitarToPiano(nn.Module):
             "input_mag": mag,
             "input_log_mag": log_mag.squeeze(1),
             "input_phase": phase,
+            "input_phase_dt": phase_dt,
+            "input_phase_df": phase_df,
             "out_log_mag": out_log_mag.squeeze(1),
             "out_phase": out_phase,
+            "before_transient_audio": audio_before_transient,
+            "after_transient_audio": audio_out,
         }
         params = {
             "mask": mask.squeeze(1),
             "residual": residual.squeeze(1),
             "phase_delta": phase_delta,
             "phase_delta_raw": phase_delta_raw,
+            "transient_delta": transient_delta,
+            "transient_delta_abs": torch.abs(transient_delta),
         }
         return audio_out, features, params
 

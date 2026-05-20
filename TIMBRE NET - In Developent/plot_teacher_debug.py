@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -25,6 +26,84 @@ import torchaudio
 from dataset import GuitarPianoDataset
 from losses import CombinedLoss
 from model import DDSPGuitarToPiano, FRAME_SIZE, HOP_SIZE, N_FFT, SAMPLE_RATE
+
+
+def explicit_cli_args(parser, argv):
+    option_to_dest = {}
+    for action in parser._actions:
+        for option in action.option_strings:
+            option_to_dest[option] = action.dest
+    explicit = set()
+    for token in argv:
+        option = token.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest is not None:
+            explicit.add(dest)
+    return explicit
+
+
+def checkpoint_training_args(payload):
+    if not isinstance(payload, dict):
+        return {}
+    training_args = payload.get("training_args")
+    if isinstance(training_args, dict):
+        return training_args
+    return payload
+
+
+def checkpoint_value(payload, name, default=None):
+    training_args = checkpoint_training_args(payload)
+    if name in training_args and training_args[name] is not None:
+        return training_args[name]
+    if isinstance(payload, dict):
+        return payload.get(name, default)
+    return default
+
+
+def apply_checkpoint_config(args, payload):
+    explicit = getattr(args, "_explicit_args", set())
+    names = (
+        "frame_size",
+        "hop_size",
+        "n_fft",
+        "win_length",
+        "hidden_size",
+        "base_ch",
+        "phase_tcn_ch",
+        "phase_tcn_layers",
+        "phase_max_delta",
+        "phase_saturation_threshold",
+        "energy_weight_floor",
+        "energy_weight_ceiling",
+        "low_energy_spectral_quantile",
+        "low_energy_spectral_margin",
+        "low_energy_onset_flux_std",
+        "low_energy_onset_pre_ms",
+        "low_energy_onset_post_ms",
+        "low_energy_band_low_weight",
+        "low_energy_band_low_mid_weight",
+        "low_energy_band_mid_weight",
+        "low_energy_band_high_weight",
+        "low_energy_low_note_threshold_hz",
+        "low_energy_low_note_ratio_threshold",
+        "low_energy_harmonic_protect",
+        "low_energy_harmonic_peak_margin",
+        "low_energy_harmonic_peak_prominence",
+        "high_energy_interharmonic_quantile",
+        "high_energy_interharmonic_margin",
+        "high_energy_interharmonic_peak_prominence",
+        "high_energy_interharmonic_peak_radius_bins",
+        "high_energy_interharmonic_low_weight",
+        "high_energy_interharmonic_low_mid_weight",
+        "high_energy_interharmonic_mid_weight",
+        "high_energy_interharmonic_high_weight",
+    )
+    for name in names:
+        if name in explicit:
+            continue
+        value = checkpoint_value(payload, name)
+        if value is not None:
+            setattr(args, name, value)
 
 
 def parse_args():
@@ -74,11 +153,21 @@ def parse_args():
     p.add_argument("--low_energy_harmonic_protect", action="store_true")
     p.add_argument("--low_energy_harmonic_peak_margin", type=float, default=0.10)
     p.add_argument("--low_energy_harmonic_peak_prominence", type=float, default=0.20)
+    p.add_argument("--high_energy_interharmonic_quantile", type=float, default=0.75)
+    p.add_argument("--high_energy_interharmonic_margin", type=float, default=0.05)
+    p.add_argument("--high_energy_interharmonic_peak_prominence", type=float, default=0.20)
+    p.add_argument("--high_energy_interharmonic_peak_radius_bins", type=int, default=1)
+    p.add_argument("--high_energy_interharmonic_low_weight", type=float, default=0.0)
+    p.add_argument("--high_energy_interharmonic_low_mid_weight", type=float, default=0.0)
+    p.add_argument("--high_energy_interharmonic_mid_weight", type=float, default=1.0)
+    p.add_argument("--high_energy_interharmonic_high_weight", type=float, default=1.0)
     p.add_argument("--artifact_peak_prominence", type=float, default=0.20)
     p.add_argument("--artifact_peak_radius_bins", type=int, default=1)
     p.add_argument("--artifact_shimmer_margin", type=float, default=0.05)
     p.add_argument("--write-wavs", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    args._explicit_args = explicit_cli_args(p, sys.argv[1:])
+    return args
 
 
 def get_device(preference: str) -> torch.device:
@@ -212,10 +301,15 @@ def parse_frame_indices(args) -> list[int]:
 def load_teacher(path: str, device: torch.device, args):
     payload = torch.load(path, map_location=device, weights_only=False)
     if isinstance(payload, dict):
-        args.win_length = int(args.win_length or payload.get("win_length", args.n_fft))
-        args.phase_tcn_ch = int(args.phase_tcn_ch or payload.get("phase_tcn_ch", 16))
-        args.phase_tcn_layers = int(args.phase_tcn_layers or payload.get("phase_tcn_layers", 3))
-        args.phase_max_delta = float(args.phase_max_delta if args.phase_max_delta is not None else payload.get("phase_max_delta", 0.5))
+        apply_checkpoint_config(args, payload)
+        args.win_length = int(args.win_length or checkpoint_value(payload, "win_length", args.n_fft))
+        args.phase_tcn_ch = int(args.phase_tcn_ch or checkpoint_value(payload, "phase_tcn_ch", 16))
+        args.phase_tcn_layers = int(args.phase_tcn_layers or checkpoint_value(payload, "phase_tcn_layers", 3))
+        args.phase_max_delta = float(
+            args.phase_max_delta
+            if args.phase_max_delta is not None
+            else checkpoint_value(payload, "phase_max_delta", 0.5)
+        )
     else:
         args.win_length = int(args.win_length or args.n_fft)
         args.phase_tcn_ch = int(args.phase_tcn_ch or 16)
@@ -293,6 +387,7 @@ class TeacherDebugFrame(torch.nn.Module):
 
         piano_spec = self._stft(piano_frame)
         piano_mag = torch.abs(piano_spec)
+        piano_phase = torch.angle(piano_spec)
         guitar_recon_audio = self._istft(spec, length=guitar_frame.shape[-1])
         piano_recon_audio = self._istft(piano_spec, length=piano_frame.shape[-1])
         piano_mag_guitar_phase_spec = torch.polar(piano_mag, phase)
@@ -304,6 +399,11 @@ class TeacherDebugFrame(torch.nn.Module):
         mask, residual = self.teacher.unet(input_log)
         teacher_log_mag = input_log * mask + residual
         teacher_mag = torch.exp(teacher_log_mag.squeeze(1))
+        oracle_intended_target_phase_spec = torch.polar(teacher_mag, piano_phase)
+        oracle_intended_target_phase_audio = self._istft(
+            oracle_intended_target_phase_spec,
+            length=guitar_frame.shape[-1],
+        )
         teacher_before_phase_tcn_spec = torch.polar(teacher_mag, phase)
         teacher_before_phase_tcn_audio = self._istft(
             teacher_before_phase_tcn_spec,
@@ -314,17 +414,31 @@ class TeacherDebugFrame(torch.nn.Module):
         phase_delta = teacher_params["phase_delta"].unsqueeze(1)
         phase_delta_raw = teacher_params["phase_delta_raw"].unsqueeze(1)
         transient_delta = teacher_params["transient_delta"]
+        oracle_intended_phase_tcn_phase_spec = torch.polar(
+            teacher_mag,
+            phase + teacher_params["phase_delta"],
+        )
+        oracle_intended_phase_tcn_phase_audio = self._istft(
+            oracle_intended_phase_tcn_phase_spec,
+            length=guitar_frame.shape[-1],
+        )
         phase_tcn_waveform_delta = teacher_before_transient_audio - teacher_before_phase_tcn_audio
         transient_correction_delta = teacher_final_audio - teacher_before_transient_audio
         after_vs_before_waveform_delta = teacher_final_audio - teacher_before_phase_tcn_audio
 
         piano_log_mag = self._log_mag(piano_frame)
         piano_mag_guitar_phase_log_mag = self._log_mag(piano_mag_guitar_phase_audio)
+        oracle_intended_target_phase_log_mag = self._log_mag(oracle_intended_target_phase_audio)
+        oracle_intended_guitar_phase_log_mag = self._log_mag(teacher_before_phase_tcn_audio)
+        oracle_intended_phase_tcn_phase_log_mag = self._log_mag(oracle_intended_phase_tcn_phase_audio)
         teacher_before_phase_tcn_log_mag = self._log_mag(teacher_before_phase_tcn_audio)
         teacher_before_transient_log_mag = self._log_mag(teacher_before_transient_audio)
         teacher_final_log_mag = self._log_mag(teacher_final_audio)
         input_residual = piano_log_mag - input_log
         teacher_intended_residual = teacher_log_mag - input_log
+        oracle_intended_target_phase_residual = oracle_intended_target_phase_log_mag - input_log
+        oracle_intended_guitar_phase_residual = oracle_intended_guitar_phase_log_mag - input_log
+        oracle_intended_phase_tcn_phase_residual = oracle_intended_phase_tcn_phase_log_mag - input_log
         teacher_residual = teacher_before_phase_tcn_log_mag - input_log
         teacher_before_transient_residual = teacher_before_transient_log_mag - input_log
         teacher_final_residual = teacher_final_log_mag - input_log
@@ -333,6 +447,9 @@ class TeacherDebugFrame(torch.nn.Module):
         output_delta_log_mag = teacher_final_log_mag - teacher_before_phase_tcn_log_mag
 
         piano_mag_guitar_phase_error = piano_mag_guitar_phase_log_mag - piano_log_mag
+        oracle_intended_target_phase_error = oracle_intended_target_phase_log_mag - piano_log_mag
+        oracle_intended_guitar_phase_error = oracle_intended_guitar_phase_log_mag - piano_log_mag
+        oracle_intended_phase_tcn_phase_error = oracle_intended_phase_tcn_phase_log_mag - piano_log_mag
         teacher_pre_error = teacher_before_phase_tcn_log_mag - piano_log_mag
         teacher_before_transient_error = teacher_before_transient_log_mag - piano_log_mag
         teacher_final_error = teacher_final_log_mag - piano_log_mag
@@ -359,6 +476,9 @@ class TeacherDebugFrame(torch.nn.Module):
             "guitar_recon_audio": guitar_recon_audio,
             "piano_recon_audio": piano_recon_audio,
             "piano_mag_guitar_phase_audio": piano_mag_guitar_phase_audio,
+            "oracle_intended_target_phase_audio": oracle_intended_target_phase_audio,
+            "oracle_intended_guitar_phase_audio": teacher_before_phase_tcn_audio,
+            "oracle_intended_phase_tcn_phase_audio": oracle_intended_phase_tcn_phase_audio,
             "teacher_before_phase_tcn_audio": teacher_before_phase_tcn_audio,
             "teacher_before_transient_audio": teacher_before_transient_audio,
             "teacher_after_phase_tcn_audio": teacher_before_transient_audio,
@@ -371,6 +491,9 @@ class TeacherDebugFrame(torch.nn.Module):
             "input_log": input_log,
             "piano_log_mag": piano_log_mag,
             "piano_mag_guitar_phase_log_mag": piano_mag_guitar_phase_log_mag,
+            "oracle_intended_target_phase_log_mag": oracle_intended_target_phase_log_mag,
+            "oracle_intended_guitar_phase_log_mag": oracle_intended_guitar_phase_log_mag,
+            "oracle_intended_phase_tcn_phase_log_mag": oracle_intended_phase_tcn_phase_log_mag,
             "teacher_log_mag": teacher_before_phase_tcn_log_mag,
             "teacher_intended_log_mag": teacher_log_mag,
             "teacher_before_phase_tcn_log_mag": teacher_before_phase_tcn_log_mag,
@@ -381,6 +504,9 @@ class TeacherDebugFrame(torch.nn.Module):
             "piano_residual": input_residual,
             "teacher_residual": teacher_residual,
             "teacher_intended_residual": teacher_intended_residual,
+            "oracle_intended_target_phase_residual": oracle_intended_target_phase_residual,
+            "oracle_intended_guitar_phase_residual": oracle_intended_guitar_phase_residual,
+            "oracle_intended_phase_tcn_phase_residual": oracle_intended_phase_tcn_phase_residual,
             "teacher_before_phase_tcn_residual": teacher_residual,
             "teacher_before_transient_residual": teacher_before_transient_residual,
             "teacher_final_residual": teacher_final_residual,
@@ -390,12 +516,18 @@ class TeacherDebugFrame(torch.nn.Module):
             "transient_correction_log_mag_delta": transient_correction_log_mag_delta,
             "output_delta_log_mag": output_delta_log_mag,
             "piano_mag_guitar_phase_signed_error": piano_mag_guitar_phase_error,
+            "oracle_intended_target_phase_signed_error": oracle_intended_target_phase_error,
+            "oracle_intended_guitar_phase_signed_error": oracle_intended_guitar_phase_error,
+            "oracle_intended_phase_tcn_phase_signed_error": oracle_intended_phase_tcn_phase_error,
             "teacher_pre_signed_error": teacher_pre_error,
             "teacher_before_transient_signed_error": teacher_before_transient_error,
             "teacher_final_signed_error": teacher_final_error,
             "teacher_after_phase_tcn_signed_error": teacher_before_transient_error,
             "teacher_after_transient_signed_error": teacher_final_error,
             "piano_mag_guitar_phase_abs_error": torch.abs(piano_mag_guitar_phase_error),
+            "oracle_intended_target_phase_abs_error": torch.abs(oracle_intended_target_phase_error),
+            "oracle_intended_guitar_phase_abs_error": torch.abs(oracle_intended_guitar_phase_error),
+            "oracle_intended_phase_tcn_phase_abs_error": torch.abs(oracle_intended_phase_tcn_phase_error),
             "teacher_pre_abs_error": torch.abs(teacher_pre_error),
             "teacher_before_transient_abs_error": torch.abs(teacher_before_transient_error),
             "teacher_final_abs_error": torch.abs(teacher_final_error),
@@ -607,6 +739,9 @@ def plot_frame(result: dict, out_png: Path, title: str, args):
         maps["piano_log_mag"],
         maps["piano_mag_guitar_phase_log_mag"],
         maps["teacher_intended_log_mag"],
+        maps["oracle_intended_target_phase_log_mag"],
+        maps["oracle_intended_guitar_phase_log_mag"],
+        maps["oracle_intended_phase_tcn_phase_log_mag"],
         maps["teacher_log_mag"],
         maps["teacher_before_transient_log_mag"],
         maps["teacher_final_log_mag"],
@@ -614,6 +749,9 @@ def plot_frame(result: dict, out_png: Path, title: str, args):
     residual_vmin, residual_vmax = symmetric_range(
         maps["piano_residual"],
         maps["teacher_intended_residual"],
+        maps["oracle_intended_target_phase_residual"],
+        maps["oracle_intended_guitar_phase_residual"],
+        maps["oracle_intended_phase_tcn_phase_residual"],
         maps["teacher_residual"],
         maps["teacher_before_transient_residual"],
         maps["teacher_final_residual"],
@@ -621,6 +759,9 @@ def plot_frame(result: dict, out_png: Path, title: str, args):
         maps["transient_correction_log_mag_delta"],
         maps["output_delta_log_mag"],
         maps["piano_mag_guitar_phase_signed_error"],
+        maps["oracle_intended_target_phase_signed_error"],
+        maps["oracle_intended_guitar_phase_signed_error"],
+        maps["oracle_intended_phase_tcn_phase_signed_error"],
         maps["teacher_before_transient_signed_error"],
         maps["teacher_final_signed_error"],
     )
@@ -632,6 +773,9 @@ def plot_frame(result: dict, out_png: Path, title: str, args):
     phase_abs_vmin, phase_abs_vmax = finite_range(maps["phase_delta_abs"])
     error_vmin, error_vmax = finite_range(
         maps["piano_mag_guitar_phase_abs_error"],
+        maps["oracle_intended_target_phase_abs_error"],
+        maps["oracle_intended_guitar_phase_abs_error"],
+        maps["oracle_intended_phase_tcn_phase_abs_error"],
         maps["teacher_pre_abs_error"],
         maps["teacher_before_transient_abs_error"],
         maps["teacher_final_abs_error"],
@@ -645,11 +789,17 @@ def plot_frame(result: dict, out_png: Path, title: str, args):
         ("Target piano log-mag", "piano_log_mag", "magma", log_vmin, log_vmax),
         ("Piano mag + guitar phase log-mag", "piano_mag_guitar_phase_log_mag", "magma", log_vmin, log_vmax),
         ("Teacher intended log-mag", "teacher_intended_log_mag", "magma", log_vmin, log_vmax),
+        ("Oracle intended + piano phase log-mag", "oracle_intended_target_phase_log_mag", "magma", log_vmin, log_vmax),
+        ("Oracle intended + guitar phase log-mag", "oracle_intended_guitar_phase_log_mag", "magma", log_vmin, log_vmax),
+        ("Oracle intended + phase TCN phase log-mag", "oracle_intended_phase_tcn_phase_log_mag", "magma", log_vmin, log_vmax),
         ("Teacher before phase TCN log-mag", "teacher_log_mag", "magma", log_vmin, log_vmax),
         ("Teacher before transient log-mag", "teacher_before_transient_log_mag", "magma", log_vmin, log_vmax),
         ("Teacher after transient log-mag", "teacher_final_log_mag", "magma", log_vmin, log_vmax),
         ("Piano residual", "piano_residual", "coolwarm", residual_vmin, residual_vmax),
         ("Teacher intended residual", "teacher_intended_residual", "coolwarm", residual_vmin, residual_vmax),
+        ("Oracle intended + piano phase residual", "oracle_intended_target_phase_residual", "coolwarm", residual_vmin, residual_vmax),
+        ("Oracle intended + guitar phase residual", "oracle_intended_guitar_phase_residual", "coolwarm", residual_vmin, residual_vmax),
+        ("Oracle intended + phase TCN residual", "oracle_intended_phase_tcn_phase_residual", "coolwarm", residual_vmin, residual_vmax),
         ("Teacher before phase TCN residual", "teacher_residual", "coolwarm", residual_vmin, residual_vmax),
         ("Teacher before transient residual", "teacher_before_transient_residual", "coolwarm", residual_vmin, residual_vmax),
         ("Teacher after transient residual", "teacher_final_residual", "coolwarm", residual_vmin, residual_vmax),
@@ -658,10 +808,16 @@ def plot_frame(result: dict, out_png: Path, title: str, args):
         ("Phase residual", "phase_delta", "coolwarm", phase_vmin, phase_vmax),
         ("Phase residual abs", "phase_delta_abs", "viridis", phase_abs_vmin, phase_abs_vmax),
         ("Piano mag + guitar phase signed error", "piano_mag_guitar_phase_signed_error", "coolwarm", residual_vmin, residual_vmax),
+        ("Oracle intended + piano phase signed error", "oracle_intended_target_phase_signed_error", "coolwarm", residual_vmin, residual_vmax),
+        ("Oracle intended + guitar phase signed error", "oracle_intended_guitar_phase_signed_error", "coolwarm", residual_vmin, residual_vmax),
+        ("Oracle intended + phase TCN signed error", "oracle_intended_phase_tcn_phase_signed_error", "coolwarm", residual_vmin, residual_vmax),
         ("Teacher before phase TCN signed error", "teacher_pre_signed_error", "coolwarm", residual_vmin, residual_vmax),
         ("Teacher before transient signed error", "teacher_before_transient_signed_error", "coolwarm", residual_vmin, residual_vmax),
         ("Teacher after transient signed error", "teacher_final_signed_error", "coolwarm", residual_vmin, residual_vmax),
         ("Piano mag + guitar phase abs error", "piano_mag_guitar_phase_abs_error", "viridis", error_vmin, error_vmax),
+        ("Oracle intended + piano phase abs error", "oracle_intended_target_phase_abs_error", "viridis", error_vmin, error_vmax),
+        ("Oracle intended + guitar phase abs error", "oracle_intended_guitar_phase_abs_error", "viridis", error_vmin, error_vmax),
+        ("Oracle intended + phase TCN abs error", "oracle_intended_phase_tcn_phase_abs_error", "viridis", error_vmin, error_vmax),
         ("Teacher before phase TCN abs error", "teacher_pre_abs_error", "viridis", error_vmin, error_vmax),
         ("Teacher before transient abs error", "teacher_before_transient_abs_error", "viridis", error_vmin, error_vmax),
         ("Teacher after transient abs error", "teacher_final_abs_error", "viridis", error_vmin, error_vmax),
@@ -687,6 +843,9 @@ def plot_frame(result: dict, out_png: Path, title: str, args):
     wave_ax.plot(t, audio_vec(result["guitar_audio"]), label="Guitar", alpha=0.55)
     wave_ax.plot(t, audio_vec(result["piano_audio"]), label="Target piano", alpha=0.8)
     wave_ax.plot(t, audio_vec(result["piano_mag_guitar_phase_audio"]), label="Piano mag + guitar phase", alpha=0.8)
+    wave_ax.plot(t, audio_vec(result["oracle_intended_target_phase_audio"]), label="Intended + piano phase", alpha=0.8)
+    wave_ax.plot(t, audio_vec(result["oracle_intended_guitar_phase_audio"]), label="Intended + guitar phase", alpha=0.8)
+    wave_ax.plot(t, audio_vec(result["oracle_intended_phase_tcn_phase_audio"]), label="Intended + phase TCN phase", alpha=0.8)
     wave_ax.plot(t, audio_vec(result["teacher_before_phase_tcn_audio"]), label="Teacher before phase TCN", alpha=0.8)
     wave_ax.plot(t, audio_vec(result["teacher_before_transient_audio"]), label="Teacher before transient", alpha=0.8)
     wave_ax.plot(t, audio_vec(result["teacher_final_audio"]), label="Teacher after transient", alpha=0.8)
@@ -804,6 +963,9 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
     teacher_log_mag = result["teacher_log_mag"]
     teacher_intended_log_mag = result["teacher_intended_log_mag"]
     piano_mag_guitar_phase_log_mag = result["piano_mag_guitar_phase_log_mag"]
+    oracle_intended_target_phase_log_mag = result["oracle_intended_target_phase_log_mag"]
+    oracle_intended_guitar_phase_log_mag = result["oracle_intended_guitar_phase_log_mag"]
+    oracle_intended_phase_tcn_phase_log_mag = result["oracle_intended_phase_tcn_phase_log_mag"]
     teacher_final_log_mag = result["teacher_final_log_mag"]
     teacher_residual = result["teacher_residual"]
     teacher_final_residual = result["teacher_final_residual"]
@@ -811,6 +973,9 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
     guitar_recon_audio = result["guitar_recon_audio"]
     piano_recon_audio = result["piano_recon_audio"]
     piano_mag_guitar_phase_audio = result["piano_mag_guitar_phase_audio"]
+    oracle_intended_target_phase_audio = result["oracle_intended_target_phase_audio"]
+    oracle_intended_guitar_phase_audio = result["oracle_intended_guitar_phase_audio"]
+    oracle_intended_phase_tcn_phase_audio = result["oracle_intended_phase_tcn_phase_audio"]
     teacher_pre_audio = result["teacher_before_phase_tcn_audio"]
     teacher_before_transient_audio = result["teacher_before_transient_audio"]
     teacher_final_audio = result["teacher_final_audio"]
@@ -855,6 +1020,42 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
             F.l1_loss(piano_mag_guitar_phase_audio, piano_audio)
         ),
         "piano_mag_guitar_phase_combined_loss": scalar(criterion(piano_mag_guitar_phase_audio, piano_audio)),
+        "oracle_intended_target_phase_vs_piano_log_mag_l1": scalar(
+            F.l1_loss(oracle_intended_target_phase_log_mag, piano_log_mag)
+        ),
+        "oracle_intended_target_phase_vs_piano_waveform_l1": scalar(
+            F.l1_loss(oracle_intended_target_phase_audio, piano_audio)
+        ),
+        "oracle_intended_target_phase_combined_loss": scalar(
+            criterion(oracle_intended_target_phase_audio, piano_audio)
+        ),
+        "oracle_intended_guitar_phase_vs_piano_log_mag_l1": scalar(
+            F.l1_loss(oracle_intended_guitar_phase_log_mag, piano_log_mag)
+        ),
+        "oracle_intended_guitar_phase_vs_piano_waveform_l1": scalar(
+            F.l1_loss(oracle_intended_guitar_phase_audio, piano_audio)
+        ),
+        "oracle_intended_guitar_phase_combined_loss": scalar(
+            criterion(oracle_intended_guitar_phase_audio, piano_audio)
+        ),
+        "oracle_intended_phase_tcn_phase_vs_piano_log_mag_l1": scalar(
+            F.l1_loss(oracle_intended_phase_tcn_phase_log_mag, piano_log_mag)
+        ),
+        "oracle_intended_phase_tcn_phase_vs_piano_waveform_l1": scalar(
+            F.l1_loss(oracle_intended_phase_tcn_phase_audio, piano_audio)
+        ),
+        "oracle_intended_phase_tcn_phase_combined_loss": scalar(
+            criterion(oracle_intended_phase_tcn_phase_audio, piano_audio)
+        ),
+        "oracle_target_vs_guitar_phase_log_mag_l1": scalar(
+            F.l1_loss(oracle_intended_target_phase_log_mag, oracle_intended_guitar_phase_log_mag)
+        ),
+        "oracle_phase_tcn_vs_guitar_phase_log_mag_l1": scalar(
+            F.l1_loss(oracle_intended_phase_tcn_phase_log_mag, oracle_intended_guitar_phase_log_mag)
+        ),
+        "oracle_phase_tcn_vs_target_phase_log_mag_l1": scalar(
+            F.l1_loss(oracle_intended_phase_tcn_phase_log_mag, oracle_intended_target_phase_log_mag)
+        ),
         "teacher_pre_vs_piano_log_mag_l1": scalar(F.l1_loss(teacher_log_mag, piano_log_mag)),
         "teacher_final_vs_piano_log_mag_l1": scalar(F.l1_loss(teacher_final_log_mag, piano_log_mag)),
         "teacher_pre_vs_piano_residual_l1": scalar(F.l1_loss(teacher_residual, piano_residual)),
@@ -931,11 +1132,17 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
         "piano_log_mag",
         "piano_mag_guitar_phase_log_mag",
         "teacher_intended_log_mag",
+        "oracle_intended_target_phase_log_mag",
+        "oracle_intended_guitar_phase_log_mag",
+        "oracle_intended_phase_tcn_phase_log_mag",
         "teacher_log_mag",
         "teacher_before_transient_log_mag",
         "teacher_final_log_mag",
         "piano_residual",
         "teacher_intended_residual",
+        "oracle_intended_target_phase_residual",
+        "oracle_intended_guitar_phase_residual",
+        "oracle_intended_phase_tcn_phase_residual",
         "teacher_residual",
         "teacher_before_transient_residual",
         "teacher_final_residual",
@@ -943,6 +1150,9 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
         "transient_correction_log_mag_delta",
         "output_delta_log_mag",
         "piano_mag_guitar_phase_signed_error",
+        "oracle_intended_target_phase_signed_error",
+        "oracle_intended_guitar_phase_signed_error",
+        "oracle_intended_phase_tcn_phase_signed_error",
         "mask",
         "raw_residual",
         "phase_delta",
@@ -959,6 +1169,9 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
         "guitar_recon_audio",
         "piano_recon_audio",
         "piano_mag_guitar_phase_audio",
+        "oracle_intended_target_phase_audio",
+        "oracle_intended_guitar_phase_audio",
+        "oracle_intended_phase_tcn_phase_audio",
         "teacher_before_phase_tcn_audio",
         "teacher_before_transient_audio",
         "teacher_after_phase_tcn_audio",
@@ -1211,6 +1424,9 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
 
     stage_log_mags = {
         "intended": teacher_intended_log_mag,
+        "oracle_target_phase": result["oracle_intended_target_phase_log_mag"],
+        "oracle_guitar_phase": result["oracle_intended_guitar_phase_log_mag"],
+        "oracle_phase_tcn_phase": result["oracle_intended_phase_tcn_phase_log_mag"],
         "before_phase": teacher_log_mag,
         "before_transient": result["teacher_before_transient_log_mag"],
         "final": teacher_final_log_mag,
@@ -1240,6 +1456,40 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
         "interharmonic_sustain_{stage}_{band}_over_mean",
         interharmonic_over_by_stage,
         interharmonic_band_masks,
+    )
+
+    high_energy_quantile = max(0.0, min(1.0, float(args.high_energy_interharmonic_quantile)))
+    piano_time_energy = torch.exp(piano_log_mag).mean(dim=-2, keepdim=True)
+    high_energy_threshold = torch.quantile(
+        piano_time_energy.detach().flatten(1),
+        high_energy_quantile,
+        dim=1,
+    ).view(-1, 1, 1)
+    high_energy_time_mask = piano_time_energy >= high_energy_threshold
+    high_energy_harmonic_region = artifact_harmonic_region(
+        piano_log_mag,
+        args.high_energy_interharmonic_peak_prominence,
+        args.high_energy_interharmonic_peak_radius_bins,
+    )
+    high_energy_sustain_mask = artifact_sustain_mask & high_energy_time_mask
+    high_energy_interharmonic_mask = high_energy_sustain_mask & (~high_energy_harmonic_region)
+    high_energy_band_masks = {
+        name: high_energy_interharmonic_mask & freq_mask.view(1, 1, -1, 1)
+        for name, freq_mask in band_freq_masks.items()
+    }
+    high_energy_over_by_stage = {
+        stage: torch.relu(stage_log - piano_log_mag - float(args.high_energy_interharmonic_margin))
+        for stage, stage_log in stage_log_mags.items()
+    }
+    metrics["high_energy_sustain_active_frac"] = float(high_energy_sustain_mask.float().mean().item())
+    metrics["high_energy_interharmonic_sustain_active_frac"] = float(
+        high_energy_interharmonic_mask.float().mean().item()
+    )
+    add_stage_band_metrics(
+        metrics,
+        "high_energy_interharmonic_sustain_{stage}_{band}_over_mean",
+        high_energy_over_by_stage,
+        high_energy_band_masks,
     )
 
     if piano_log_mag.shape[-1] > 1:
@@ -1360,6 +1610,14 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
         f"low_energy_harmonic_protect={args.low_energy_harmonic_protect}",
         f"low_energy_harmonic_peak_margin={args.low_energy_harmonic_peak_margin}",
         f"low_energy_harmonic_peak_prominence={args.low_energy_harmonic_peak_prominence}",
+        f"high_energy_interharmonic_quantile={args.high_energy_interharmonic_quantile}",
+        f"high_energy_interharmonic_margin={args.high_energy_interharmonic_margin}",
+        f"high_energy_interharmonic_peak_prominence={args.high_energy_interharmonic_peak_prominence}",
+        f"high_energy_interharmonic_peak_radius_bins={args.high_energy_interharmonic_peak_radius_bins}",
+        f"high_energy_interharmonic_low_weight={args.high_energy_interharmonic_low_weight}",
+        f"high_energy_interharmonic_low_mid_weight={args.high_energy_interharmonic_low_mid_weight}",
+        f"high_energy_interharmonic_mid_weight={args.high_energy_interharmonic_mid_weight}",
+        f"high_energy_interharmonic_high_weight={args.high_energy_interharmonic_high_weight}",
         f"artifact_peak_prominence={args.artifact_peak_prominence}",
         f"artifact_peak_radius_bins={args.artifact_peak_radius_bins}",
         f"artifact_shimmer_margin={args.artifact_shimmer_margin}",
@@ -1389,6 +1647,9 @@ def write_debug_wavs(result: dict, out_dir: Path, frame_index: int):
         "guitar_recon": result["guitar_recon_audio"],
         "piano_recon": result["piano_recon_audio"],
         "piano_mag_guitar_phase": result["piano_mag_guitar_phase_audio"],
+        "oracle_intended_target_phase": result["oracle_intended_target_phase_audio"],
+        "oracle_intended_guitar_phase": result["oracle_intended_guitar_phase_audio"],
+        "oracle_intended_phase_tcn_phase": result["oracle_intended_phase_tcn_phase_audio"],
         "teacher_before_phase_tcn": result["teacher_before_phase_tcn_audio"],
         "teacher_after_phase_tcn": result["teacher_after_phase_tcn_audio"],
         "teacher_before_transient": result["teacher_before_transient_audio"],
