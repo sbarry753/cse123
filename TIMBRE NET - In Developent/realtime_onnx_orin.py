@@ -544,8 +544,9 @@ def process_wav(
 
 def create_engine(args):
     frame_size = int(args.frame_size)
+    hop_size = int(args.hop_size)
     if args.engine:
-        return TrtOLAEngine(args.engine, frame_size=frame_size), "TensorRT"
+        return TrtOLAEngine(args.engine, frame_size=frame_size, hop_size=hop_size), "TensorRT"
     providers = choose_providers(args.provider)
     return OnnxOLAEngine(args.model, providers=providers, frame_size=frame_size), "ONNX Runtime"
 
@@ -745,6 +746,7 @@ def main() -> None:
     ap.add_argument("--output", default=None, help="[WAV mode] Output WAV file")
     ap.add_argument("--play", action="store_true", help="[WAV mode] Play output while processing")
     ap.add_argument("--frame_size", type=int, default=FRAME_SIZE, help="Model input/output frame size")
+    ap.add_argument("--hop_size", type=int, default=HOP_SIZE, help="Model input/output hop size")
     ap.add_argument("--list-devices", action="store_true", help="List PortAudio devices and exit")
     ap.add_argument("--host-api", default="JACK", help="Host API filter for device names, e.g. JACK or ALSA")
     ap.add_argument("--input-device", default=None, help="Input device index or partial device name")
