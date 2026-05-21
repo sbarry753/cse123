@@ -46,7 +46,7 @@ import torchaudio
 
 import onnxruntime as ort
 import tensorrt as trt
-from cuda.bindings import runtime as cudart
+from cuda import cudart
 
 
 SAMPLE_RATE = 48000
