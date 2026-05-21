@@ -109,6 +109,7 @@ def apply_checkpoint_config(args, payload):
     explicit = getattr(args, "_explicit_args", set())
     names = (
         "frame_size",
+        "output_size",
         "hop_size",
         "n_fft",
         "win_length",
@@ -124,6 +125,20 @@ def apply_checkpoint_config(args, payload):
         value = checkpoint_value(payload, name)
         if value is not None:
             setattr(args, name, value)
+
+
+def compatible_checkpoint_state(payload, model):
+    state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    state = {key: value for key, value in state.items() if key != "window"}
+    current = model.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state.items():
+        if key in current and current[key].shape != value.shape:
+            skipped.append(key)
+            continue
+        compatible[key] = value
+    return compatible, skipped
 
 
 def load_model(path: str, device: torch.device, args):
@@ -145,6 +160,7 @@ def load_model(path: str, device: torch.device, args):
         model = DDSPGuitarToPiano(
             sample_rate=SAMPLE_RATE,
             frame_size=args.frame_size,
+            output_size=args.output_size,
             n_fft=args.n_fft,
             win_length=args.win_length,
             hop_size=args.hop_size,
@@ -154,7 +170,14 @@ def load_model(path: str, device: torch.device, args):
             phase_tcn_layers=args.phase_tcn_layers,
             phase_max_delta=args.phase_max_delta,
         )
-        model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
+        state, skipped = compatible_checkpoint_state(ckpt, model)
+        load_result = model.load_state_dict(state, strict=False)
+        if skipped:
+            print(f"Skipped incompatible checkpoint tensors: {skipped}")
+        if load_result.missing_keys:
+            print(f"Missing model keys initialized from defaults: {load_result.missing_keys}")
+        if load_result.unexpected_keys:
+            print(f"Ignored unexpected checkpoint keys: {load_result.unexpected_keys}")
 
     model.to(device)
     model.eval()
@@ -210,11 +233,11 @@ class OverlapAddEngine:
     For each hop-size input chunk:
       - shift new samples into input ring
       - run model on full frame window
-      - render the full predicted frame according to render_mode
+      - render the predicted audio according to render_mode
       - emit next hop-size samples
     """
 
-    MODES = {"windowed_ola", "last_hop", "legacy_ola"}
+    MODES = {"windowed_ola", "center_hop", "causal_hop", "legacy_ola"}
 
     def __init__(
         self,
@@ -246,8 +269,12 @@ class OverlapAddEngine:
 
     @property
     def wet_path_delay_samples(self) -> int:
-        if self.render_mode == "last_hop":
+        if self.render_mode == "causal_hop":
             return 0
+        if self.render_mode == "center_hop":
+            center_start = (self.frame_size - self.hop_size) // 2
+            center_end = center_start + self.hop_size
+            return self.frame_size - center_end
         return self.frame_size - self.hop_size
 
     def process_hop(self, in_hop: np.ndarray) -> np.ndarray:
@@ -258,11 +285,27 @@ class OverlapAddEngine:
         self.input_ring[:-self.hop_size] = self.input_ring[self.hop_size:]
         self.input_ring[-self.hop_size:] = in_hop
 
-        # Model predicts full frame window
+        # Model predicts either a full frame or a trained causal output chunk.
         pred_frame = _infer(self.model, self.buf, self.input_ring.copy())
 
-        if self.render_mode == "last_hop":
+        if self.render_mode == "causal_hop":
+            if len(pred_frame) < self.hop_size:
+                raise ValueError(
+                    f"{self.render_mode} requires model output length >= hop_size "
+                    f"({self.hop_size}), got {len(pred_frame)}"
+                )
             return pred_frame[-self.hop_size:].copy()
+
+        if len(pred_frame) != self.frame_size:
+            raise ValueError(
+                f"{self.render_mode} requires full-frame model output length {self.frame_size}, "
+                f"got {len(pred_frame)}. Use --render-mode causal_hop for cropped-output checkpoints."
+            )
+
+        if self.render_mode == "center_hop":
+            center_start = (self.frame_size - self.hop_size) // 2
+            center_end = center_start + self.hop_size
+            return pred_frame[center_start:center_end].copy()
 
         if self.render_mode == "legacy_ola":
             # Historical behavior retained for A/B comparisons. This applies
@@ -270,6 +313,16 @@ class OverlapAddEngine:
             self.output_ring += pred_frame
             out_hop = self.output_ring[:self.hop_size].copy()
         else:
+            """
+            Synthesis window is a Hann window the size of the frame.
+            Each inference output is multiplied by the Hann window so the edges of the frame.
+            contribute less to the output stream. This smoothes the output audio along the 
+            frame boundaries.
+            The normalization ring is used to record how much "weight" each sample in the frame has.
+            The output hop is divided by the accumulated weights within the window to prevent the output
+            audio from having too much gain from the overlapping windows
+            """
+
             self.output_ring += pred_frame * self.synthesis_window
             self.norm_ring += self.synthesis_window
 
@@ -365,7 +418,7 @@ def process_wav(
                 stream.write(mixed.reshape(-1, 1))
 
         # Flush the tail so saved file captures final overlap-add decay
-        if collected is not None:
+        if collected is not None and engine.wet_path_delay_samples:
             tail_hops = args.frame_size // args.hop_size
             tail_start = len(audio_np)
             tail_out = []
@@ -540,6 +593,7 @@ def main():
     p.add_argument("--win_length", type=int, default=None)
     p.add_argument("--hop_size", type=int, default=HOP_SIZE)
     p.add_argument("--frame_size", type=int, default=FRAME_SIZE)
+    p.add_argument("--output_size", type=int, default=None)
     p.add_argument("--input", default="overfit/guitar/plaz.wav", help="[WAV mode] Input WAV file")
     p.add_argument("--output", default=None, help="[WAV mode] Output WAV file")
     p.add_argument("--play", action="store_true", help="[WAV mode] Play output while processing")
@@ -551,7 +605,8 @@ def main():
         default="windowed_ola",
         help=(
             "Streaming renderer: windowed_ola fixes overlap gain with normalized Hann OLA; "
-            "last_hop emits pred_frame[-hop_size:]; legacy_ola preserves the old unnormalized OLA."
+            "center_hop emits the middle hop from full-frame models; "
+            "causal_hop emits the newest hop from cropped-output models; "
         ),
     )
     p.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")

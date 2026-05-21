@@ -75,28 +75,6 @@ def apply_checkpoint_config(args, payload):
         "phase_saturation_threshold",
         "energy_weight_floor",
         "energy_weight_ceiling",
-        "low_energy_spectral_quantile",
-        "low_energy_spectral_margin",
-        "low_energy_onset_flux_std",
-        "low_energy_onset_pre_ms",
-        "low_energy_onset_post_ms",
-        "low_energy_band_low_weight",
-        "low_energy_band_low_mid_weight",
-        "low_energy_band_mid_weight",
-        "low_energy_band_high_weight",
-        "low_energy_low_note_threshold_hz",
-        "low_energy_low_note_ratio_threshold",
-        "low_energy_harmonic_protect",
-        "low_energy_harmonic_peak_margin",
-        "low_energy_harmonic_peak_prominence",
-        "high_energy_interharmonic_quantile",
-        "high_energy_interharmonic_margin",
-        "high_energy_interharmonic_peak_prominence",
-        "high_energy_interharmonic_peak_radius_bins",
-        "high_energy_interharmonic_low_weight",
-        "high_energy_interharmonic_low_mid_weight",
-        "high_energy_interharmonic_mid_weight",
-        "high_energy_interharmonic_high_weight",
     )
     for name in names:
         if name in explicit:
@@ -139,28 +117,90 @@ def parse_args():
     p.add_argument("--debug_attack_ms", type=float, default=20.0)
     p.add_argument("--debug_attack_contrast_margin", type=float, default=0.0)
     p.add_argument("--debug_sustain_start_ms", type=float, default=30.0)
-    p.add_argument("--low_energy_spectral_quantile", type=float, default=0.25)
-    p.add_argument("--low_energy_spectral_margin", type=float, default=0.05)
-    p.add_argument("--low_energy_onset_flux_std", type=float, default=1.5)
-    p.add_argument("--low_energy_onset_pre_ms", type=float, default=5.0)
-    p.add_argument("--low_energy_onset_post_ms", type=float, default=35.0)
-    p.add_argument("--low_energy_band_low_weight", type=float, default=0.0)
-    p.add_argument("--low_energy_band_low_mid_weight", type=float, default=0.5)
-    p.add_argument("--low_energy_band_mid_weight", type=float, default=1.25)
-    p.add_argument("--low_energy_band_high_weight", type=float, default=1.25)
-    p.add_argument("--low_energy_low_note_threshold_hz", type=float, default=500.0)
-    p.add_argument("--low_energy_low_note_ratio_threshold", type=float, default=0.45)
-    p.add_argument("--low_energy_harmonic_protect", action="store_true")
-    p.add_argument("--low_energy_harmonic_peak_margin", type=float, default=0.10)
-    p.add_argument("--low_energy_harmonic_peak_prominence", type=float, default=0.20)
-    p.add_argument("--high_energy_interharmonic_quantile", type=float, default=0.75)
-    p.add_argument("--high_energy_interharmonic_margin", type=float, default=0.05)
-    p.add_argument("--high_energy_interharmonic_peak_prominence", type=float, default=0.20)
-    p.add_argument("--high_energy_interharmonic_peak_radius_bins", type=int, default=1)
-    p.add_argument("--high_energy_interharmonic_low_weight", type=float, default=0.0)
-    p.add_argument("--high_energy_interharmonic_low_mid_weight", type=float, default=0.0)
-    p.add_argument("--high_energy_interharmonic_mid_weight", type=float, default=1.0)
-    p.add_argument("--high_energy_interharmonic_high_weight", type=float, default=1.0)
+    p.add_argument("--debug-low-energy-quantile", dest="low_energy_spectral_quantile", type=float, default=0.25)
+    p.add_argument("--debug-low-energy-margin", dest="low_energy_spectral_margin", type=float, default=0.05)
+    p.add_argument("--debug-onset-flux-std", dest="low_energy_onset_flux_std", type=float, default=1.5)
+    p.add_argument("--debug-onset-pre-ms", dest="low_energy_onset_pre_ms", type=float, default=5.0)
+    p.add_argument("--debug-onset-post-ms", dest="low_energy_onset_post_ms", type=float, default=35.0)
+    p.add_argument("--debug-band-low-weight", dest="low_energy_band_low_weight", type=float, default=0.0)
+    p.add_argument("--debug-band-low-mid-weight", dest="low_energy_band_low_mid_weight", type=float, default=0.5)
+    p.add_argument("--debug-band-mid-weight", dest="low_energy_band_mid_weight", type=float, default=1.25)
+    p.add_argument("--debug-band-high-weight", dest="low_energy_band_high_weight", type=float, default=1.25)
+    p.add_argument("--debug-low-note-threshold-hz", dest="low_energy_low_note_threshold_hz", type=float, default=500.0)
+    p.add_argument("--debug-low-note-ratio-threshold", dest="low_energy_low_note_ratio_threshold", type=float, default=0.45)
+    p.add_argument("--debug-harmonic-protect", dest="low_energy_harmonic_protect", action="store_true")
+    p.add_argument("--debug-harmonic-peak-margin", dest="low_energy_harmonic_peak_margin", type=float, default=0.10)
+    p.add_argument("--debug-harmonic-peak-prominence", dest="low_energy_harmonic_peak_prominence", type=float, default=0.20)
+    p.add_argument("--debug-high-energy-quantile", dest="high_energy_interharmonic_quantile", type=float, default=0.75)
+    p.add_argument("--debug-high-energy-margin", dest="high_energy_interharmonic_margin", type=float, default=0.05)
+    p.add_argument(
+        "--debug-high-energy-peak-prominence",
+        dest="high_energy_interharmonic_peak_prominence",
+        type=float,
+        default=0.20,
+    )
+    p.add_argument(
+        "--debug-high-energy-peak-radius-bins",
+        dest="high_energy_interharmonic_peak_radius_bins",
+        type=int,
+        default=1,
+    )
+    p.add_argument("--debug-high-energy-low-weight", dest="high_energy_interharmonic_low_weight", type=float, default=0.0)
+    p.add_argument(
+        "--debug-high-energy-low-mid-weight",
+        dest="high_energy_interharmonic_low_mid_weight",
+        type=float,
+        default=0.0,
+    )
+    p.add_argument("--debug-high-energy-mid-weight", dest="high_energy_interharmonic_mid_weight", type=float, default=1.0)
+    p.add_argument("--debug-high-energy-high-weight", dest="high_energy_interharmonic_high_weight", type=float, default=1.0)
+    p.add_argument("--low_energy_spectral_quantile", dest="low_energy_spectral_quantile", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_spectral_margin", dest="low_energy_spectral_margin", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_onset_flux_std", dest="low_energy_onset_flux_std", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_onset_pre_ms", dest="low_energy_onset_pre_ms", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_onset_post_ms", dest="low_energy_onset_post_ms", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_band_low_weight", dest="low_energy_band_low_weight", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_band_low_mid_weight", dest="low_energy_band_low_mid_weight", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_band_mid_weight", dest="low_energy_band_mid_weight", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_band_high_weight", dest="low_energy_band_high_weight", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_low_note_threshold_hz", dest="low_energy_low_note_threshold_hz", type=float, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--low_energy_low_note_ratio_threshold",
+        dest="low_energy_low_note_ratio_threshold",
+        type=float,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--low_energy_harmonic_protect", dest="low_energy_harmonic_protect", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--low_energy_harmonic_peak_margin", dest="low_energy_harmonic_peak_margin", type=float, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--low_energy_harmonic_peak_prominence",
+        dest="low_energy_harmonic_peak_prominence",
+        type=float,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--high_energy_interharmonic_quantile", dest="high_energy_interharmonic_quantile", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--high_energy_interharmonic_margin", dest="high_energy_interharmonic_margin", type=float, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--high_energy_interharmonic_peak_prominence",
+        dest="high_energy_interharmonic_peak_prominence",
+        type=float,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--high_energy_interharmonic_peak_radius_bins",
+        dest="high_energy_interharmonic_peak_radius_bins",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--high_energy_interharmonic_low_weight", dest="high_energy_interharmonic_low_weight", type=float, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--high_energy_interharmonic_low_mid_weight",
+        dest="high_energy_interharmonic_low_mid_weight",
+        type=float,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--high_energy_interharmonic_mid_weight", dest="high_energy_interharmonic_mid_weight", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--high_energy_interharmonic_high_weight", dest="high_energy_interharmonic_high_weight", type=float, help=argparse.SUPPRESS)
     p.add_argument("--artifact_peak_prominence", type=float, default=0.20)
     p.add_argument("--artifact_peak_radius_bins", type=int, default=1)
     p.add_argument("--artifact_shimmer_margin", type=float, default=0.05)
@@ -1596,28 +1636,29 @@ def write_metrics(result: dict, out_txt: Path, args, frame_index: int, start_sam
         f"debug_attack_ms={args.debug_attack_ms}",
         f"debug_attack_contrast_margin={args.debug_attack_contrast_margin}",
         f"debug_sustain_start_ms={args.debug_sustain_start_ms}",
-        f"low_energy_spectral_quantile={args.low_energy_spectral_quantile}",
-        f"low_energy_spectral_margin={args.low_energy_spectral_margin}",
-        f"low_energy_onset_flux_std={args.low_energy_onset_flux_std}",
-        f"low_energy_onset_pre_ms={args.low_energy_onset_pre_ms}",
-        f"low_energy_onset_post_ms={args.low_energy_onset_post_ms}",
-        f"low_energy_band_low_weight={args.low_energy_band_low_weight}",
-        f"low_energy_band_low_mid_weight={args.low_energy_band_low_mid_weight}",
-        f"low_energy_band_mid_weight={args.low_energy_band_mid_weight}",
-        f"low_energy_band_high_weight={args.low_energy_band_high_weight}",
-        f"low_energy_low_note_threshold_hz={args.low_energy_low_note_threshold_hz}",
-        f"low_energy_low_note_ratio_threshold={args.low_energy_low_note_ratio_threshold}",
-        f"low_energy_harmonic_protect={args.low_energy_harmonic_protect}",
-        f"low_energy_harmonic_peak_margin={args.low_energy_harmonic_peak_margin}",
-        f"low_energy_harmonic_peak_prominence={args.low_energy_harmonic_peak_prominence}",
-        f"high_energy_interharmonic_quantile={args.high_energy_interharmonic_quantile}",
-        f"high_energy_interharmonic_margin={args.high_energy_interharmonic_margin}",
-        f"high_energy_interharmonic_peak_prominence={args.high_energy_interharmonic_peak_prominence}",
-        f"high_energy_interharmonic_peak_radius_bins={args.high_energy_interharmonic_peak_radius_bins}",
-        f"high_energy_interharmonic_low_weight={args.high_energy_interharmonic_low_weight}",
-        f"high_energy_interharmonic_low_mid_weight={args.high_energy_interharmonic_low_mid_weight}",
-        f"high_energy_interharmonic_mid_weight={args.high_energy_interharmonic_mid_weight}",
-        f"high_energy_interharmonic_high_weight={args.high_energy_interharmonic_high_weight}",
+        "artifact_diagnostics_only=True",
+        f"debug_low_energy_quantile={args.low_energy_spectral_quantile}",
+        f"debug_low_energy_margin={args.low_energy_spectral_margin}",
+        f"debug_onset_flux_std={args.low_energy_onset_flux_std}",
+        f"debug_onset_pre_ms={args.low_energy_onset_pre_ms}",
+        f"debug_onset_post_ms={args.low_energy_onset_post_ms}",
+        f"debug_band_low_weight={args.low_energy_band_low_weight}",
+        f"debug_band_low_mid_weight={args.low_energy_band_low_mid_weight}",
+        f"debug_band_mid_weight={args.low_energy_band_mid_weight}",
+        f"debug_band_high_weight={args.low_energy_band_high_weight}",
+        f"debug_low_note_threshold_hz={args.low_energy_low_note_threshold_hz}",
+        f"debug_low_note_ratio_threshold={args.low_energy_low_note_ratio_threshold}",
+        f"debug_harmonic_protect={args.low_energy_harmonic_protect}",
+        f"debug_harmonic_peak_margin={args.low_energy_harmonic_peak_margin}",
+        f"debug_harmonic_peak_prominence={args.low_energy_harmonic_peak_prominence}",
+        f"debug_high_energy_quantile={args.high_energy_interharmonic_quantile}",
+        f"debug_high_energy_margin={args.high_energy_interharmonic_margin}",
+        f"debug_high_energy_peak_prominence={args.high_energy_interharmonic_peak_prominence}",
+        f"debug_high_energy_peak_radius_bins={args.high_energy_interharmonic_peak_radius_bins}",
+        f"debug_high_energy_low_weight={args.high_energy_interharmonic_low_weight}",
+        f"debug_high_energy_low_mid_weight={args.high_energy_interharmonic_low_mid_weight}",
+        f"debug_high_energy_mid_weight={args.high_energy_interharmonic_mid_weight}",
+        f"debug_high_energy_high_weight={args.high_energy_interharmonic_high_weight}",
         f"artifact_peak_prominence={args.artifact_peak_prominence}",
         f"artifact_peak_radius_bins={args.artifact_peak_radius_bins}",
         f"artifact_shimmer_margin={args.artifact_shimmer_margin}",

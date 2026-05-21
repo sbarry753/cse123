@@ -271,6 +271,7 @@ class PolyphonicGuitarToPiano(nn.Module):
         phase_tcn_ch: int = 16,
         phase_tcn_layers: int = 3,
         phase_max_delta: float = 0.5,
+        output_size: int | None = None,
         transient_ch: int = 16,
         transient_ms: float = 30.0,
         transient_max_gain: float = 0.20,
@@ -282,10 +283,14 @@ class PolyphonicGuitarToPiano(nn.Module):
             raise ValueError(f"frame_size must be > 0, got {frame_size}")
         if hop_size <= 0:
             raise ValueError(f"hop_size must be > 0, got {hop_size}")
+        output_size = int(frame_size if output_size is None else output_size)
+        if output_size <= 0 or output_size > frame_size:
+            raise ValueError(f"output_size must satisfy 0 < output_size <= frame_size, got {output_size}")
         if win_length <= 0 or win_length > n_fft:
             raise ValueError(f"win_length must satisfy 0 < win_length <= n_fft, got {win_length} and n_fft={n_fft}")
         self.sample_rate = sample_rate
         self.frame_size = int(frame_size)
+        self.output_size = int(output_size)
         self.n_fft = int(n_fft)
         self.win_length = win_length
         self.hop_size = int(hop_size)
@@ -385,9 +390,11 @@ class PolyphonicGuitarToPiano(nn.Module):
 
         audio_before_transient = self._istft(out_spec, length=length)
         transient_delta = self.transient_correction(audio_frame, audio_before_transient)
-        audio_out = audio_before_transient + transient_delta
+        full_audio_out = audio_before_transient + transient_delta
         #audio_out = self.transient(audio_out)
         # audio_out = torch.tanh(audio_out)
+        output_size = min(self.output_size, length)
+        audio_out = full_audio_out[..., -output_size:]
 
         features = {
             "input_mag": mag,
@@ -398,7 +405,8 @@ class PolyphonicGuitarToPiano(nn.Module):
             "out_log_mag": out_log_mag.squeeze(1),
             "out_phase": out_phase,
             "before_transient_audio": audio_before_transient,
-            "after_transient_audio": audio_out,
+            "after_transient_audio": full_audio_out,
+            "cropped_audio_out": audio_out,
         }
         params = {
             "mask": mask.squeeze(1),

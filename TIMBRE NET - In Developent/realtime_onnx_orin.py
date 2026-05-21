@@ -180,11 +180,14 @@ class OnnxOLAEngine:
 
         self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
         self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.norm_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.synthesis_window = np.hanning(FRAME_SIZE).astype(np.float32)
         self.in_tensor = np.zeros((1, FRAME_SIZE), dtype=np.float32)
 
     def reset(self) -> None:
         self.input_ring.fill(0.0)
         self.output_ring.fill(0.0)
+        self.norm_ring.fill(0.0)
 
     def process_hop(self, in_hop: np.ndarray) -> np.ndarray:
         if len(in_hop) != HOP_SIZE:
@@ -196,10 +199,19 @@ class OnnxOLAEngine:
         np.copyto(self.in_tensor[0], self.input_ring)
         pred = self.sess.run([self.out_name], {self.in_name: self.in_tensor})[0][0]
 
-        self.output_ring += pred
-        out_hop = self.output_ring[:HOP_SIZE].copy()
+        if len(pred) != FRAME_SIZE:
+            raise ValueError(f"Expected model output length {FRAME_SIZE}, got {len(pred)}")
+
+        self.output_ring += pred.astype(np.float32, copy=False) * self.synthesis_window
+        self.norm_ring += self.synthesis_window
+
+        denom = np.maximum(self.norm_ring[:HOP_SIZE], 1e-6)
+        out_hop = (self.output_ring[:HOP_SIZE] / denom).astype(np.float32)
+
         self.output_ring[:-HOP_SIZE] = self.output_ring[HOP_SIZE:]
         self.output_ring[-HOP_SIZE:] = 0.0
+        self.norm_ring[:-HOP_SIZE] = self.norm_ring[HOP_SIZE:]
+        self.norm_ring[-HOP_SIZE:] = 0.0
         return out_hop
 
 
@@ -279,6 +291,8 @@ class TrtOLAEngine:
 
         self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
         self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.norm_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.synthesis_window = np.hanning(FRAME_SIZE).astype(np.float32)
 
     def _find_io_tensors(self) -> Tuple[str, str]:
         trt = self.trt
@@ -323,6 +337,7 @@ class TrtOLAEngine:
     def reset(self) -> None:
         self.input_ring.fill(0.0)
         self.output_ring.fill(0.0)
+        self.norm_ring.fill(0.0)
 
     def process_hop(self, in_hop: np.ndarray) -> np.ndarray:
         if len(in_hop) != HOP_SIZE:
@@ -358,10 +373,19 @@ class TrtOLAEngine:
         _check_cuda(cudart.cudaStreamSynchronize(self.stream), "cudaStreamSynchronize")
 
         pred = self.out_tensor[0].astype(np.float32, copy=False)
-        self.output_ring += pred
-        out_hop = self.output_ring[:HOP_SIZE].copy()
+        if len(pred) != FRAME_SIZE:
+            raise ValueError(f"Expected TensorRT output length {FRAME_SIZE}, got {len(pred)}")
+
+        self.output_ring += pred * self.synthesis_window
+        self.norm_ring += self.synthesis_window
+
+        denom = np.maximum(self.norm_ring[:HOP_SIZE], 1e-6)
+        out_hop = (self.output_ring[:HOP_SIZE] / denom).astype(np.float32)
+
         self.output_ring[:-HOP_SIZE] = self.output_ring[HOP_SIZE:]
         self.output_ring[-HOP_SIZE:] = 0.0
+        self.norm_ring[:-HOP_SIZE] = self.norm_ring[HOP_SIZE:]
+        self.norm_ring[-HOP_SIZE:] = 0.0
         return out_hop
 
 
