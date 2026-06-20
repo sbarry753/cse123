@@ -21,6 +21,9 @@ python realtime_onnx_orin.py --model model.onnx --host-api JACK --queue-hops 8 -
 # Run a TensorRT engine built with trtexec
 python realtime_onnx_orin.py --engine model_fp16.plan --host-api JACK
 
+# Run a 2048-sample model/window with the fixed 256-sample realtime hop
+python realtime_onnx_orin.py --engine model_fp16.plan --frame_size 2048 --host-api JACK
+
 # WAV -> save processed output
 python realtime_onnx_orin.py --engine model_fp16.plan --input guitar.wav --output piano.wav
 
@@ -46,7 +49,7 @@ import torchaudio
 
 import onnxruntime as ort
 import tensorrt as trt
-from cuda.bindings import runtime as cudart
+from cuda import cudart
 
 
 SAMPLE_RATE = 48000
@@ -150,10 +153,28 @@ class OnnxOLAEngine:
     """
     Overlap-add engine driven by ONNX Runtime.
 
-    process_hop(in_hop[HOP_SIZE]) -> out_hop[HOP_SIZE]
+    process_hop(in_hop[hop_size]) -> out_hop[hop_size]
     """
 
-    def __init__(self, model_path: str, providers: List[str]):
+    def __init__(
+        self,
+        model_path: str,
+        providers: List[str],
+        frame_size: int = FRAME_SIZE,
+        hop_size: int = HOP_SIZE,
+    ):
+        self.frame_size = int(frame_size)
+        self.hop_size = int(hop_size)
+        if self.frame_size <= 0:
+            raise ValueError(f"frame_size must be positive, got {self.frame_size}")
+        if self.hop_size <= 0:
+            raise ValueError(f"hop_size must be positive, got {self.hop_size}")
+        if self.frame_size < self.hop_size:
+            raise ValueError(
+                f"frame_size must be >= hop_size, got frame_size={self.frame_size}, "
+                f"hop_size={self.hop_size}"
+            )
+
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess_opts.intra_op_num_threads = 1
@@ -171,35 +192,48 @@ class OnnxOLAEngine:
         print(f"Input : {in_meta.name} {in_meta.shape} {in_meta.type}")
         print(f"Output: {out_meta.name} {out_meta.shape} {out_meta.type}")
 
-        if list(in_meta.shape) != [1, FRAME_SIZE]:
+        expected_shape = [1, self.frame_size]
+        if list(in_meta.shape) != expected_shape:
             print(
                 f"WARNING: model input shape {in_meta.shape} does not match "
-                f"(1, {FRAME_SIZE}). Output may be wrong.",
+                f"(1, {self.frame_size}). Output may be wrong.",
                 file=sys.stderr,
             )
 
-        self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
-        self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
-        self.in_tensor = np.zeros((1, FRAME_SIZE), dtype=np.float32)
+        self.input_ring = np.zeros(self.frame_size, dtype=np.float32)
+        self.output_ring = np.zeros(self.frame_size, dtype=np.float32)
+        self.norm_ring = np.zeros(self.frame_size, dtype=np.float32)
+        self.synthesis_window = np.hanning(self.frame_size).astype(np.float32)
+        self.in_tensor = np.zeros((1, self.frame_size), dtype=np.float32)
 
     def reset(self) -> None:
         self.input_ring.fill(0.0)
         self.output_ring.fill(0.0)
+        self.norm_ring.fill(0.0)
 
     def process_hop(self, in_hop: np.ndarray) -> np.ndarray:
-        if len(in_hop) != HOP_SIZE:
-            raise ValueError(f"Expected hop of length {HOP_SIZE}, got {len(in_hop)}")
+        if len(in_hop) != self.hop_size:
+            raise ValueError(f"Expected hop of length {self.hop_size}, got {len(in_hop)}")
 
-        self.input_ring[:-HOP_SIZE] = self.input_ring[HOP_SIZE:]
-        self.input_ring[-HOP_SIZE:] = in_hop
+        self.input_ring[:-self.hop_size] = self.input_ring[self.hop_size:]
+        self.input_ring[-self.hop_size:] = in_hop
 
         np.copyto(self.in_tensor[0], self.input_ring)
         pred = self.sess.run([self.out_name], {self.in_name: self.in_tensor})[0][0]
 
-        self.output_ring += pred
-        out_hop = self.output_ring[:HOP_SIZE].copy()
-        self.output_ring[:-HOP_SIZE] = self.output_ring[HOP_SIZE:]
-        self.output_ring[-HOP_SIZE:] = 0.0
+        if len(pred) != self.frame_size:
+            raise ValueError(f"Expected model output length {self.frame_size}, got {len(pred)}")
+
+        self.output_ring += pred.astype(np.float32, copy=False) * self.synthesis_window
+        self.norm_ring += self.synthesis_window
+
+        denom = np.maximum(self.norm_ring[:self.hop_size], 1e-6)
+        out_hop = (self.output_ring[:self.hop_size] / denom).astype(np.float32)
+
+        self.output_ring[:-self.hop_size] = self.output_ring[self.hop_size:]
+        self.output_ring[-self.hop_size:] = 0.0
+        self.norm_ring[:-self.hop_size] = self.norm_ring[self.hop_size:]
+        self.norm_ring[-self.hop_size:] = 0.0
         return out_hop
 
 
@@ -223,10 +257,27 @@ class TrtOLAEngine:
     Overlap-add engine driven directly by a serialized TensorRT engine.
 
     The TensorRT engine must have one input and one output with shape compatible
-    with (1, FRAME_SIZE). FP32 and FP16 TensorRT I/O tensors are supported.
+    with (1, frame_size). FP32 and FP16 TensorRT I/O tensors are supported.
     """
 
-    def __init__(self, engine_path: str):
+    def __init__(
+        self,
+        engine_path: str,
+        frame_size: int = FRAME_SIZE,
+        hop_size: int = HOP_SIZE,
+    ):
+        self.frame_size = int(frame_size)
+        self.hop_size = int(hop_size)
+        if self.frame_size <= 0:
+            raise ValueError(f"frame_size must be positive, got {self.frame_size}")
+        if self.hop_size <= 0:
+            raise ValueError(f"hop_size must be positive, got {self.hop_size}")
+        if self.frame_size < self.hop_size:
+            raise ValueError(
+                f"frame_size must be >= hop_size, got frame_size={self.frame_size}, "
+                f"hop_size={self.hop_size}"
+            )
+
         self.trt = trt
         self.cudart = cudart
         self.stream = None
@@ -248,16 +299,17 @@ class TrtOLAEngine:
 
         in_shape = tuple(self.engine.get_tensor_shape(self.in_name))
         if any(dim < 0 for dim in in_shape):
-            self.context.set_input_shape(self.in_name, (1, FRAME_SIZE))
+            self.context.set_input_shape(self.in_name, (1, self.frame_size))
             in_shape = tuple(self.context.get_tensor_shape(self.in_name))
         out_shape = tuple(self.context.get_tensor_shape(self.out_name))
         if any(dim < 0 for dim in out_shape):
             out_shape = tuple(self.engine.get_tensor_shape(self.out_name))
 
-        if in_shape != (1, FRAME_SIZE):
-            raise RuntimeError(f"TensorRT input shape {in_shape} does not match (1, {FRAME_SIZE})")
-        if out_shape != (1, FRAME_SIZE):
-            raise RuntimeError(f"TensorRT output shape {out_shape} does not match (1, {FRAME_SIZE})")
+        expected_shape = (1, self.frame_size)
+        if in_shape != expected_shape:
+            raise RuntimeError(f"TensorRT input shape {in_shape} does not match {expected_shape}")
+        if out_shape != expected_shape:
+            raise RuntimeError(f"TensorRT output shape {out_shape} does not match {expected_shape}")
 
         self.input_dtype = self._trt_dtype_to_np(self.engine.get_tensor_dtype(self.in_name))
         self.output_dtype = self._trt_dtype_to_np(self.engine.get_tensor_dtype(self.out_name))
@@ -277,8 +329,10 @@ class TrtOLAEngine:
         print(f"Input : {self.in_name} {in_shape} {self.input_dtype}")
         print(f"Output: {self.out_name} {out_shape} {self.output_dtype}")
 
-        self.input_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
-        self.output_ring = np.zeros(FRAME_SIZE, dtype=np.float32)
+        self.input_ring = np.zeros(self.frame_size, dtype=np.float32)
+        self.output_ring = np.zeros(self.frame_size, dtype=np.float32)
+        self.norm_ring = np.zeros(self.frame_size, dtype=np.float32)
+        self.synthesis_window = np.hanning(self.frame_size).astype(np.float32)
 
     def _find_io_tensors(self) -> Tuple[str, str]:
         trt = self.trt
@@ -323,14 +377,15 @@ class TrtOLAEngine:
     def reset(self) -> None:
         self.input_ring.fill(0.0)
         self.output_ring.fill(0.0)
+        self.norm_ring.fill(0.0)
 
     def process_hop(self, in_hop: np.ndarray) -> np.ndarray:
-        if len(in_hop) != HOP_SIZE:
-            raise ValueError(f"Expected hop of length {HOP_SIZE}, got {len(in_hop)}")
+        if len(in_hop) != self.hop_size:
+            raise ValueError(f"Expected hop of length {self.hop_size}, got {len(in_hop)}")
 
         cudart = self.cudart
-        self.input_ring[:-HOP_SIZE] = self.input_ring[HOP_SIZE:]
-        self.input_ring[-HOP_SIZE:] = in_hop
+        self.input_ring[:-self.hop_size] = self.input_ring[self.hop_size:]
+        self.input_ring[-self.hop_size:] = in_hop
 
         np.copyto(self.in_tensor[0], self.input_ring, casting="same_kind")
         _check_cuda(
@@ -358,16 +413,26 @@ class TrtOLAEngine:
         _check_cuda(cudart.cudaStreamSynchronize(self.stream), "cudaStreamSynchronize")
 
         pred = self.out_tensor[0].astype(np.float32, copy=False)
-        self.output_ring += pred
-        out_hop = self.output_ring[:HOP_SIZE].copy()
-        self.output_ring[:-HOP_SIZE] = self.output_ring[HOP_SIZE:]
-        self.output_ring[-HOP_SIZE:] = 0.0
+        if len(pred) != self.frame_size:
+            raise ValueError(f"Expected TensorRT output length {self.frame_size}, got {len(pred)}")
+
+        self.output_ring += pred * self.synthesis_window
+        self.norm_ring += self.synthesis_window
+
+        denom = np.maximum(self.norm_ring[:self.hop_size], 1e-6)
+        out_hop = (self.output_ring[:self.hop_size] / denom).astype(np.float32)
+
+        self.output_ring[:-self.hop_size] = self.output_ring[self.hop_size:]
+        self.output_ring[-self.hop_size:] = 0.0
+        self.norm_ring[:-self.hop_size] = self.norm_ring[self.hop_size:]
+        self.norm_ring[-self.hop_size:] = 0.0
         return out_hop
 
 
 def warmup(engine, n: int = 64) -> None:
     print(f"Warming up ({n} iters)...", end="", flush=True)
-    dummy = (np.random.randn(HOP_SIZE) * 0.05).astype(np.float32)
+    hop_size = getattr(engine, "hop_size", HOP_SIZE)
+    dummy = (np.random.randn(hop_size) * 0.05).astype(np.float32)
     lats = []
     for _ in range(n):
         t0 = time.perf_counter()
@@ -406,17 +471,18 @@ def process_wav(
     host_api: Optional[str] = "JACK",
     latency="low",
 ) -> None:
+    hop_size = getattr(engine, "hop_size", HOP_SIZE)
     warmup(engine)
     audio_np = prepare_audio_file(input_path)
     orig_len = len(audio_np)
     duration = orig_len / SAMPLE_RATE
     print(f"Input: {input_path} ({duration:.2f}s, {orig_len:,} samples)")
 
-    pad = (HOP_SIZE - (orig_len % HOP_SIZE)) % HOP_SIZE
+    pad = (hop_size - (orig_len % hop_size)) % hop_size
     if pad:
         audio_np = np.concatenate([audio_np, np.zeros(pad, dtype=np.float32)])
 
-    n_steps = len(audio_np) // HOP_SIZE
+    n_steps = len(audio_np) // hop_size
     engine.reset()
 
     collected = np.zeros_like(audio_np) if output_path is not None else None
@@ -429,7 +495,7 @@ def process_wav(
             validate_device(play_device, want_input=False)
             stream = sd.OutputStream(
                 samplerate=SAMPLE_RATE,
-                blocksize=HOP_SIZE,
+                blocksize=hop_size,
                 device=play_device,
                 channels=1,
                 dtype=DTYPE,
@@ -440,8 +506,8 @@ def process_wav(
 
         print(f"Processing {n_steps:,} hops...")
         for i in range(n_steps):
-            s = i * HOP_SIZE
-            e = s + HOP_SIZE
+            s = i * hop_size
+            e = s + hop_size
             in_hop = audio_np[s:e]
 
             t0 = time.perf_counter()
@@ -477,10 +543,12 @@ def process_wav(
 
 
 def create_engine(args):
+    frame_size = int(args.frame_size)
+    hop_size = int(args.hop_size)
     if args.engine:
-        return TrtOLAEngine(args.engine), "TensorRT"
+        return TrtOLAEngine(args.engine, frame_size=frame_size, hop_size=hop_size), "TensorRT"
     providers = choose_providers(args.provider)
-    return OnnxOLAEngine(args.model, providers=providers), "ONNX Runtime"
+    return OnnxOLAEngine(args.model, providers=providers, frame_size=frame_size), "ONNX Runtime"
 
 
 # ------------------------------------------------------------
@@ -516,6 +584,8 @@ class ThreadedLivePipeline:
         self.out_q = queue.Queue(maxsize=self.queue_hops)
         self.engine = engine
         self.mode_name = mode_name
+        self.frame_size = getattr(engine, "frame_size", FRAME_SIZE)
+        self.hop_size = getattr(engine, "hop_size", HOP_SIZE)
 
         self._worker = None
         self._frames = 0
@@ -557,7 +627,7 @@ class ThreadedLivePipeline:
         if status:
             self._xruns += 1
 
-        if frames != HOP_SIZE:
+        if frames != self.hop_size:
             outdata[:, 0] = 0.0
             return
 
@@ -579,7 +649,7 @@ class ThreadedLivePipeline:
             out_hop = self.out_q.get_nowait()
         except queue.Empty:
             self._missed_out += 1
-            out_hop = in_hop if self.fallback == "dry" else np.zeros(HOP_SIZE, dtype=np.float32)
+            out_hop = in_hop if self.fallback == "dry" else np.zeros(self.hop_size, dtype=np.float32)
 
         mixed = self.wet * out_hop + (1.0 - self.wet) * in_hop
         outdata[:, 0] = np.clip(mixed * self.volume, -1.0, 1.0)
@@ -588,11 +658,11 @@ class ThreadedLivePipeline:
     def run(self) -> None:
         warmup(self.engine)
 
-        block_ms = 1000.0 * HOP_SIZE / SAMPLE_RATE
-        win_ms = 1000.0 * FRAME_SIZE / SAMPLE_RATE
+        block_ms = 1000.0 * self.hop_size / SAMPLE_RATE
+        win_ms = 1000.0 * self.frame_size / SAMPLE_RATE
         print(f"\n--- Jetson {self.mode_name} Live Mode ---------------------")
-        print(f"SR: {SAMPLE_RATE} Hz | block: {HOP_SIZE} samples ({block_ms:.2f} ms)")
-        print(f"Window: {FRAME_SIZE} samples ({win_ms:.2f} ms) | queue: {self.queue_hops} hops")
+        print(f"SR: {SAMPLE_RATE} Hz | block: {self.hop_size} samples ({block_ms:.2f} ms)")
+        print(f"Window: {self.frame_size} samples ({win_ms:.2f} ms) | queue: {self.queue_hops} hops")
         print(f"Input device: {self.input_device} | Output device: {self.output_device}")
         print(f"Latency: {self.latency} | Wet: {self.wet:.0%} | Volume: {self.volume:.1f}x")
         print(f"Fallback when worker is late: {self.fallback}")
@@ -606,7 +676,7 @@ class ThreadedLivePipeline:
         try:
             with sd.Stream(
                 samplerate=SAMPLE_RATE,
-                blocksize=HOP_SIZE,
+                blocksize=self.hop_size,
                 device=(self.input_device, self.output_device),
                 channels=1,
                 dtype=DTYPE,
@@ -656,7 +726,7 @@ class ThreadedLivePipeline:
         print(f"Missed output   : {self._missed_out:,}")
         if self._worker_lats:
             lats = np.array(self._worker_lats, dtype=np.float32)
-            budget_ms = 1000.0 * HOP_SIZE / SAMPLE_RATE
+            budget_ms = 1000.0 * self.hop_size / SAMPLE_RATE
             print(
                 f"Worker ms       : avg={lats.mean():.2f} "
                 f"p95={np.percentile(lats, 95):.2f} max={lats.max():.2f}"
@@ -675,6 +745,8 @@ def main() -> None:
     ap.add_argument("--input", default=None, help="[WAV mode] Input WAV file")
     ap.add_argument("--output", default=None, help="[WAV mode] Output WAV file")
     ap.add_argument("--play", action="store_true", help="[WAV mode] Play output while processing")
+    ap.add_argument("--frame_size", type=int, default=FRAME_SIZE, help="Model input/output frame size")
+    ap.add_argument("--hop_size", type=int, default=HOP_SIZE, help="Model input/output hop size")
     ap.add_argument("--list-devices", action="store_true", help="List PortAudio devices and exit")
     ap.add_argument("--host-api", default="JACK", help="Host API filter for device names, e.g. JACK or ALSA")
     ap.add_argument("--input-device", default=None, help="Input device index or partial device name")
@@ -691,6 +763,16 @@ def main() -> None:
         help="ONNX Runtime execution provider preference",
     )
     args = ap.parse_args()
+
+    if args.frame_size <= 0:
+        print(f"Error: --frame_size must be positive, got {args.frame_size}", file=sys.stderr)
+        sys.exit(1)
+    if args.frame_size < HOP_SIZE:
+        print(
+            f"Error: --frame_size must be at least the hop size ({HOP_SIZE}), got {args.frame_size}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.list_devices:
         list_devices(args.host_api)

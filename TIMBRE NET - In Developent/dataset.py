@@ -16,14 +16,15 @@ from __future__ import annotations
 import random
 from pathlib import Path
 from typing import List, Tuple
-
+import json
+import numpy as np
 import torch
 import torchaudio
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from model import FRAME_SIZE, HOP_SIZE, SAMPLE_RATE
-
+from data_splits import load_split_manifest, collect_stems, find_split_manifest
 
 def _to_mono_resampled(path: Path, sample_rate: int) -> torch.Tensor:
     audio, sr = torchaudio.load(str(path))
@@ -197,6 +198,7 @@ class GuitarPianoDataset(Dataset):
     def __init__(
         self,
         data_dir: str,
+        cache_dir: str | None = None,
         stems: List[str] | None = None,
         sample_rate: int = SAMPLE_RATE,
         frame_size: int = FRAME_SIZE,
@@ -207,6 +209,7 @@ class GuitarPianoDataset(Dataset):
         keep_silence_prob: float = 1.0,
     ):
         self.data_dir = Path(data_dir)
+        self.cache_dir = Path(cache_dir) if cache_dir else None
         self.sample_rate = sample_rate
         self.frame_size = frame_size
         self.hop_size = hop_size if hop_size is not None else max(1, frame_size // 4)
@@ -238,16 +241,150 @@ class GuitarPianoDataset(Dataset):
             raise ValueError("No matching guitar/piano file pairs found.")
 
         self.frames: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self.clips: List[dict] = []
+        self.cache_path: Path | None = None
+        self.cache = None
+        self.cache_len = 0
 
         print(f"Found {len(common)} paired clips.")
+
         for stem in common:
             g_path = guitar_map[stem]
             p_path = piano_map[stem]
 
-            clip_pairs = self._load_pair(g_path, p_path)
-            self.frames.extend(clip_pairs)
+            clip = self._make_clip_index(stem, g_path, p_path)
+            if clip["n_frames"] == 0:
+                continue
+            self.clips.append(clip)
+
+        if self.cache_dir is not None:
+            self._prepare_cache()
+        else:
+            for clip in self.clips:
+                clip_pairs = self._load_pair(clip["guitar_path"], clip["piano_path"])
+                self.frames.extend(clip_pairs)
 
         print(f"Total aligned training frames: {len(self.frames):,}")
+    
+    # Indexes all clips with additional metadata to build cache
+    def _make_clip_index(self, stem: str, guitar_path: Path, piano_path: Path) -> dict:
+        
+        def _target_sample_count(num_frames: int, sample_rate: int) -> int:
+            if sample_rate == self.sample_rate:
+                return num_frames
+            return int(num_frames * self.sample_rate / sample_rate)
+    
+        g_info = torchaudio.info(str(guitar_path))
+        p_info = torchaudio.info(str(piano_path))
+
+        g_len = _target_sample_count(g_info.num_frames, g_info.sample_rate)
+        p_len = _target_sample_count(p_info.num_frames, p_info.sample_rate)
+
+        n = min(g_len, p_len)
+        if n < self.frame_size:
+            n_frames = 0
+        else:
+            n_frames = (n - self.frame_size) // self.hop_size + 1
+
+        return {
+            "stem": stem,
+            "guitar_path": guitar_path,
+            "piano_path": piano_path,
+            "guitar_sr": g_info.sample_rate,
+            "piano_sr": p_info.sample_rate,
+            "n_frames": n_frames,
+        }
+    
+    # Uses existing cache or builds data cache
+    def _prepare_cache(self) -> None:
+        assert self.cache_dir is not None
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = self.cache_dir / "metadata.json"
+        data_path = self.cache_dir / "frames.dat"
+        expected_config = self._metadata_payload()
+
+        if meta_path.exists() and data_path.exists():
+            with open(meta_path, "r", encoding="utf-8") as f:
+                cached_meta = json.load(f)
+            if cached_meta.get("config") == expected_config:
+                self.cache_path = data_path
+                self._open_cache(cached_meta["num_frames"])
+                print(f"Using frame cache: {self.cache_dir}")
+                return
+            
+        print(f"Building frame cache: {self.cache_dir}")
+
+        max_frames = sum(clip["n_frames"] for clip in self.clips)
+        if max_frames == 0:
+            raise ValueError("No frames available to cache.")
+
+        cache = np.memmap(
+            data_path,
+            dtype=np.float32,
+            mode="w+",
+            shape=(max_frames, 2, self.frame_size),
+        )
+        cursor = 0
+
+        for clip in self.clips:
+            clip_pairs = self._load_pair(clip["guitar_path"], clip["piano_path"])
+            for guitar_frame, piano_frame in clip_pairs:
+                if cursor >= max_frames:
+                    raise RuntimeError(
+                        "Cache frame estimate was too small. "
+                        "Check _make_clip_index() frame counting."
+                    )
+                cache[cursor, 0, :] = guitar_frame.numpy()
+                cache[cursor, 1, :] = piano_frame.numpy()
+                cursor += 1
+
+        cache.flush()
+
+        metadata = {
+            "config": expected_config,
+            "num_frames": cursor,
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        self.cache_path = data_path
+        self._open_cache(cursor)
+    
+    # Cache metadata
+    def _metadata_payload(self):
+        return {
+            "sample_rate": self.sample_rate,
+            "frame_size": self.frame_size,
+            "hop_size": self.hop_size,
+            "max_shift_ms": self.max_shift_ms,
+            "min_rms": self.min_rms,
+            "keep_silence_prob": self.keep_silence_prob,
+            "clips": [
+                {
+                    "stem": clip["stem"],
+                    "guitar_path": str(clip["guitar_path"]),
+                    "piano_path": str(clip["piano_path"]),
+                    "guitar_sr": clip["guitar_sr"],
+                    "piano_sr": clip["piano_sr"],
+                    "n_frames": clip["n_frames"],
+                }
+                for clip in self.clips
+            ],
+        }
+
+    def _open_cache(self, num_frames: int):
+        assert self.cache_path is not None
+
+        self.cache_len = num_frames
+        self.cache = np.memmap(
+            self.cache_path,
+            dtype=np.float32,
+            mode="r",
+            shape=(num_frames, 2, self.frame_size),
+        )
+        self.frames = [None] * num_frames
+
 
     def _load_pair(self, guitar_path: Path, piano_path: Path):
         guitar = _to_mono_resampled(guitar_path, self.sample_rate)
@@ -286,10 +423,14 @@ class GuitarPianoDataset(Dataset):
         )
 
     def __len__(self):
-        return len(self.frames)
+        return self.cache_len if self.cache is not None else len(self.frames)
 
     def __getitem__(self, idx):
-        guitar_frame, piano_frame = self.frames[idx]
+        if self.cache is not None:
+            guitar_frame = torch.from_numpy(self.cache[idx, 0].copy())
+            piano_frame = torch.from_numpy(self.cache[idx, 1].copy())
+        else:
+            guitar_frame, piano_frame = self.frames[idx]
 
         # clone so augmentation never mutates stored tensors
         guitar_frame = guitar_frame.clone()
@@ -314,7 +455,6 @@ class GuitarPianoDataset(Dataset):
 
         return guitar_frame, piano_frame
 
-
 def make_dataloaders(
     data_dir: str,
     batch_size: int = 64,
@@ -326,30 +466,33 @@ def make_dataloaders(
     min_rms: float = 0.002,
     keep_silence_prob: float = 1.0,
     seed: int = 22,
+    split_manifest: str | Path | None = None,
 ):
     """
     Split by clip stem, not by frame, so validation is honest.
     """
     data_dir = Path(data_dir)
-    guitar_dir = data_dir / "guitar"
-    piano_dir = data_dir / "piano"
+    manifest_splits = load_split_manifest(data_dir, split_manifest)
 
-    guitar_files = sorted(guitar_dir.glob("*.wav")) + sorted(guitar_dir.glob("*.flac"))
-    piano_files = sorted(piano_dir.glob("*.wav")) + sorted(piano_dir.glob("*.flac"))
+    if manifest_splits is not None:
+        train_stems = manifest_splits["train"]
+        val_stems = manifest_splits["val"]
+        if not val_stems:
+            raise ValueError("Split manifest must include a non-empty val split for make_dataloaders().")
+    else:
+        guitar_stems = collect_stems(data_dir / "guitar")
+        piano_stems = collect_stems(data_dir / "piano")
+        common = sorted(guitar_stems & piano_stems)
 
-    guitar_stems = {f.stem for f in guitar_files}
-    piano_stems = {f.stem for f in piano_files}
-    common = sorted(guitar_stems & piano_stems)
+        if not common:
+            raise ValueError("No matching guitar/piano stems found.")
 
-    if not common:
-        raise ValueError("No matching guitar/piano stems found.")
+        rng = random.Random(seed)
+        rng.shuffle(common)
 
-    rng = random.Random(seed)
-    rng.shuffle(common)
-
-    n_val = max(2, int(round(len(common) * val_split))) if len(common) > 2 else 1
-    val_stems = common[:n_val]
-    train_stems = common[n_val:] if n_val > 0 else common
+        n_val = max(2, int(round(len(common) * val_split))) if len(common) > 2 else 1
+        val_stems = common[:n_val]
+        train_stems = common[n_val:] if n_val > 0 else common
 
     train_set = GuitarPianoDataset(
         data_dir=str(data_dir),
